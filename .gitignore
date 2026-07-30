@@ -3,3 +3,8 @@ node_modules/
 .DS_Store
 /worktrees/
 /tmp/
+
+# pnpm's build-script approval state (from `pnpm approve-builds`) — a
+# machine-local trust decision, not portable project config. Never
+# committed by upstream, no git history for this file.
+/pnpm-workspace.yaml
