@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatTimestamp, slugify } from '../timestamp.js';
+import { formatTimestamp, parseTimestamp, slugify } from '../timestamp.js';
 
 describe('formatTimestamp', () => {
   it('formats a UTC date as YYYY-MM-DDTHH-MM-SS with no colons', () => {
@@ -16,6 +16,23 @@ describe('formatTimestamp', () => {
     const earlier = formatTimestamp(new Date(Date.UTC(2026, 0, 1, 0, 0, 0)));
     const later = formatTimestamp(new Date(Date.UTC(2026, 0, 1, 0, 0, 1)));
     expect([later, earlier].sort()).toEqual([earlier, later]);
+  });
+});
+
+describe('parseTimestamp', () => {
+  it('is the exact inverse of formatTimestamp for a round trip', () => {
+    const original = new Date(Date.UTC(2026, 6, 17, 18, 45, 12));
+    expect(parseTimestamp(formatTimestamp(original))).toEqual(original);
+  });
+
+  it('parses zero-padded components correctly', () => {
+    expect(parseTimestamp('2026-01-05T03-04-05')).toEqual(new Date(Date.UTC(2026, 0, 5, 3, 4, 5)));
+  });
+
+  it('throws a clear error rather than returning an Invalid Date for malformed input', () => {
+    expect(() => parseTimestamp('not-a-timestamp')).toThrow(/not a valid agent-locks timestamp/);
+    expect(() => parseTimestamp('2026-07-17T18:45:12')).toThrow(/not a valid agent-locks timestamp/); // colons, not dashes
+    expect(() => parseTimestamp('')).toThrow(/not a valid agent-locks timestamp/);
   });
 });
 

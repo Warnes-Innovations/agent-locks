@@ -102,9 +102,9 @@ The `id` frontmatter field is, by design, **exactly the filename minus `.md`** �
 
 `{timestamp}-{kebab-case-title}.md` — purely chronological, no sequence numbers by design (these files are ephemeral coordination artifacts, not a numbered decision log).
 
-## The 5 MCP tools
+## The 7 MCP tools
 
-All five are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
+All seven are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
 
 ### `lock_query`
 
@@ -116,11 +116,11 @@ Lists locks. **Hard requirement, enforced and tested** (`src/__tests__/store.tes
 { "name": "lock_query", "arguments": { "scope": "backend/src/oauth/client.ts" } }
 ```
 
-Returns `Array<{id, title, status, percentComplete, scope, agent_id, parent_agent_id}>`. `percentComplete` is the ratio of checked to total tasks (a lock with zero tasks reports 100).
+Returns `Array<{id, title, status, percentComplete, scope, agent_id, parent_agent_id, stale, staleForSeconds}>`. `percentComplete` is the ratio of checked to total tasks (a lock with zero tasks reports 100). See "Staleness detection" below for `stale`/`staleForSeconds` and the optional `stale_minutes` argument.
 
 ### `lock_check_conflict`
 
-Purely informational — **never blocks, never vetoes, has no side effects**. Returns any *active* locks whose `scope` glob-overlaps the patterns you pass in; you decide what to do with that information.
+Purely informational — **never blocks, never vetoes, has no side effects**. Returns any *active* locks whose `scope` glob-overlaps the patterns you pass in; you decide what to do with that information. Same summary shape as `lock_query`, including `stale`/`staleForSeconds`.
 
 ```json
 { "name": "lock_check_conflict", "arguments": { "scope": ["backend/src/oauth/**"] } }
@@ -157,6 +157,42 @@ Returns `{id, filePath}`.
 ```
 
 Moves the file from `agents-locks/` to `agents-locks/done/`, sets `status: done`. Errors clearly (not silently) if the lock doesn't exist, or already exists but is already done.
+
+### `lock_heartbeat`
+
+```json
+{ "name": "lock_heartbeat", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test" } }
+```
+
+Bumps **only** a lock's `updated` timestamp — no task/note/scope change. Call this periodically during a long stretch of work that isn't naturally hitting `lock_update` often enough (completing a task already bumps `updated` for free) to keep the lock from reading as stale to anyone else watching. Restricted to active locks — errors clearly if `lock_id` doesn't exist, or exists but is already done.
+
+### `lock_reap`
+
+```json
+{ "name": "lock_reap", "arguments": {} }
+{ "name": "lock_reap", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test" } }
+{ "name": "lock_reap", "arguments": { "dry_run": true } }
+```
+
+Finishes (same mechanism as `lock_finish`) every currently-stale active lock, or a single specific one if `lock_id` is given. **Explicit and deliberate — never a side effect of `lock_query`/`lock_check_conflict` reading state.** Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (and for how long), so the done archive stays honest about "the owning agent finished this" vs. "nobody was heard from and this got cleaned up." If `lock_id` is given but that lock is **not** actually stale, this errors (`LockNotStaleError`) rather than reaping it — `lock_reap` cannot be used as a back door to force-finish someone else's live work. `dry_run: true` reports what would be reaped without writing anything.
+
+## Staleness detection
+
+Every lock summary (`lock_query`, `lock_check_conflict`) carries two computed fields:
+
+- `stale: boolean` — true only for an **active** lock whose `updated` timestamp is older than the staleness threshold. Always `false` for a `done` lock; staleness is a property of abandoned in-progress work, not of finished work.
+- `staleForSeconds: number` — how long it's been, for display/sorting.
+
+**Threshold resolution**, in priority order: an explicit `stale_minutes` argument on the call, then the `AGENT_LOCKS_STALE_MINUTES` environment variable (read fresh on every call — same "never cache an assumption" principle as `resolveLocksRoot` in `git.ts`), then a default of 60 minutes.
+
+**Computed fresh, never mutates anything.** Reading `stale` never moves or touches a lock file — the same "no database, no in-memory cache" principle as everything else in this project (see below) applies here too: staleness is a pure function of `now` and the lock's own `updated` field, recomputed on every call. Cleanup only happens via the explicit `lock_reap` tool.
+
+**`updated` *is* the heartbeat signal — there is no separate `heartbeat`/`pid` field.** `lock_create` sets it, `lock_update` bumps it on every real change, and `lock_heartbeat` bumps it with no other side effect for the gap between real updates. This was a deliberate simplification over a two-signal (timestamp + process-liveness) design:
+
+- A **process-liveness** check (recording the calling process's PID and checking `kill -0` on it) sounds like it would catch crashes faster, but it doesn't transfer cleanly across this tool's two invocation shapes. For an MCP server session, the server subprocess plausibly *does* represent "is this session still connected" for its whole lifetime. For a CLI invocation (`agent-locks claim ...`), the process that created the lock **exits immediately** after the command returns — its PID is dead within milliseconds, by design, while the work it claimed may continue for hours. A staleness rule that trusted PID liveness would therefore flag every CLI-created lock as abandoned almost immediately, which is exactly backwards.
+- A **timestamp-since-last-real-activity** check has none of that asymmetry: it means the same thing regardless of which interface created or is updating the lock, degrades gracefully (a crashed process just stops producing updates, and eventually crosses the threshold — a slower but strictly more correct signal than a PID check with a CLI-mode blind spot), and reuses a field the schema already had rather than adding new frontmatter that every existing hand-written or future lock file would need to carry.
+
+If you need faster-than-threshold crash detection for the long-running MCP-server case specifically, that's a reasonable follow-up (e.g. an opt-in PID check that only applies when the caller identifies itself as a persistent session) — deliberately left out of this change to keep the staleness model uniform and simple across both interfaces first.
 
 ## Honest `agent_id` / `parent_agent_id` semantics
 

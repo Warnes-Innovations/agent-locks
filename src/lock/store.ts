@@ -11,10 +11,31 @@ import path from 'node:path';
 import { formatTimestamp, slugify } from '../timestamp.js';
 import { parseLockFile, serializeLockFile } from './markdown.js';
 import { scopesOverlap } from './globOverlap.js';
-import { computePercentComplete, toSummary } from './types.js';
+import { computePercentComplete, toSummary, DEFAULT_STALE_MINUTES } from './types.js';
 import type { LockFrontmatter, LockRecord, LockSummary, LockTask } from './types.js';
 
 const DONE_SUBDIR = 'done';
+const STALE_MINUTES_ENV_VAR = 'AGENT_LOCKS_STALE_MINUTES';
+
+/**
+ * Resolves the staleness threshold (in minutes) an agent should actually
+ * use, in priority order: an explicit override passed by the caller, then
+ * AGENT_LOCKS_STALE_MINUTES from the environment (read fresh on every call,
+ * never cached — same "no stale cached assumptions" principle as
+ * resolveLocksRoot in git.ts), then DEFAULT_STALE_MINUTES.
+ *
+ * A non-numeric or non-positive env value is treated as unset (falls back
+ * to the default) rather than throwing, so a malformed environment can
+ * never make every query fail — staleness is an informational feature, not
+ * a load-bearing one, and should degrade gracefully.
+ */
+export function resolveStaleMinutes(override?: number): number {
+  if (override !== undefined) return override;
+  const raw = process.env[STALE_MINUTES_ENV_VAR];
+  if (raw === undefined) return DEFAULT_STALE_MINUTES;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_MINUTES;
+}
 
 export class LockNotFoundError extends Error {
   constructor(lockId: string) {
@@ -156,6 +177,8 @@ export interface QueryLocksParams {
   scope?: string | string[];
   agent_id?: string | null;
   text?: string;
+  /** Staleness threshold override, in minutes. Defaults per resolveStaleMinutes(). */
+  stale_minutes?: number;
 }
 
 /**
@@ -184,7 +207,8 @@ export async function queryLocks(locksRoot: string, params: QueryLocksParams): P
     return true;
   });
 
-  return filtered.map(toSummary);
+  const staleMinutes = resolveStaleMinutes(params.stale_minutes);
+  return filtered.map((record) => toSummary(record, { staleMinutes }));
 }
 
 /**
@@ -193,10 +217,11 @@ export async function queryLocks(locksRoot: string, params: QueryLocksParams): P
  * never blocks, and lock_create never consults it — the calling agent
  * decides what, if anything, to do with the result.
  */
-export async function checkConflicts(locksRoot: string, scope: string[]): Promise<LockSummary[]> {
+export async function checkConflicts(locksRoot: string, scope: string[], staleMinutesOverride?: number): Promise<LockSummary[]> {
   const records = await readAllRecords(locksRoot, 'active');
   const conflicting = records.filter((record) => scopesOverlap(scope, record.frontmatter.scope));
-  return conflicting.map(toSummary);
+  const staleMinutes = resolveStaleMinutes(staleMinutesOverride);
+  return conflicting.map((record) => toSummary(record, { staleMinutes }));
 }
 
 export interface UpdateLockParams {
@@ -284,4 +309,128 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
   await fs.unlink(oldFilePath);
 
   return { id: record.frontmatter.id, filePath: newFilePath };
+}
+
+export interface HeartbeatLockParams {
+  lock_id: string;
+}
+
+export interface HeartbeatLockResult {
+  id: string;
+  updated: string;
+}
+
+/**
+ * Bumps ONLY a lock's `updated` timestamp — no task/note/scope change.
+ * This is the proof-of-life ping an agent should call periodically during
+ * a long-running task that isn't naturally hitting lock_update (completing
+ * a task) often enough to keep the lock from reading as stale. `updated`
+ * doubles as the heartbeat signal rather than introducing a separate field
+ * (see README "Staleness detection" for why): lock_update already bumps it
+ * for free on real activity, so this is purely for the gap between real
+ * updates.
+ *
+ * Restricted to active locks — heartbeating a done/archived lock is not a
+ * meaningful operation and would be a new footgun, not a feature.
+ */
+export async function heartbeatLock(locksRoot: string, params: HeartbeatLockParams): Promise<HeartbeatLockResult> {
+  const activeFiles = await listMarkdownFiles(activeDir(locksRoot));
+  for (const filePath of activeFiles) {
+    const record = await readRecord(filePath);
+    if (record.frontmatter.id === params.lock_id) {
+      record.frontmatter.updated = formatTimestamp();
+      await writeRecord(record);
+      return { id: record.frontmatter.id, updated: record.frontmatter.updated };
+    }
+  }
+  // Distinguish "never existed" from "exists but already done", same as finishLock.
+  const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
+  for (const filePath of doneFiles) {
+    const candidate = await readRecord(filePath);
+    if (candidate.frontmatter.id === params.lock_id) {
+      throw new LockNotActiveError(params.lock_id);
+    }
+  }
+  throw new LockNotFoundError(params.lock_id);
+}
+
+export interface ReapStaleLocksParams {
+  /** Reap only this lock id. Errors if it exists but isn't actually stale (a safety check, not a formality — see store.test.ts). Omit to reap every stale active lock. */
+  lock_id?: string;
+  stale_minutes?: number;
+  /** When true, returns what WOULD be reaped without writing anything. */
+  dry_run?: boolean;
+}
+
+export interface ReapedLock {
+  id: string;
+  title: string;
+  staleForSeconds: number;
+}
+
+export class LockNotStaleError extends Error {
+  constructor(lockId: string, staleForSeconds: number, staleMinutes: number) {
+    super(
+      `Lock "${lockId}" is not stale (last updated ${staleForSeconds}s ago; the threshold is ${staleMinutes} minute(s)). ` +
+        `Refusing to reap a lock that isn't actually stale — reap is for cleaning up abandoned work, not an alternate way to call lock_finish.`,
+    );
+    this.name = 'LockNotStaleError';
+  }
+}
+
+/**
+ * Finishes (moves to done, same as finishLock) every active lock currently
+ * computed as stale, or a single specific lock if lock_id is given —
+ * explicitly, never as a side effect of a read like lock_query. Each
+ * reaped lock gets an auto-generated note recording why, so the done
+ * archive stays honest about "the owning agent finished this" vs.
+ * "nobody was heard from and this got cleaned up automatically."
+ */
+export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksParams = {}): Promise<ReapedLock[]> {
+  const staleMinutes = resolveStaleMinutes(params.stale_minutes);
+  const now = new Date();
+  const activeRecords = await readAllRecords(locksRoot, 'active');
+
+  const candidates = activeRecords.filter((record) => {
+    if (params.lock_id !== undefined && record.frontmatter.id !== params.lock_id) return false;
+    return toSummary(record, { staleMinutes, now }).stale;
+  });
+
+  if (params.lock_id !== undefined && candidates.length === 0) {
+    // Either the id doesn't exist/isn't active, or it exists but isn't stale — give an
+    // honest, specific error either way rather than a silent empty-array no-op.
+    const match = activeRecords.find((record) => record.frontmatter.id === params.lock_id);
+    if (match) {
+      const summary = toSummary(match, { staleMinutes, now });
+      throw new LockNotStaleError(params.lock_id, summary.staleForSeconds, staleMinutes);
+    }
+    const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
+    for (const filePath of doneFiles) {
+      const candidate = await readRecord(filePath);
+      if (candidate.frontmatter.id === params.lock_id) throw new LockNotActiveError(params.lock_id);
+    }
+    throw new LockNotFoundError(params.lock_id);
+  }
+
+  const reaped: ReapedLock[] = [];
+  for (const record of candidates) {
+    const summary = toSummary(record, { staleMinutes, now });
+    reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
+    if (params.dry_run) continue;
+
+    record.notes.push(
+      `Auto-reaped: no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s) ` +
+        `(threshold: ${staleMinutes} minute(s)).`,
+    );
+    record.frontmatter.status = 'done';
+    record.frontmatter.updated = formatTimestamp();
+    const newFilePath = path.join(doneDir(locksRoot), path.basename(record.filePath));
+    const oldFilePath = record.filePath;
+    record.filePath = newFilePath;
+    await ensureDirs(locksRoot);
+    await writeRecord(record);
+    await fs.unlink(oldFilePath);
+  }
+
+  return reaped;
 }
