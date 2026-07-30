@@ -496,14 +496,266 @@ function createServer() {
   return server;
 }
 
+// src/cli.ts
+var USAGE = `agent-locks \u2014 filesystem-based work-claiming locks for AI coding agents, shared across every git worktree of the current repository.
+
+Usage:
+  agent-locks                           Start the MCP stdio server (same as running with no args \u2014 this is what an MCP client config should use).
+  agent-locks serve                     Same as above, explicit.
+  agent-locks status                    Human-readable summary of active locks.
+  agent-locks list [options]            List locks. See "agent-locks list --help".
+  agent-locks check <scope...>          Check whether any active lock overlaps the given glob(s). Informational only \u2014 exits 0 either way.
+  agent-locks claim [options]           Create a new lock. See "agent-locks claim --help".
+  agent-locks update <lock-id> [options]  Mark a task done/undone on an existing lock. See "agent-locks update --help".
+  agent-locks finish <lock-id> [--summary <text>]  Mark a lock done and archive it.
+  agent-locks --help                    Show this message.
+
+Every subcommand talks to the exact same lock store the MCP tools use \u2014 a human running "agent-locks status" and an agent calling lock_query see identical, live state.`;
+var LIST_USAGE = `agent-locks list [options]
+
+Options:
+  --status <active|done|all>   Which locks to include. Default: active.
+  --scope <glob>                Only locks whose scope overlaps this glob. Repeatable.
+  --agent <id>                  Only locks with this exact agent_id.
+  --text <query>                Case-insensitive substring search over title + notes.
+  --json                        Print raw JSON instead of a formatted table.`;
+var CLAIM_USAGE = `agent-locks claim [options]
+
+Options:
+  --title <text>        Required. Short description of the work.
+  --scope <glob>         Required. Glob pattern this lock claims. Repeatable.
+  --task <text>          A task to track on this lock. Repeatable; order preserved.
+  --agent <id>           Your own agent id, if you have one. Never fabricated if omitted.
+  --parent <id>          Your parent agent's id, if known.
+  --json                 Print raw JSON instead of a short confirmation line.`;
+var UPDATE_USAGE = `agent-locks update <lock-id> [options]
+
+Options:
+  --task <text>          Required. Must match an existing task's text exactly.
+  --done                 Mark the task done (default if neither --done nor --undone given).
+  --undone               Mark the task not done.
+  --note <text>           Append a free-text note to the lock.
+  --json                 Print raw JSON instead of a short confirmation line.`;
+var CliUsageError = class extends Error {
+};
+var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help"]);
+function parseArgs(argv) {
+  const positionals = [];
+  const flags = /* @__PURE__ */ new Map();
+  const boolFlags = /* @__PURE__ */ new Set();
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (!arg.startsWith("--")) {
+      positionals.push(arg);
+      continue;
+    }
+    if (BOOLEAN_FLAGS.has(arg)) {
+      boolFlags.add(arg);
+      continue;
+    }
+    const value = argv[i + 1];
+    if (value === void 0 || value.startsWith("--")) {
+      throw new CliUsageError(`Flag ${arg} requires a value.`);
+    }
+    const existing = flags.get(arg) ?? [];
+    existing.push(value);
+    flags.set(arg, existing);
+    i += 1;
+  }
+  return { positionals, flags, boolFlags };
+}
+function oneOf(flags, name) {
+  const values = flags.get(name);
+  if (values === void 0) return void 0;
+  return values[values.length - 1];
+}
+function allOf(flags, name) {
+  return flags.get(name) ?? [];
+}
+function formatLockTable(locks) {
+  if (locks.length === 0) return "(no locks)";
+  const rows = locks.map((lock) => [
+    lock.id,
+    lock.status,
+    `${lock.percentComplete}%`,
+    lock.agent_id ?? "(unknown agent)",
+    lock.scope.join(", "),
+    lock.title
+  ]);
+  const header = ["ID", "STATUS", "DONE", "AGENT", "SCOPE", "TITLE"];
+  const widths = header.map((h, col) => Math.max(h.length, ...rows.map((r) => r[col].length)));
+  const formatRow = (row) => row.map((cell, col) => cell.padEnd(widths[col])).join("  ");
+  return [formatRow(header), formatRow(header.map((h) => "-".repeat(h.length))), ...rows.map(formatRow)].join("\n");
+}
+async function cmdStatus() {
+  const locksRoot = await resolveLocksRoot();
+  const locks = await queryLocks(locksRoot, {});
+  console.log(`agent-locks: ${locks.length} active lock(s) in ${locksRoot}
+`);
+  console.log(formatLockTable(locks));
+}
+async function cmdList(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(LIST_USAGE);
+    return;
+  }
+  const status = oneOf(flags.flags, "--status");
+  if (status !== void 0 && !["active", "done", "all"].includes(status)) {
+    throw new CliUsageError(`--status must be one of active, done, all (got "${status}").`);
+  }
+  const scope = allOf(flags.flags, "--scope");
+  const agent_id = oneOf(flags.flags, "--agent");
+  const text = oneOf(flags.flags, "--text");
+  const locksRoot = await resolveLocksRoot();
+  const locks = await queryLocks(locksRoot, {
+    status,
+    scope: scope.length > 0 ? scope : void 0,
+    agent_id,
+    text
+  });
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(locks, null, 2));
+  } else {
+    console.log(formatLockTable(locks));
+  }
+}
+async function cmdCheck(flags) {
+  const scope = flags.positionals;
+  if (scope.length === 0) {
+    throw new CliUsageError('agent-locks check requires at least one scope glob, e.g. "agent-locks check src/auth/**".');
+  }
+  const locksRoot = await resolveLocksRoot();
+  const conflicts = await checkConflicts(locksRoot, scope);
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(conflicts, null, 2));
+    return;
+  }
+  if (conflicts.length === 0) {
+    console.log(`No active locks overlap ${scope.join(", ")}.`);
+    return;
+  }
+  console.log(`${conflicts.length} active lock(s) overlap ${scope.join(", ")} \u2014 informational only, nothing is blocked:
+`);
+  console.log(formatLockTable(conflicts));
+}
+async function cmdClaim(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(CLAIM_USAGE);
+    return;
+  }
+  const title = oneOf(flags.flags, "--title");
+  if (!title) throw new CliUsageError('agent-locks claim requires --title. See "agent-locks claim --help".');
+  const scope = allOf(flags.flags, "--scope");
+  if (scope.length === 0) throw new CliUsageError('agent-locks claim requires at least one --scope. See "agent-locks claim --help".');
+  const tasks = allOf(flags.flags, "--task");
+  const agent_id = oneOf(flags.flags, "--agent") ?? null;
+  const parent_agent_id = oneOf(flags.flags, "--parent") ?? null;
+  const locksRoot = await resolveLocksRoot();
+  const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id });
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`Claimed "${title}" as lock ${result.id}`);
+  }
+}
+async function cmdUpdate(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(UPDATE_USAGE);
+    return;
+  }
+  const lockId = flags.positionals[0];
+  if (!lockId) throw new CliUsageError('agent-locks update requires a lock id as its first argument. See "agent-locks update --help".');
+  const taskText = oneOf(flags.flags, "--task");
+  if (!taskText) throw new CliUsageError('agent-locks update requires --task. See "agent-locks update --help".');
+  if (flags.boolFlags.has("--done") && flags.boolFlags.has("--undone")) {
+    throw new CliUsageError("Pass at most one of --done / --undone.");
+  }
+  const done = !flags.boolFlags.has("--undone");
+  const note = oneOf(flags.flags, "--note");
+  const locksRoot = await resolveLocksRoot();
+  const result = await updateLock(locksRoot, { lock_id: lockId, task_text: taskText, done, note });
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`Lock ${result.id}: "${taskText}" marked ${done ? "done" : "not done"} (${result.percentComplete}% complete overall).`);
+  }
+}
+async function cmdFinish(flags) {
+  const lockId = flags.positionals[0];
+  if (!lockId) throw new CliUsageError("agent-locks finish requires a lock id as its first argument.");
+  const summary = oneOf(flags.flags, "--summary");
+  const locksRoot = await resolveLocksRoot();
+  const result = await finishLock(locksRoot, { lock_id: lockId, summary });
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`Lock ${result.id} finished and archived.`);
+  }
+}
+async function runCli(argv) {
+  const [command, ...rest] = argv;
+  if (command === void 0 || command === "--help" || command === "-h") {
+    console.log(USAGE);
+    return 0;
+  }
+  try {
+    switch (command) {
+      case "status":
+        await cmdStatus();
+        return 0;
+      case "list":
+        await cmdList(parseArgs(rest));
+        return 0;
+      case "check":
+        await cmdCheck(parseArgs(rest));
+        return 0;
+      case "claim":
+        await cmdClaim(parseArgs(rest));
+        return 0;
+      case "update":
+        await cmdUpdate(parseArgs(rest));
+        return 0;
+      case "finish":
+        await cmdFinish(parseArgs(rest));
+        return 0;
+      default:
+        console.error(`agent-locks: unknown command "${command}".
+`);
+        console.error(USAGE);
+        return 1;
+    }
+  } catch (error) {
+    if (error instanceof CliUsageError) {
+      console.error(`agent-locks: ${error.message}`);
+      return 1;
+    }
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError) {
+      console.error(`agent-locks: ${error.message}`);
+      return 1;
+    }
+    console.error(`agent-locks: unexpected error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    return 1;
+  }
+}
+
 // src/index.ts
-async function main() {
+async function runServer() {
   const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
+async function main() {
+  const argv = process.argv.slice(2);
+  const isServerMode = argv.length === 0 || argv[0] === "serve";
+  if (isServerMode) {
+    await runServer();
+    return;
+  }
+  const exitCode = await runCli(argv);
+  process.exitCode = exitCode;
+}
 main().catch((error) => {
-  process.stderr.write(`agent-locks: fatal error during startup: ${error instanceof Error ? error.stack ?? error.message : String(error)}
+  process.stderr.write(`agent-locks: fatal error: ${error instanceof Error ? error.stack ?? error.message : String(error)}
 `);
   process.exitCode = 1;
 });
