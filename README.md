@@ -158,6 +158,39 @@ Returns `{id, filePath}`.
 
 Moves the file from `agents-locks/` to `agents-locks/done/`, sets `status: done`. Errors clearly (not silently) if the lock doesn't exist, or already exists but is already done.
 
+## CLI usage
+
+The exact same lock store the 5 MCP tools above talk to is also reachable from a plain terminal or a shell script — useful for a human checking coordination state directly, or for any agent harness that can run a command but doesn't (yet) speak MCP.
+
+`index.js` dispatches on `argv`: called with **no arguments** (or the explicit `serve` alias) it starts the MCP stdio server exactly as before — every existing MCP client config keeps working unchanged. Called with any other first argument, it runs as a CLI and exits with a real exit code (0 on success, 1 on a usage error or a store error like a missing lock id) instead of hanging waiting for JSON-RPC on stdin.
+
+```bash
+# Human-readable summary of active locks in the current repo (or worktree)
+agent-locks status
+
+# Full query, same filters as lock_query, --json for scripting
+agent-locks list [--status active|done|all] [--scope <glob>] [--agent <id>] [--text <query>] [--json]
+
+# Same as lock_check_conflict — informational only, exit code is always 0
+agent-locks check <scope-glob...>
+
+# Same as lock_create
+agent-locks claim --title <text> --scope <glob> [--scope <glob> ...] [--task <text> ...] [--agent <id>] [--parent <id>]
+
+# Same as lock_update
+agent-locks update <lock-id> --task <text> [--done | --undone] [--note <text>]
+
+# Same as lock_finish
+agent-locks finish <lock-id> [--summary <text>]
+
+# Explicit alias for "no arguments" — starts the MCP server
+agent-locks serve
+```
+
+Every subcommand resolves `locksRoot` fresh via `resolveLocksRoot()`, the same as every MCP tool handler — running the CLI from one worktree while an agent's MCP session is live in another worktree of the same repo still coordinates correctly, for the same git-common-dir reason the whole tool exists.
+
+No new dependency was added for this — argument parsing is hand-rolled (`src/cli.ts`) to match the project's existing minimal footprint.
+
 ## Honest `agent_id` / `parent_agent_id` semantics
 
 **Claude Code does not expose any session id to a stdio MCP server subprocess** — not via environment variable, not via any MCP `initialize` parameter (the spec's `initialize` params are only `protocolVersion`, `capabilities`, `clientInfo`), and there is no documented mechanism for a subagent's MCP server process to learn its parent session's id either.
