@@ -30,8 +30,28 @@
  * nothing and removes any risk of relying on a stale, cached assumption if
  * this server is ever invoked in an environment where that assumption
  * doesn't hold.
+ *
+ * One more normalization step matters: git does not consistently return the
+ * common-dir path in the same symlink-resolved-or-not form across call
+ * shapes. When `cwd` IS the repo root, git tends to answer with a path
+ * relative to `cwd` (e.g. plain ".git"), so `path.resolve(cwd, ...)` inherits
+ * whatever symlink form `cwd` itself was passed in. When `cwd` is a LINKED
+ * worktree, resolving the common dir requires git to internally chase the
+ * worktree's `.git` *file* (a `gitdir: ...` pointer) back to the shared
+ * directory, and in doing so git can return an already-canonicalized
+ * (symlink-resolved) absolute path. On platforms where a caller's natural
+ * working-directory path itself passes through a symlink — notably macOS,
+ * where `/tmp` and `/var` are symlinks to `/private/tmp` and `/private/var`
+ * — these two call shapes can therefore return two DIFFERENT strings for
+ * what is the same real directory on disk, defeating this function's entire
+ * contract ("same real directory in, same path out, regardless of which
+ * worktree you called it from"). We close that gap by resolving the final
+ * path through `fs.realpath` before returning it, so the return value is
+ * always the canonical form no matter which internal path git took to get
+ * there.
  */
 import { execFile } from 'node:child_process';
+import { promises as fs } from 'node:fs';
 import { promisify } from 'node:util';
 import path from 'node:path';
 
@@ -69,5 +89,13 @@ export async function resolveLocksRoot(cwd: string = process.cwd()): Promise<str
   // path, depending on git version and whether cwd is the repo root.
   // path.resolve is a no-op if gitCommonDir is already absolute.
   const absoluteGitCommonDir = path.resolve(cwd, gitCommonDir);
-  return path.join(absoluteGitCommonDir, 'agents-locks');
+  // Canonicalize so the same real directory always yields the same string,
+  // regardless of which symlink form `cwd` or git's own answer happened to
+  // use (see the module doc comment above). The directory is known to exist
+  // — `git rev-parse --git-common-dir` just succeeded against it — so a
+  // realpath failure here would indicate something removed it out from
+  // under us mid-call; surface that rather than silently falling back to
+  // the unresolved path, which would reintroduce the very bug this fixes.
+  const realGitCommonDir = await fs.realpath(absoluteGitCommonDir);
+  return path.join(realGitCommonDir, 'agents-locks');
 }

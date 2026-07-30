@@ -41,7 +41,13 @@ describe('resolveLocksRoot', () => {
     await git(repo, ['commit', '-q', '-m', 'init']);
 
     const locksRoot = await resolveLocksRoot(repo);
-    expect(locksRoot).toBe(path.join(repo, '.git', 'agents-locks'));
+    // Compare against the REALPATH'd repo, not `repo` itself: on platforms
+    // where the OS temp dir is reached through a symlink (e.g. macOS's
+    // /tmp -> /private/tmp), resolveLocksRoot canonicalizes its answer (see
+    // src/git.ts), so the raw `repo` string built from `sandbox` would not
+    // match even though it refers to the same real directory.
+    const realRepo = await fs.realpath(repo);
+    expect(locksRoot).toBe(path.join(realRepo, '.git', 'agents-locks'));
   });
 
   it('resolves to the SAME path from a linked worktree as from the main worktree ' +
@@ -74,7 +80,10 @@ describe('resolveLocksRoot', () => {
     const locksRootFromMain = await resolveLocksRoot(repo);
     const locksRootFromLinked = await resolveLocksRoot(linkedWorktree);
     expect(locksRootFromLinked).toBe(locksRootFromMain);
-    expect(locksRootFromMain).toBe(path.join(repo, '.git', 'agents-locks'));
+    // See the sibling test above for why this compares against the
+    // REALPATH'd repo rather than `repo` itself.
+    const realRepo = await fs.realpath(repo);
+    expect(locksRootFromMain).toBe(path.join(realRepo, '.git', 'agents-locks'));
   });
 
   it('is not resolved once and cached — it is safe to call repeatedly and get a fresh answer each time', async () => {
