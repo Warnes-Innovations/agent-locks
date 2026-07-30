@@ -9,6 +9,7 @@ import { z } from "zod";
 
 // src/git.ts
 import { execFile } from "child_process";
+import { promises as fs } from "fs";
 import { promisify } from "util";
 import path from "path";
 var execFileAsync = promisify(execFile);
@@ -29,11 +30,12 @@ async function resolveLocksRoot(cwd = process.cwd()) {
   }
   const gitCommonDir = stdout.trim();
   const absoluteGitCommonDir = path.resolve(cwd, gitCommonDir);
-  return path.join(absoluteGitCommonDir, "agents-locks");
+  const realGitCommonDir = await fs.realpath(absoluteGitCommonDir);
+  return path.join(realGitCommonDir, "agents-locks");
 }
 
 // src/lock/store.ts
-import { promises as fs } from "fs";
+import { promises as fs2 } from "fs";
 import path2 from "path";
 
 // src/timestamp.ts
@@ -200,12 +202,12 @@ function doneDir(locksRoot) {
   return path2.join(locksRoot, DONE_SUBDIR);
 }
 async function ensureDirs(locksRoot) {
-  await fs.mkdir(doneDir(locksRoot), { recursive: true });
+  await fs2.mkdir(doneDir(locksRoot), { recursive: true });
 }
 async function listMarkdownFiles(dir) {
   let entries;
   try {
-    entries = await fs.readdir(dir);
+    entries = await fs2.readdir(dir);
   } catch (error) {
     if (error.code === "ENOENT") return [];
     throw error;
@@ -213,14 +215,14 @@ async function listMarkdownFiles(dir) {
   return entries.filter((name) => name.endsWith(".md")).map((name) => path2.join(dir, name));
 }
 async function readRecord(filePath) {
-  const raw = await fs.readFile(filePath, "utf8");
+  const raw = await fs2.readFile(filePath, "utf8");
   const parsed = parseLockFile(raw);
   return { ...parsed, filePath };
 }
 async function writeRecord(record) {
   const contents = serializeLockFile(record);
-  await fs.mkdir(path2.dirname(record.filePath), { recursive: true });
-  await fs.writeFile(record.filePath, contents, "utf8");
+  await fs2.mkdir(path2.dirname(record.filePath), { recursive: true });
+  await fs2.writeFile(record.filePath, contents, "utf8");
 }
 async function readAllRecords(locksRoot, status) {
   const dirs = [];
@@ -245,7 +247,7 @@ async function uniqueFilePath(dir, timestamp, slug) {
     const candidateId = suffix === 0 ? `${timestamp}-${slug}` : `${timestamp}-${slug}-${suffix + 1}`;
     const filePath = path2.join(dir, `${candidateId}.md`);
     try {
-      await fs.access(filePath);
+      await fs2.access(filePath);
       suffix += 1;
     } catch {
       return { filePath, id: candidateId };
@@ -350,7 +352,7 @@ async function finishLock(locksRoot, params) {
   const oldFilePath = record.filePath;
   record.filePath = newFilePath;
   await writeRecord(record);
-  await fs.unlink(oldFilePath);
+  await fs2.unlink(oldFilePath);
   return { id: record.frontmatter.id, filePath: newFilePath };
 }
 
