@@ -651,6 +651,8 @@ Usage:
   agent-locks claim [options]           Create a new lock. See "agent-locks claim --help".
   agent-locks update <lock-id> [options]  Mark a task done/undone on an existing lock. See "agent-locks update --help".
   agent-locks finish <lock-id> [--summary <text>]  Mark a lock done and archive it.
+  agent-locks heartbeat <lock-id>        Bump a lock's updated timestamp with no other change. See "Staleness detection" in the README.
+  agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks --help                    Show this message.
 
 Every subcommand talks to the exact same lock store the MCP tools use \u2014 a human running "agent-locks status" and an agent calling lock_query see identical, live state.`;
@@ -661,6 +663,7 @@ Options:
   --scope <glob>                Only locks whose scope overlaps this glob. Repeatable.
   --agent <id>                  Only locks with this exact agent_id.
   --text <query>                Case-insensitive substring search over title + notes.
+  --stale-minutes <n>           Override the staleness threshold (minutes) for this call only.
   --json                        Print raw JSON instead of a formatted table.`;
 var CLAIM_USAGE = `agent-locks claim [options]
 
@@ -679,9 +682,20 @@ Options:
   --undone               Mark the task not done.
   --note <text>           Append a free-text note to the lock.
   --json                 Print raw JSON instead of a short confirmation line.`;
+var REAP_USAGE = `agent-locks reap [lock-id] [options]
+
+Reaps (finishes, same as "agent-locks finish") every currently-stale active lock, or a
+single one if lock-id is given. Refuses to reap a named lock-id that isn't actually
+stale \u2014 never a back door to force-finish someone else's live work.
+
+Options:
+  --stale-minutes <n>    Override the staleness threshold for this call only. Defaults
+                          to AGENT_LOCKS_STALE_MINUTES or 60.
+  --dry-run              Report what would be reaped without writing anything.
+  --json                 Print raw JSON instead of a short confirmation line.`;
 var CliUsageError = class extends Error {
 };
-var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help"]);
+var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help", "--dry-run"]);
 function parseArgs(argv) {
   const positionals = [];
   const flags = /* @__PURE__ */ new Map();
@@ -715,20 +729,35 @@ function oneOf(flags, name) {
 function allOf(flags, name) {
   return flags.get(name) ?? [];
 }
+function formatStaleForSeconds(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds / 3600)}h`;
+}
 function formatLockTable(locks) {
   if (locks.length === 0) return "(no locks)";
   const rows = locks.map((lock) => [
     lock.id,
     lock.status,
     `${lock.percentComplete}%`,
+    lock.status === "active" ? lock.stale ? `yes (${formatStaleForSeconds(lock.staleForSeconds)})` : "no" : "-",
     lock.agent_id ?? "(unknown agent)",
     lock.scope.join(", "),
     lock.title
   ]);
-  const header = ["ID", "STATUS", "DONE", "AGENT", "SCOPE", "TITLE"];
+  const header = ["ID", "STATUS", "DONE", "STALE", "AGENT", "SCOPE", "TITLE"];
   const widths = header.map((h, col) => Math.max(h.length, ...rows.map((r) => r[col].length)));
   const formatRow = (row) => row.map((cell, col) => cell.padEnd(widths[col])).join("  ");
   return [formatRow(header), formatRow(header.map((h) => "-".repeat(h.length))), ...rows.map(formatRow)].join("\n");
+}
+function parseStaleMinutesFlag(flags) {
+  const raw = oneOf(flags.flags, "--stale-minutes");
+  if (raw === void 0) return void 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new CliUsageError(`--stale-minutes must be a positive number (got "${raw}").`);
+  }
+  return parsed;
 }
 async function cmdStatus() {
   const locksRoot = await resolveLocksRoot();
@@ -749,12 +778,14 @@ async function cmdList(flags) {
   const scope = allOf(flags.flags, "--scope");
   const agent_id = oneOf(flags.flags, "--agent");
   const text = oneOf(flags.flags, "--text");
+  const stale_minutes = parseStaleMinutesFlag(flags);
   const locksRoot = await resolveLocksRoot();
   const locks = await queryLocks(locksRoot, {
     status,
     scope: scope.length > 0 ? scope : void 0,
     agent_id,
-    text
+    text,
+    stale_minutes
   });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(locks, null, 2));
@@ -767,8 +798,9 @@ async function cmdCheck(flags) {
   if (scope.length === 0) {
     throw new CliUsageError('agent-locks check requires at least one scope glob, e.g. "agent-locks check src/auth/**".');
   }
+  const stale_minutes = parseStaleMinutesFlag(flags);
   const locksRoot = await resolveLocksRoot();
-  const conflicts = await checkConflicts(locksRoot, scope);
+  const conflicts = await checkConflicts(locksRoot, scope, stale_minutes);
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(conflicts, null, 2));
     return;
@@ -835,6 +867,41 @@ async function cmdFinish(flags) {
     console.log(`Lock ${result.id} finished and archived.`);
   }
 }
+async function cmdHeartbeat(flags) {
+  const lockId = flags.positionals[0];
+  if (!lockId) throw new CliUsageError("agent-locks heartbeat requires a lock id as its first argument.");
+  const locksRoot = await resolveLocksRoot();
+  const result = await heartbeatLock(locksRoot, { lock_id: lockId });
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`Lock ${result.id} heartbeat sent (updated: ${result.updated}).`);
+  }
+}
+async function cmdReap(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(REAP_USAGE);
+    return;
+  }
+  const lockId = flags.positionals[0];
+  const stale_minutes = parseStaleMinutesFlag(flags);
+  const dry_run = flags.boolFlags.has("--dry-run");
+  const locksRoot = await resolveLocksRoot();
+  const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(reaped, null, 2));
+    return;
+  }
+  if (reaped.length === 0) {
+    console.log("No stale locks to reap.");
+    return;
+  }
+  const verb = dry_run ? "Would reap" : "Reaped";
+  console.log(`${verb} ${reaped.length} lock(s):`);
+  for (const lock of reaped) {
+    console.log(`  ${lock.id} \u2014 "${lock.title}" (stale for ${formatStaleForSeconds(lock.staleForSeconds)})`);
+  }
+}
 async function runCli(argv) {
   const [command, ...rest] = argv;
   if (command === void 0 || command === "--help" || command === "-h") {
@@ -861,6 +928,12 @@ async function runCli(argv) {
       case "finish":
         await cmdFinish(parseArgs(rest));
         return 0;
+      case "heartbeat":
+        await cmdHeartbeat(parseArgs(rest));
+        return 0;
+      case "reap":
+        await cmdReap(parseArgs(rest));
+        return 0;
       default:
         console.error(`agent-locks: unknown command "${command}".
 `);
@@ -872,7 +945,7 @@ async function runCli(argv) {
       console.error(`agent-locks: ${error.message}`);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotStaleError) {
       console.error(`agent-locks: ${error.message}`);
       return 1;
     }

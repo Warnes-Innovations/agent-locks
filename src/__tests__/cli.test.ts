@@ -181,6 +181,119 @@ describe('runCli', () => {
   });
 });
 
+// Lock timestamps have whole-second precision (see timestamp.ts), so a check
+// made mere milliseconds after an operation can show up to ~1000ms of
+// apparent staleness from truncation alone, with zero real inactivity.
+// SLEEP_MS is comfortably over the threshold below; SHORT_STALE_MINUTES is
+// well below that real wait but well above both the ~1000ms truncation
+// noise floor AND realistic scheduling overhead under a fully parallel test
+// run (see staleness.test.ts for the full reasoning — this file has the
+// same "fresh lock created right after a stale one" pattern that needs the
+// wider margin, not just the truncation-floor margin). NOT_STALE_MINUTES is
+// used for immediate (no-sleep) "not stale" checks. Kept local here since
+// this file doesn't otherwise depend on staleness.test.ts.
+const SLEEP_MS = 2500;
+const SHORT_STALE_MINUTES = '0.03'; // 1800ms, passed as a CLI flag value (string)
+const NOT_STALE_MINUTES = '0.1'; // 6000ms
+const sleepPastStaleThreshold = () => new Promise((resolve) => setTimeout(resolve, SLEEP_MS));
+
+describe('runCli heartbeat/reap', () => {
+  it('heartbeat resets an active lock to not-stale', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Long task', '--scope', 'a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    await sleepPastStaleThreshold();
+    logs.length = 0;
+    await runCliIn(repo, ['list', '--json', '--stale-minutes', SHORT_STALE_MINUTES]);
+    expect(JSON.parse(logs[0])[0].stale).toBe(true);
+
+    const heartbeatCode = await runCliIn(repo, ['heartbeat', lockId]);
+    expect(heartbeatCode).toBe(0);
+
+    logs.length = 0;
+    await runCliIn(repo, ['list', '--json', '--stale-minutes', NOT_STALE_MINUTES]);
+    expect(JSON.parse(logs[0])[0].stale).toBe(false);
+  });
+
+  it('heartbeat on a nonexistent lock id is a clear exit-1 error, not a stack trace', async () => {
+    const { errors } = captureConsole();
+    const code = await runCliIn(repo, ['heartbeat', 'nonexistent']);
+    expect(code).toBe(1);
+    expect(errors[0]).toContain('No lock found with id "nonexistent"');
+  });
+
+  it('heartbeat requires a lock id', async () => {
+    const { errors } = captureConsole();
+    const code = await runCliIn(repo, ['heartbeat']);
+    expect(code).toBe(1);
+    expect(errors[0]).toContain('requires a lock id');
+  });
+
+  it('reap with no lock_id reaps every stale active lock and reports them', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Stale one', '--scope', 'a/**']);
+    const staleId = logs[logs.length - 1].split(' ').pop() as string;
+
+    await sleepPastStaleThreshold();
+    await runCliIn(repo, ['claim', '--title', 'Fresh one', '--scope', 'b/**']);
+    const freshId = logs[logs.length - 1].split(' ').pop() as string;
+
+    logs.length = 0;
+    const code = await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
+    expect(code).toBe(0);
+    expect(logs.join('\n')).toContain('Reaped 1 lock(s)');
+    expect(logs.join('\n')).toContain(staleId);
+    expect(logs.join('\n')).not.toContain(freshId);
+
+    logs.length = 0;
+    await runCliIn(repo, ['list', '--json', '--status', 'active']);
+    const stillActive = JSON.parse(logs[0]) as Array<{ id: string }>;
+    expect(stillActive.map((l) => l.id)).toEqual([freshId]);
+  });
+
+  it('reap --dry-run reports without mutating anything', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    await sleepPastStaleThreshold();
+    logs.length = 0;
+    await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES, '--dry-run']);
+    expect(logs.join('\n')).toContain('Would reap 1 lock(s)');
+
+    logs.length = 0;
+    await runCliIn(repo, ['list', '--json']);
+    expect(JSON.parse(logs[0]).map((l: { id: string }) => l.id)).toEqual([lockId]);
+  });
+
+  it('reap refuses to reap a named lock_id that is not actually stale', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    const code = await runCliIn(repo, ['reap', lockId, '--stale-minutes', '1000']);
+    expect(code).toBe(1);
+    expect(errors[0]).toContain('is not stale');
+  });
+
+  it('reap with no stale locks reports none, not an error', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'fresh', '--scope', 'a/**']);
+    logs.length = 0;
+    const code = await runCliIn(repo, ['reap', '--stale-minutes', '1000']);
+    expect(code).toBe(0);
+    expect(logs.join('\n')).toContain('No stale locks to reap');
+  });
+
+  it('reap rejects a non-positive --stale-minutes value', async () => {
+    const { errors } = captureConsole();
+    const code = await runCliIn(repo, ['reap', '--stale-minutes', '0']);
+    expect(code).toBe(1);
+    expect(errors[0]).toContain('--stale-minutes must be a positive number');
+  });
+});
+
 describe('CLI dispatch via the actual compiled binary', () => {
   it('running dist/index.js with a CLI subcommand exits with the CLI\'s code, not the MCP server', async () => {
     // Complements e2e.test.ts, which already proves argv.length === 0 starts

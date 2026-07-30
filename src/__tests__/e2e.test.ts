@@ -131,9 +131,13 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     // NOT_STALE_MINUTES is used for immediate (no-sleep) "not stale" checks,
     // comfortably above the noise floor on its own. See staleness.test.ts,
     // which documents and unit-tests this same reasoning directly.
-    const SLEEP_MS = 1100;
-    const SHORT_STALE_MINUTES = 0.01; // 600ms
-    const NOT_STALE_MINUTES = 0.05; // 3000ms
+    // Widened from an earlier 1100ms/600ms/3000ms to stay robust under a
+    // fully parallel test run (see staleness.test.ts for why: realistic
+    // scheduling overhead between an operation and its check can exceed a
+    // too-tight margin under real CPU contention from other test files).
+    const SLEEP_MS = 2500;
+    const SHORT_STALE_MINUTES = 0.03; // 1800ms
+    const NOT_STALE_MINUTES = 0.1; // 6000ms
     const sleepPastStaleThreshold = () => new Promise((resolve) => setTimeout(resolve, SLEEP_MS));
 
     const createResult = await client.callTool({

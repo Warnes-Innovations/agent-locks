@@ -201,15 +201,21 @@ agent-locks update <lock-id> --task <text> [--done | --undone] [--note <text>]
 # Same as lock_finish
 agent-locks finish <lock-id> [--summary <text>]
 
+# Same as lock_heartbeat
+agent-locks heartbeat <lock-id>
+
+# Same as lock_reap
+agent-locks reap [lock-id] [--stale-minutes <n>] [--dry-run] [--json]
+
 # Explicit alias for "no arguments" — starts the MCP server
 agent-locks serve
 ```
 
+`list`/`check` also accept `--stale-minutes <n>` to override the staleness threshold for that call, matching `lock_query`/`lock_check_conflict`'s own `stale_minutes` argument. The table view of `status`/`list`/`check` includes a STALE column (`yes (2h)` / `no` / `-` for done locks).
+
 Every subcommand resolves `locksRoot` fresh via `resolveLocksRoot()`, the same as every MCP tool handler — running the CLI from one worktree while an agent's MCP session is live in another worktree of the same repo still coordinates correctly, for the same git-common-dir reason the whole tool exists.
 
 No new dependency was added for this — argument parsing is hand-rolled (`src/cli.ts`) to match the project's existing minimal footprint.
-
-`lock_heartbeat`/`lock_reap` (below) are not yet exposed as CLI subcommands — that's a natural small follow-up once both PRs land upstream; kept separate so each PR stays independently reviewable regardless of merge order.
 
 ## Staleness detection
 

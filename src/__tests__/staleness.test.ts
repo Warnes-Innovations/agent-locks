@@ -22,14 +22,23 @@ const STALE_MINUTES_ENV_VAR = 'AGENT_LOCKS_STALE_MINUTES';
 // later can already show up to ~1000ms of apparent staleness purely from
 // truncation, with no real inactivity at all. Tests here account for that
 // deliberately rather than fighting it:
-//   - "definitely stale" tests sleep past SLEEP_MS (comfortably over one
-//     real second) and use SHORT_STALE_MINUTES, which is well below the
-//     real elapsed time but well above the ~1000ms truncation noise floor.
+//   - "definitely stale" tests sleep past SLEEP_MS (comfortably over the
+//     threshold below) and use SHORT_STALE_MINUTES.
 //   - "definitely not stale" tests use NOT_STALE_MINUTES, comfortably above
-//     that same ~1000ms noise floor, with no sleep at all.
-const SLEEP_MS = 1100;
-const SHORT_STALE_MINUTES = 0.01; // 600ms — exceeded by any real SLEEP_MS-length wait, never by truncation noise alone
-const NOT_STALE_MINUTES = 0.05; // 3000ms — comfortably above the ~1000ms truncation noise floor with zero real wait
+//     the ~1000ms truncation noise floor, with no sleep at all.
+//   - "control" locks meant to stay fresh (e.g. a lock created right after
+//     the sleep, in a test asserting it's NOT reaped alongside stale ones)
+//     need their own margin against real scheduling overhead between their
+//     creation and the moment the assertion actually runs — under a fully
+//     parallel test run (many files, several with their own real sleeps,
+//     genuinely competing for the CPU) that gap was observed to occasionally
+//     exceed a too-tight threshold, reaping the "fresh" control lock too.
+//     SHORT_STALE_MINUTES is set well above that realistic overhead, not
+//     just above the truncation floor, specifically to keep those tests
+//     robust under full-suite parallel load, not just in isolation.
+const SLEEP_MS = 2500;
+const SHORT_STALE_MINUTES = 0.03; // 1800ms — well above both the ~1000ms truncation floor and realistic scheduling overhead between a "fresh" control lock's creation and the moment it's checked
+const NOT_STALE_MINUTES = 0.1; // 6000ms — comfortably above both floors with zero real wait
 
 function sleepPastStaleThreshold(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, SLEEP_MS));
