@@ -74,10 +74,12 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     expect(instructions).toContain('cannot detect your agent id');
   });
 
-  it('lists exactly the 5 documented tools', async () => {
+  it('lists exactly the 7 documented tools', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(['lock_check_conflict', 'lock_create', 'lock_finish', 'lock_query', 'lock_update'].sort());
+    expect(names).toEqual(
+      ['lock_check_conflict', 'lock_create', 'lock_finish', 'lock_heartbeat', 'lock_query', 'lock_reap', 'lock_update'].sort(),
+    );
   });
 
   it('drives a real create -> query -> update -> finish round trip against the filesystem', async () => {
@@ -118,6 +120,79 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     const doneQueryResult = await client.callTool({ name: 'lock_query', arguments: { status: 'done' } });
     const doneQueried = toolResultJson(doneQueryResult) as Array<{ id: string; status: string }>;
     expect(doneQueried.find((l) => l.id === created.id)?.status).toBe('done');
+  });
+
+  it('drives a real heartbeat -> stale detection -> reap round trip against the filesystem', async () => {
+    // Lock timestamps have whole-SECOND precision (see timestamp.ts), so a
+    // check made mere milliseconds after creation can show up to ~1000ms of
+    // apparent staleness from truncation alone, with zero real inactivity.
+    // SLEEP_MS is comfortably over one real second; SHORT_STALE_MINUTES is
+    // well below that real wait but well above the truncation noise floor;
+    // NOT_STALE_MINUTES is used for immediate (no-sleep) "not stale" checks,
+    // comfortably above the noise floor on its own. See staleness.test.ts,
+    // which documents and unit-tests this same reasoning directly.
+    const SLEEP_MS = 1100;
+    const SHORT_STALE_MINUTES = 0.01; // 600ms
+    const NOT_STALE_MINUTES = 0.05; // 3000ms
+    const sleepPastStaleThreshold = () => new Promise((resolve) => setTimeout(resolve, SLEEP_MS));
+
+    const createResult = await client.callTool({
+      name: 'lock_create',
+      arguments: { title: 'Staleness e2e lock', scope: ['stale/**'], tasks: [] },
+    });
+    const created = toolResultJson(createResult) as { id: string };
+
+    await sleepPastStaleThreshold();
+    const staleQuery = await client.callTool({
+      name: 'lock_query',
+      arguments: { stale_minutes: SHORT_STALE_MINUTES },
+    });
+    const staleResults = toolResultJson(staleQuery) as Array<{ id: string; stale: boolean; staleForSeconds: number }>;
+    const found = staleResults.find((l) => l.id === created.id);
+    expect(found?.stale).toBe(true);
+    expect(found?.staleForSeconds).toBeGreaterThan(0);
+
+    // A real MCP tool error, not a JS throw, for a heartbeat on the wrong lock id.
+    const badHeartbeat = await client.callTool({ name: 'lock_heartbeat', arguments: { lock_id: 'nonexistent' } });
+    expect(badHeartbeat.isError).toBe(true);
+
+    // Heartbeating the real lock resets it to not-stale immediately.
+    await client.callTool({ name: 'lock_heartbeat', arguments: { lock_id: created.id } });
+    const afterHeartbeat = await client.callTool({ name: 'lock_query', arguments: { stale_minutes: NOT_STALE_MINUTES } });
+    const afterHeartbeatResults = toolResultJson(afterHeartbeat) as Array<{ id: string; stale: boolean }>;
+    expect(afterHeartbeatResults.find((l) => l.id === created.id)?.stale).toBe(false);
+
+    // Reaping a lock that is NOT stale is a real MCP tool error, not a silent finish.
+    const reapNotStale = await client.callTool({
+      name: 'lock_reap',
+      arguments: { lock_id: created.id, stale_minutes: 1000 },
+    });
+    expect(reapNotStale.isError).toBe(true);
+    const reapErrorText = (reapNotStale.content as Array<{ text?: string }>)[0].text;
+    expect(reapErrorText).toContain('is not stale');
+
+    // Let it go stale again, then dry_run must report it without mutating anything.
+    await sleepPastStaleThreshold();
+    const dryRunResult = await client.callTool({
+      name: 'lock_reap',
+      arguments: { lock_id: created.id, stale_minutes: SHORT_STALE_MINUTES, dry_run: true },
+    });
+    const dryRunReaped = toolResultJson(dryRunResult) as Array<{ id: string }>;
+    expect(dryRunReaped.map((l) => l.id)).toContain(created.id);
+    const stillActiveQuery = await client.callTool({ name: 'lock_query', arguments: {} });
+    const stillActive = toolResultJson(stillActiveQuery) as Array<{ id: string; status: string }>;
+    expect(stillActive.find((l) => l.id === created.id)?.status).toBe('active');
+
+    // A real (non-dry-run) reap actually moves it to done, with an honest note.
+    const reapResult = await client.callTool({
+      name: 'lock_reap',
+      arguments: { lock_id: created.id, stale_minutes: SHORT_STALE_MINUTES },
+    });
+    const reaped = toolResultJson(reapResult) as Array<{ id: string }>;
+    expect(reaped.map((l) => l.id)).toContain(created.id);
+    const doneQuery = await client.callTool({ name: 'lock_query', arguments: { status: 'done' } });
+    const doneResults = toolResultJson(doneQuery) as Array<{ id: string; status: string }>;
+    expect(doneResults.find((l) => l.id === created.id)?.status).toBe('done');
   });
 
   it('reports a real MCP tool error (isError: true) rather than throwing or silently no-op-ing on a bad task_text', async () => {

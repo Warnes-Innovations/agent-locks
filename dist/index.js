@@ -49,6 +49,17 @@ function formatTimestamp(date = /* @__PURE__ */ new Date()) {
   const seconds = pad(date.getUTCSeconds());
   return `${year}-${month}-${day}T${hours}-${minutes}-${seconds}`;
 }
+var TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})$/;
+function parseTimestamp(value) {
+  const match = TIMESTAMP_RE.exec(value);
+  if (!match) {
+    throw new Error(`agent-locks: "${value}" is not a valid agent-locks timestamp (expected YYYY-MM-DDTHH-MM-SS).`);
+  }
+  const [, year, month, day, hours, minutes, seconds] = match;
+  return new Date(
+    Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hours), Number(minutes), Number(seconds))
+  );
+}
 function slugify(title) {
   const slug = title.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   return slug.length > 0 ? slug : "untitled";
@@ -156,12 +167,19 @@ function scopesOverlap(a, b) {
 }
 
 // src/lock/types.ts
+var DEFAULT_STALE_MINUTES = 60;
 function computePercentComplete(tasks) {
   if (tasks.length === 0) return 100;
   const done = tasks.filter((t) => t.done).length;
   return Math.round(done / tasks.length * 100);
 }
-function toSummary(record) {
+function toSummary(record, options = {}) {
+  const staleMinutes = options.staleMinutes ?? DEFAULT_STALE_MINUTES;
+  const now = options.now ?? /* @__PURE__ */ new Date();
+  const updatedAt = parseTimestamp(record.frontmatter.updated);
+  const staleForMs = Math.max(0, now.getTime() - updatedAt.getTime());
+  const staleForSeconds = Math.round(staleForMs / 1e3);
+  const stale = record.frontmatter.status === "active" && staleForMs > staleMinutes * 6e4;
   return {
     id: record.frontmatter.id,
     title: record.title,
@@ -169,12 +187,22 @@ function toSummary(record) {
     percentComplete: computePercentComplete(record.tasks),
     scope: record.frontmatter.scope,
     agent_id: record.frontmatter.agent_id,
-    parent_agent_id: record.frontmatter.parent_agent_id
+    parent_agent_id: record.frontmatter.parent_agent_id,
+    stale,
+    staleForSeconds
   };
 }
 
 // src/lock/store.ts
 var DONE_SUBDIR = "done";
+var STALE_MINUTES_ENV_VAR = "AGENT_LOCKS_STALE_MINUTES";
+function resolveStaleMinutes(override) {
+  if (override !== void 0) return override;
+  const raw = process.env[STALE_MINUTES_ENV_VAR];
+  if (raw === void 0) return DEFAULT_STALE_MINUTES;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_MINUTES;
+}
 var LockNotFoundError = class extends Error {
   constructor(lockId) {
     super(`No lock found with id "${lockId}".`);
@@ -296,12 +324,14 @@ async function queryLocks(locksRoot, params) {
     }
     return true;
   });
-  return filtered.map(toSummary);
+  const staleMinutes = resolveStaleMinutes(params.stale_minutes);
+  return filtered.map((record) => toSummary(record, { staleMinutes }));
 }
-async function checkConflicts(locksRoot, scope) {
+async function checkConflicts(locksRoot, scope, staleMinutesOverride) {
   const records = await readAllRecords(locksRoot, "active");
   const conflicting = records.filter((record) => scopesOverlap(scope, record.frontmatter.scope));
-  return conflicting.map(toSummary);
+  const staleMinutes = resolveStaleMinutes(staleMinutesOverride);
+  return conflicting.map((record) => toSummary(record, { staleMinutes }));
 }
 async function updateLock(locksRoot, params) {
   const record = await findRecordById(locksRoot, params.lock_id);
@@ -355,6 +385,73 @@ async function finishLock(locksRoot, params) {
   await fs2.unlink(oldFilePath);
   return { id: record.frontmatter.id, filePath: newFilePath };
 }
+async function heartbeatLock(locksRoot, params) {
+  const activeFiles = await listMarkdownFiles(activeDir(locksRoot));
+  for (const filePath of activeFiles) {
+    const record = await readRecord(filePath);
+    if (record.frontmatter.id === params.lock_id) {
+      record.frontmatter.updated = formatTimestamp();
+      await writeRecord(record);
+      return { id: record.frontmatter.id, updated: record.frontmatter.updated };
+    }
+  }
+  const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
+  for (const filePath of doneFiles) {
+    const candidate = await readRecord(filePath);
+    if (candidate.frontmatter.id === params.lock_id) {
+      throw new LockNotActiveError(params.lock_id);
+    }
+  }
+  throw new LockNotFoundError(params.lock_id);
+}
+var LockNotStaleError = class extends Error {
+  constructor(lockId, staleForSeconds, staleMinutes) {
+    super(
+      `Lock "${lockId}" is not stale (last updated ${staleForSeconds}s ago; the threshold is ${staleMinutes} minute(s)). Refusing to reap a lock that isn't actually stale \u2014 reap is for cleaning up abandoned work, not an alternate way to call lock_finish.`
+    );
+    this.name = "LockNotStaleError";
+  }
+};
+async function reapStaleLocks(locksRoot, params = {}) {
+  const staleMinutes = resolveStaleMinutes(params.stale_minutes);
+  const now = /* @__PURE__ */ new Date();
+  const activeRecords = await readAllRecords(locksRoot, "active");
+  const candidates = activeRecords.filter((record) => {
+    if (params.lock_id !== void 0 && record.frontmatter.id !== params.lock_id) return false;
+    return toSummary(record, { staleMinutes, now }).stale;
+  });
+  if (params.lock_id !== void 0 && candidates.length === 0) {
+    const match = activeRecords.find((record) => record.frontmatter.id === params.lock_id);
+    if (match) {
+      const summary = toSummary(match, { staleMinutes, now });
+      throw new LockNotStaleError(params.lock_id, summary.staleForSeconds, staleMinutes);
+    }
+    const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
+    for (const filePath of doneFiles) {
+      const candidate = await readRecord(filePath);
+      if (candidate.frontmatter.id === params.lock_id) throw new LockNotActiveError(params.lock_id);
+    }
+    throw new LockNotFoundError(params.lock_id);
+  }
+  const reaped = [];
+  for (const record of candidates) {
+    const summary = toSummary(record, { staleMinutes, now });
+    reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
+    if (params.dry_run) continue;
+    record.notes.push(
+      `Auto-reaped: no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s) (threshold: ${staleMinutes} minute(s)).`
+    );
+    record.frontmatter.status = "done";
+    record.frontmatter.updated = formatTimestamp();
+    const newFilePath = path2.join(doneDir(locksRoot), path2.basename(record.filePath));
+    const oldFilePath = record.filePath;
+    record.filePath = newFilePath;
+    await ensureDirs(locksRoot);
+    await writeRecord(record);
+    await fs2.unlink(oldFilePath);
+  }
+  return reaped;
+}
 
 // src/server.ts
 var SERVER_NAME = "agent-locks";
@@ -364,8 +461,10 @@ var INSTRUCTIONS = `agent-locks: filesystem-based work-claiming locks shared acr
 Recommended workflow, in order:
 1. Before starting work on a set of files, call lock_query (default view, active locks only) to see what other agents are already doing, and call lock_check_conflict with the globs you're about to touch to see if anyone's active lock overlaps them. lock_check_conflict is purely informational \u2014 it never blocks you, it just gives you information to make your own judgment call with.
 2. If you decide to proceed, call lock_create to claim the work: give it a title, the glob patterns describing what you're touching, and a checklist of the tasks you plan to do.
-3. As you actually complete each task, call lock_update immediately \u2014 not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime.
+3. As you actually complete each task, call lock_update immediately \u2014 not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime. If you're doing a long stretch of work without a task boundary to check off, call lock_heartbeat periodically so your lock doesn't read as abandoned to anyone else watching.
 4. When the work is done, call lock_finish with a short summary. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
+
+Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) \u2014 true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict \u2014 nothing is ever cleaned up as a side effect of reading. If you see a stale lock that's blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it, so it can't be used as a workaround to force-finish someone else's live work.
 
 Honesty note on agent identity: this server cannot detect your agent id or your parent agent's id automatically \u2014 no MCP transport mechanism exposes that. Pass agent_id/parent_agent_id to lock_create only if you already know them from your own context (e.g. an orchestration harness gave you an explicit id); otherwise omit them and they will be recorded as null. Do not guess or fabricate an id.`;
 function textResult(text) {
@@ -384,21 +483,22 @@ function createServer() {
     "lock_query",
     {
       title: "Query locks",
-      description: 'Lists agent-locks work-claim locks for the current git repository (shared across all its worktrees). IMPORTANT: when `status` is omitted, this ONLY returns active locks \u2014 done/finished locks are excluded from the default view by design, so you see what is currently being worked on, not a full history. Pass status: "done" or status: "all" to include finished locks. Returns a compact summary per lock: {id, title, status, percentComplete, scope, agent_id, parent_agent_id}. percentComplete is computed from the ratio of checked to total tasks on that lock (a lock with zero tasks reports 100).',
+      description: `Lists agent-locks work-claim locks for the current git repository (shared across all its worktrees). IMPORTANT: when \`status\` is omitted, this ONLY returns active locks \u2014 done/finished locks are excluded from the default view by design, so you see what is currently being worked on, not a full history. Pass status: "done" or status: "all" to include finished locks. Returns a compact summary per lock: {id, title, status, percentComplete, scope, agent_id, parent_agent_id, stale, staleForSeconds}. percentComplete is computed from the ratio of checked to total tasks on that lock (a lock with zero tasks reports 100). stale is true for an ACTIVE lock not touched in over stale_minutes (default ${DEFAULT_STALE_MINUTES}) \u2014 computed fresh on every call, never mutates anything; done locks are never stale.`,
       inputSchema: {
         status: z.enum(["active", "done", "all"]).optional().describe('Which locks to include. Defaults to "active" (done locks are excluded unless you explicitly ask for them).'),
         scope: z.union([z.string(), z.array(z.string())]).optional().describe(
           "One or more glob patterns. Only locks whose own scope glob-overlaps at least one of these patterns are returned. Uses the same overlap heuristic as lock_check_conflict (see that tool's description for its limitations)."
         ),
         agent_id: z.string().optional().describe("Only return locks created with this exact agent_id."),
-        text: z.string().optional().describe("Free-text, case-insensitive substring search across each lock's title and its Notes section.")
+        text: z.string().optional().describe("Free-text, case-insensitive substring search across each lock's title and its Notes section."),
+        stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`)
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
-    async ({ status, scope, agent_id, text }) => {
+    async ({ status, scope, agent_id, text, stale_minutes }) => {
       try {
         const locksRoot = await resolveLocksRoot();
-        const results = await queryLocks(locksRoot, { status, scope, agent_id, text });
+        const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
         return textResult(JSON.stringify(results, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -409,16 +509,17 @@ function createServer() {
     "lock_check_conflict",
     {
       title: "Check for scope conflicts",
-      description: "Checks whether any currently ACTIVE lock claims file(s)/path(s) that overlap the glob patterns you pass in. This tool is purely INFORMATIONAL \u2014 it never blocks, refuses, or vetoes anything; it has no side effects and cannot prevent lock_create from proceeding. It exists only to give you information so you (the calling agent) can decide for yourself whether to proceed, coordinate with the other lock's owner, or pick a narrower scope. Overlap is determined by a static-prefix glob heuristic (not exact set intersection) that is intentionally biased toward reporting overlaps that turn out not to matter, rather than missing a real one \u2014 see this project's README for the exact heuristic and a documented case (filesystem case-sensitivity) it deliberately does not catch. Returns the same compact summary shape as lock_query for every overlapping active lock (empty array if none).",
+      description: "Checks whether any currently ACTIVE lock claims file(s)/path(s) that overlap the glob patterns you pass in. This tool is purely INFORMATIONAL \u2014 it never blocks, refuses, or vetoes anything; it has no side effects and cannot prevent lock_create from proceeding. It exists only to give you information so you (the calling agent) can decide for yourself whether to proceed, coordinate with the other lock's owner, or pick a narrower scope. Overlap is determined by a static-prefix glob heuristic (not exact set intersection) that is intentionally biased toward reporting overlaps that turn out not to matter, rather than missing a real one \u2014 see this project's README for the exact heuristic and a documented case (filesystem case-sensitivity) it deliberately does not catch. Returns the same compact summary shape as lock_query (including stale/staleForSeconds) for every overlapping active lock (empty array if none).",
       inputSchema: {
-        scope: z.array(z.string()).describe("Glob patterns describing the files/paths you are about to work on.")
+        scope: z.array(z.string()).describe("Glob patterns describing the files/paths you are about to work on."),
+        stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`)
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
-    async ({ scope }) => {
+    async ({ scope, stale_minutes }) => {
       try {
         const locksRoot = await resolveLocksRoot();
-        const results = await checkConflicts(locksRoot, scope);
+        const results = await checkConflicts(locksRoot, scope, stale_minutes);
         return textResult(JSON.stringify(results, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -487,6 +588,48 @@ function createServer() {
       try {
         const locksRoot = await resolveLocksRoot();
         const result = await finishLock(locksRoot, { lock_id, summary });
+        return textResult(JSON.stringify(result, null, 2));
+      } catch (error) {
+        return errorResult(error);
+      }
+    }
+  );
+  server.registerTool(
+    "lock_heartbeat",
+    {
+      title: "Heartbeat a lock",
+      description: "Bumps ONLY a lock's updated timestamp \u2014 no task, note, or scope change. Call this periodically during a long stretch of work that isn't naturally hitting lock_update often enough (completing a task also counts as a heartbeat for free) to keep the lock from being computed as stale by lock_query / lock_check_conflict. Restricted to active locks \u2014 errors clearly if lock_id does not exist, or exists but is already done (heartbeating finished work is not a meaningful operation).",
+      inputSchema: {
+        lock_id: z.string().describe("The id of the active lock to heartbeat.")
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+    },
+    async ({ lock_id }) => {
+      try {
+        const locksRoot = await resolveLocksRoot();
+        const result = await heartbeatLock(locksRoot, { lock_id });
+        return textResult(JSON.stringify(result, null, 2));
+      } catch (error) {
+        return errorResult(error);
+      }
+    }
+  );
+  server.registerTool(
+    "lock_reap",
+    {
+      title: "Reap stale lock(s)",
+      description: "Finishes (moves to the done archive, same mechanism as lock_finish) every ACTIVE lock currently computed as stale, or a single specific one if lock_id is given. This is an explicit, deliberate mutation \u2014 never a side effect of lock_query or lock_check_conflict reading state. Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (with how long) rather than finished by its owning agent, so the done archive stays honest. If lock_id is given but that lock is NOT actually stale, this errors rather than reaping it \u2014 reap cannot be used as a workaround to force-finish someone else's live work. Pass dry_run: true to see what WOULD be reaped without writing anything.",
+      inputSchema: {
+        lock_id: z.string().optional().describe("Reap only this lock id. Omit to reap every currently-stale active lock."),
+        stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
+        dry_run: z.boolean().optional().describe("If true, report what would be reaped without actually mutating anything.")
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+    },
+    async ({ lock_id, stale_minutes, dry_run }) => {
+      try {
+        const locksRoot = await resolveLocksRoot();
+        const result = await reapStaleLocks(locksRoot, { lock_id, stale_minutes, dry_run });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);

@@ -36,6 +36,29 @@ export function formatTimestamp(date: Date = new Date()): string {
   return `${year}-${month}-${day}T${hours}-${minutes}-${seconds}`;
 }
 
+const TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})$/;
+
+/**
+ * The inverse of formatTimestamp. Needed for staleness math (comparing a
+ * lock's `updated` field against "now"): a plain `new Date(str)` cannot
+ * parse this format reliably, since the dashed time portion isn't valid
+ * ISO 8601 and carries no explicit UTC marker for the runtime to key off.
+ *
+ * Throws on malformed input rather than returning an Invalid Date, so a
+ * corrupted or hand-edited frontmatter field fails loudly instead of
+ * silently comparing as "always stale" or "never stale".
+ */
+export function parseTimestamp(value: string): Date {
+  const match = TIMESTAMP_RE.exec(value);
+  if (!match) {
+    throw new Error(`agent-locks: "${value}" is not a valid agent-locks timestamp (expected YYYY-MM-DDTHH-MM-SS).`);
+  }
+  const [, year, month, day, hours, minutes, seconds] = match;
+  return new Date(
+    Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hours), Number(minutes), Number(seconds)),
+  );
+}
+
 /**
  * Turns a free-text title into a filesystem- and URL-safe kebab-case slug.
  * Used to build both the lock filename and its `id` frontmatter field.
