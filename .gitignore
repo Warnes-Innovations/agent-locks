@@ -1,3 +1,8 @@
 node_modules/
 *.tgz
 .DS_Store
+
+# pnpm's build-script approval state (from `pnpm approve-builds`, needed the
+# first time a contributor's pnpm prompts to approve esbuild's postinstall
+# script) — a machine-local trust decision, not portable project config.
+/pnpm-workspace.yaml
