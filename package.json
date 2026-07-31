@@ -5,6 +5,9 @@
   "type": "module",
   "license": "MIT",
   "author": "andysfruit021209@gmail.com",
+  "contributors": [
+    "Gregory R. Warnes <greg@warnes-innovations.com>"
+  ],
   "bin": {
     "agent-locks": "./dist/index.js"
   },
