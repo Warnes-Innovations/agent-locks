@@ -1,0 +1,33 @@
+# Copyright (C) 2026 Gregory R. Warnes
+# SPDX-License-Identifier: MIT
+#
+# The SPDX line above says MIT to match this repository's LICENSE. A file
+# asserting a different licence inside an MIT repository would be a licensing
+# claim, not a formatting detail.
+#
+# Read by tools/check_confidential.py in the maintainer's agent-config setup.
+#
+# One of:
+#   public-bound   — this repository is published, or is intended to be. Scan every
+#                    commit for confidential material.
+#   always-private — this repository will never be published. Skip the scan.
+#
+# ABSENT FILE MEANS public-bound. That default is deliberate: a repository nobody has
+# classified is exactly the one where nobody has considered the question.
+intent: public-bound
+
+# THIS REPOSITORY IS ALREADY PUBLIC. `gh repo view --json visibility` reports PUBLIC as
+# of 2026-07-30, so there is nothing prospective about this declaration. Anything
+# committed here is world-readable the moment it is pushed, and the history keeps it even
+# if the file is deleted afterwards.
+#
+# The declaration therefore does not buy a skip and is not a judgement call that could
+# later turn out wrong. It records that the question was asked, and it makes the scanner
+# report "nothing found" rather than the weaker "no declaration, defaulting to
+# public-bound, nobody has considered this" — two different statements that were
+# otherwise reported identically.
+#
+# There is also an `upstream` remote (github.com/luohoa97/agent-locks). GitHub does not
+# consider this repo a fork (isFork: false), so pushes go only to this origin — but the
+# upstream relationship means code here may be offered back upstream, which is a second,
+# independent path by which anything committed becomes public.
