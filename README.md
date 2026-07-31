@@ -54,13 +54,43 @@ $ git ls-files | grep some-lock
 
 ### How the path is resolved — freshly, every single call
 
-Every tool implementation calls `resolveLocksRoot()` (`src/git.ts`) at the start of its own handler, which runs `git rev-parse --git-common-dir` with `cwd` set to the server process's own current working directory (`process.cwd()`) **at that exact moment** — never cached across calls, never resolved once at server startup. There is no protocol-level or environment-variable mechanism for a stdio MCP server to learn "which worktree is this particular tool call morally about" (see the [Claude Code launch mechanics](#how-claude-code-launches-this-server) section below) — the server's own `cwd` at call time is the only signal available, and re-resolving it fresh every call costs one cheap subprocess spawn while removing any risk of relying on a stale assumption.
+Every tool implementation calls `resolveLocksRoot()` (`src/git.ts`) at the start of its own handler, which runs `git rev-parse --git-common-dir` with `cwd` set to the caller's `base_dir` if one was given, and otherwise to the server process's own current working directory (`process.cwd()`) **at that exact moment** — never cached across calls, never resolved once at server startup. There is no protocol-level or environment-variable mechanism for a stdio MCP server to learn "which worktree is this particular tool call morally about" (see the [Claude Code launch mechanics](#how-claude-code-launches-this-server) section below) — the server's own `cwd` at call time is the only signal available, and re-resolving it fresh every call costs one cheap subprocess spawn while removing any risk of relying on a stale assumption.
 
 ## How Claude Code launches this server
 
 Claude Code's `.mcp.json`/`claude mcp add` configuration for a stdio server has no `cwd` field. A spawned stdio server simply **inherits Claude Code's own current working directory** at the moment it's launched (standard `child_process.spawn` behavior when no explicit `cwd` is given) — i.e., whatever directory the `claude` session itself was started from, which for a worktree-rooted session is that worktree's own directory. This is exactly what this tool needs: two Claude Code sessions rooted in two different worktrees of the same repo will each spawn their own agent-locks process with a different `process.cwd()`, and both will resolve to the *same* `agents-locks/` directory via `--git-common-dir`.
 
 Claude Code does expose one environment variable to spawned stdio servers, `CLAUDE_PROJECT_DIR` — but this project **deliberately does not use it**. Per Claude Code's own docs, `CLAUDE_PROJECT_DIR` is "the stable project root" that "doesn't change when you add or remove working directories mid-session." That stability is exactly wrong for this tool: if a user works from a linked worktree, `CLAUDE_PROJECT_DIR` would likely still point at (or be defined relative to) the original/main project root rather than the worktree the session is actually rooted in, defeating the entire per-worktree design. Using the server process's own inherited `cwd` instead is what actually varies correctly across worktrees.
+
+## Claiming work in a *different* repository (`base_dir`)
+
+Everything above is about worktrees of **one** repository. But agents routinely work out of one checkout while writing into another — a session rooted in `project-a` that needs to edit `shared-config`, say. Without help, such a session can only create a lock in `project-a`, where the very agent it might collide with — the one working in `shared-config` — will never look. **A lock the colliding agent cannot see is decorative.**
+
+Every lock tool therefore accepts an optional `base_dir`: any path inside the repository you want to operate on.
+
+```json
+{
+  "name": "lock_create",
+  "arguments": {
+    "title": "Bump the shared eslint config",
+    "scope": ["packages/eslint-config/**"],
+    "tasks": ["Bump rules", "Run downstream builds"],
+    "base_dir": "/Users/me/src/shared-config"
+  }
+}
+```
+
+The lock lands in **`shared-config`**'s shared `.git`, where an agent working in `shared-config` sees it via a plain `lock_query` — which is the entire point.
+
+Three properties worth stating explicitly, each of them tested (`src/__tests__/crossRepo.test.ts`):
+
+- **It resolves to the git *common* dir, like everything else here.** A `base_dir` pointing at a linked worktree and one pointing at that repo's main checkout land in the same store. `base_dir` does not open a hole in the cross-worktree guarantee.
+- **A `base_dir` outside any git repository is a hard error**, never a silent fallback to the current directory. Falling back would file the lock in the wrong repository *and look like success* — strictly worse than failing, because the caller would believe the work was claimed.
+- **It is required, not decorative.** Omitting `base_dir` genuinely cannot reach another repository's locks; there is no accidental cross-repo leakage in either direction.
+
+Every lock is stamped with the repository it governs (`repository` in the frontmatter, and in every summary `lock_query` returns), so an agent reading a lock never has to infer that from the scope glob.
+
+`base_dir` is available on all 7 MCP tools and, as `--base-dir`, on every CLI subcommand except `serve`.
 
 ## File format
 
@@ -106,6 +136,8 @@ The `id` frontmatter field is, by design, **exactly the filename minus `.md`** �
 
 All seven are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
 
+All seven also accept an optional `base_dir` to operate on a different repository — omitted from the examples below for brevity; see [Claiming work in a *different* repository](#claiming-work-in-a-different-repository-base_dir).
+
 ### `lock_query`
 
 Lists locks. **Hard requirement, enforced and tested** (`src/__tests__/store.test.ts`): when `status` is omitted, done locks are excluded — you see current work, not history, by default.
@@ -116,7 +148,7 @@ Lists locks. **Hard requirement, enforced and tested** (`src/__tests__/store.tes
 { "name": "lock_query", "arguments": { "scope": "backend/src/oauth/client.ts" } }
 ```
 
-Returns `Array<{id, title, status, percentComplete, scope, agent_id, parent_agent_id, stale, staleForSeconds}>`. `percentComplete` is the ratio of checked to total tasks (a lock with zero tasks reports 100). See "Staleness detection" below for `stale`/`staleForSeconds` and the optional `stale_minutes` argument.
+Returns `Array<{id, title, status, percentComplete, scope, repository, agent_id, parent_agent_id, stale, staleForSeconds}>`. `percentComplete` is the ratio of checked to total tasks (a lock with zero tasks reports 100). `repository` is the root of the repo the lock governs, so a reader never has to infer that from the scope glob. See "Staleness detection" below for `stale`/`staleForSeconds` and the optional `stale_minutes` argument.
 
 ### `lock_check_conflict`
 
@@ -178,7 +210,7 @@ Finishes (same mechanism as `lock_finish`) every currently-stale active lock, or
 
 ## CLI usage
 
-The exact same lock store the 5 MCP tools above talk to is also reachable from a plain terminal or a shell script — useful for a human checking coordination state directly, or for any agent harness that can run a command but doesn't (yet) speak MCP.
+The exact same lock store the 7 MCP tools above talk to is also reachable from a plain terminal or a shell script — useful for a human checking coordination state directly, or for any agent harness that can run a command but doesn't (yet) speak MCP.
 
 `index.js` dispatches on `argv`: called with **no arguments** (or the explicit `serve` alias) it starts the MCP stdio server exactly as before — every existing MCP client config keeps working unchanged. Called with any other first argument, it runs as a CLI and exits with a real exit code (0 on success, 1 on a usage error or a store error like a missing lock id) instead of hanging waiting for JSON-RPC on stdin.
 
@@ -212,6 +244,18 @@ agent-locks serve
 ```
 
 `list`/`check` also accept `--stale-minutes <n>` to override the staleness threshold for that call, matching `lock_query`/`lock_check_conflict`'s own `stale_minutes` argument. The table view of `status`/`list`/`check` includes a STALE column (`yes (2h)` / `no` / `-` for done locks).
+
+Every subcommand except `serve` accepts `--base-dir <path>` to operate on another repository, mirroring the MCP tools' `base_dir`:
+
+```bash
+# What is being worked on in a different repo, from wherever you happen to be
+agent-locks status --base-dir ~/src/shared-config
+
+# Claim work there before you write into it
+agent-locks claim --base-dir ~/src/shared-config --title "Bump eslint config" --scope 'packages/eslint-config/**'
+```
+
+As with the MCP tools, a `--base-dir` that is not inside a git repository exits 1 with a clear error rather than quietly falling back to the current directory.
 
 Every subcommand resolves `locksRoot` fresh via `resolveLocksRoot()`, the same as every MCP tool handler — running the CLI from one worktree while an agent's MCP session is live in another worktree of the same repo still coordinates correctly, for the same git-common-dir reason the whole tool exists.
 
