@@ -23,7 +23,7 @@
  * agent session still coordinates correctly, for the same git-common-dir
  * reason documented in git.ts.
  */
-import { resolveLocksRoot, NotAGitRepoError } from './git.js';
+import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
   createLock,
   queryLocks,
@@ -64,6 +64,7 @@ Options:
   --agent <id>                  Only locks with this exact agent_id.
   --text <query>                Case-insensitive substring search over title + notes.
   --stale-minutes <n>           Override the staleness threshold (minutes) for this call only.
+  --base-dir <path>             Resolve locks from a different repository (any path inside it).
   --json                        Print raw JSON instead of a formatted table.`;
 
 const CLAIM_USAGE = `agent-locks claim [options]
@@ -74,6 +75,7 @@ Options:
   --task <text>          A task to track on this lock. Repeatable; order preserved.
   --agent <id>           Your own agent id, if you have one. Never fabricated if omitted.
   --parent <id>          Your parent agent's id, if known.
+  --base-dir <path>      Create the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
 
 const UPDATE_USAGE = `agent-locks update <lock-id> [options]
@@ -83,6 +85,7 @@ Options:
   --done                 Mark the task done (default if neither --done nor --undone given).
   --undone               Mark the task not done.
   --note <text>           Append a free-text note to the lock.
+  --base-dir <path>      Look up the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
 
 const REAP_USAGE = `agent-locks reap [lock-id] [options]
@@ -95,6 +98,7 @@ Options:
   --stale-minutes <n>    Override the staleness threshold for this call only. Defaults
                           to AGENT_LOCKS_STALE_MINUTES or 60.
   --dry-run              Report what would be reaped without writing anything.
+  --base-dir <path>      Reap locks in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
 
 class CliUsageError extends Error {}
@@ -179,6 +183,11 @@ function parseStaleMinutesFlag(flags: ParsedFlags): number | undefined {
   return parsed;
 }
 
+function resolveBaseDir(flags: ParsedFlags): string {
+  const raw = oneOf(flags.flags, '--base-dir');
+  return raw ?? process.cwd();
+}
+
 async function cmdStatus(): Promise<void> {
   const locksRoot = await resolveLocksRoot();
   const locks = await queryLocks(locksRoot, {});
@@ -200,7 +209,8 @@ async function cmdList(flags: ParsedFlags): Promise<void> {
   const text = oneOf(flags.flags, '--text');
   const stale_minutes = parseStaleMinutesFlag(flags);
 
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {
     status,
     scope: scope.length > 0 ? scope : undefined,
@@ -222,7 +232,8 @@ async function cmdCheck(flags: ParsedFlags): Promise<void> {
     throw new CliUsageError('agent-locks check requires at least one scope glob, e.g. "agent-locks check src/auth/**".');
   }
   const stale_minutes = parseStaleMinutesFlag(flags);
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const conflicts = await checkConflicts(locksRoot, scope, stale_minutes);
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(conflicts, null, 2));
@@ -249,8 +260,12 @@ async function cmdClaim(flags: ParsedFlags): Promise<void> {
   const agent_id = oneOf(flags.flags, '--agent') ?? null;
   const parent_agent_id = oneOf(flags.flags, '--parent') ?? null;
 
-  const locksRoot = await resolveLocksRoot();
-  const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id });
+  const cwd = resolveBaseDir(flags);
+  const [locksRoot, repoRoot] = await Promise.all([
+    resolveLocksRoot(cwd),
+    resolveRepoRoot(cwd),
+  ]);
+  const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot });
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(result, null, 2));
@@ -274,7 +289,8 @@ async function cmdUpdate(flags: ParsedFlags): Promise<void> {
   const done = !flags.boolFlags.has('--undone');
   const note = oneOf(flags.flags, '--note');
 
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const result = await updateLock(locksRoot, { lock_id: lockId, task_text: taskText, done, note });
 
   if (flags.boolFlags.has('--json')) {
@@ -289,7 +305,8 @@ async function cmdFinish(flags: ParsedFlags): Promise<void> {
   if (!lockId) throw new CliUsageError('agent-locks finish requires a lock id as its first argument.');
   const summary = oneOf(flags.flags, '--summary');
 
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const result = await finishLock(locksRoot, { lock_id: lockId, summary });
 
   if (flags.boolFlags.has('--json')) {
@@ -303,7 +320,8 @@ async function cmdHeartbeat(flags: ParsedFlags): Promise<void> {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError('agent-locks heartbeat requires a lock id as its first argument.');
 
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const result = await heartbeatLock(locksRoot, { lock_id: lockId });
 
   if (flags.boolFlags.has('--json')) {
@@ -322,7 +340,8 @@ async function cmdReap(flags: ParsedFlags): Promise<void> {
   const stale_minutes = parseStaleMinutesFlag(flags);
   const dry_run = flags.boolFlags.has('--dry-run');
 
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
 
   if (flags.boolFlags.has('--json')) {

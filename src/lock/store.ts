@@ -139,6 +139,8 @@ export interface CreateLockParams {
   tasks: string[];
   agent_id?: string | null;
   parent_agent_id?: string | null;
+  /** Canonical repository root path, recorded at creation time so lock summaries always carry it. Defaults to empty string for backward compat. */
+  repository?: string;
 }
 
 export interface CreateLockResult {
@@ -160,6 +162,7 @@ export async function createLock(locksRoot: string, params: CreateLockParams): P
     created: now,
     updated: now,
     scope: params.scope,
+    repository: params.repository ?? '',
   };
   const record: LockRecord = {
     filePath,

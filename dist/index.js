@@ -22,6 +22,18 @@ var NotAGitRepoError = class extends Error {
   }
 };
 async function resolveLocksRoot(cwd = process.cwd()) {
+  const realGitCommonDir = await getRealGitCommonDir(cwd);
+  return path.join(realGitCommonDir, "agents-locks");
+}
+async function resolveRepoRoot(cwd = process.cwd()) {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd });
+    return stdout.trim();
+  } catch (error) {
+    throw new NotAGitRepoError(cwd, error);
+  }
+}
+async function getRealGitCommonDir(cwd) {
   let stdout;
   try {
     ({ stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], { cwd }));
@@ -31,7 +43,7 @@ async function resolveLocksRoot(cwd = process.cwd()) {
   const gitCommonDir = stdout.trim();
   const absoluteGitCommonDir = path.resolve(cwd, gitCommonDir);
   const realGitCommonDir = await fs.realpath(absoluteGitCommonDir);
-  return path.join(realGitCommonDir, "agents-locks");
+  return realGitCommonDir;
 }
 
 // src/lock/store.ts
@@ -186,6 +198,7 @@ function toSummary(record, options = {}) {
     status: record.frontmatter.status,
     percentComplete: computePercentComplete(record.tasks),
     scope: record.frontmatter.scope,
+    repository: record.frontmatter.repository ?? "",
     agent_id: record.frontmatter.agent_id,
     parent_agent_id: record.frontmatter.parent_agent_id,
     stale,
@@ -294,7 +307,8 @@ async function createLock(locksRoot, params) {
     status: "active",
     created: now,
     updated: now,
-    scope: params.scope
+    scope: params.scope,
+    repository: params.repository ?? ""
   };
   const record = {
     filePath,
@@ -491,13 +505,17 @@ function createServer() {
         ),
         agent_id: z.string().optional().describe("Only return locks created with this exact agent_id."),
         text: z.string().optional().describe("Free-text, case-insensitive substring search across each lock's title and its Notes section."),
-        stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`)
+        stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). Locks are resolved from that repository's shared .git directory instead of the current working directory. Fails with a clear error if this path is not inside a git repository."
+        )
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
-    async ({ status, scope, agent_id, text, stale_minutes }) => {
+    async ({ status, scope, agent_id, text, stale_minutes, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
         return textResult(JSON.stringify(results, null, 2));
       } catch (error) {
@@ -512,13 +530,17 @@ function createServer() {
       description: "Checks whether any currently ACTIVE lock claims file(s)/path(s) that overlap the glob patterns you pass in. This tool is purely INFORMATIONAL \u2014 it never blocks, refuses, or vetoes anything; it has no side effects and cannot prevent lock_create from proceeding. It exists only to give you information so you (the calling agent) can decide for yourself whether to proceed, coordinate with the other lock's owner, or pick a narrower scope. Overlap is determined by a static-prefix glob heuristic (not exact set intersection) that is intentionally biased toward reporting overlaps that turn out not to matter, rather than missing a real one \u2014 see this project's README for the exact heuristic and a documented case (filesystem case-sensitivity) it deliberately does not catch. Returns the same compact summary shape as lock_query (including stale/staleForSeconds) for every overlapping active lock (empty array if none).",
       inputSchema: {
         scope: z.array(z.string()).describe("Glob patterns describing the files/paths you are about to work on."),
-        stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`)
+        stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). Conflicts are checked against locks in that repository's shared .git directory instead of the current working directory."
+        )
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
-    async ({ scope, stale_minutes }) => {
+    async ({ scope, stale_minutes, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const results = await checkConflicts(locksRoot, scope, stale_minutes);
         return textResult(JSON.stringify(results, null, 2));
       } catch (error) {
@@ -536,14 +558,21 @@ function createServer() {
         scope: z.array(z.string()).min(1).describe("Glob patterns describing the files/paths this lock claims."),
         tasks: z.array(z.string()).describe("Plain-text descriptions of the tasks you plan to do. All are created unchecked."),
         agent_id: z.string().nullable().optional().describe("Your own agent id, ONLY if you already know it from your context. Omit or pass null otherwise \u2014 never guess."),
-        parent_agent_id: z.string().nullable().optional().describe("The id of whatever spawned you, ONLY if you already know it. Omit or pass null otherwise \u2014 never guess.")
+        parent_agent_id: z.string().nullable().optional().describe("The id of whatever spawned you, ONLY if you already know it. Omit or pass null otherwise \u2014 never guess."),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). The lock is created in that repository's shared .git directory instead of the current working directory. Use this when an agent working in one repo needs to claim work in another \u2014 a lock the colliding agent cannot see is decorative."
+        )
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
     },
-    async ({ title, scope, tasks, agent_id, parent_agent_id }) => {
+    async ({ title, scope, tasks, agent_id, parent_agent_id, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
-        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id });
+        const cwd = base_dir ?? process.cwd();
+        const [locksRoot, repoRoot] = await Promise.all([
+          resolveLocksRoot(cwd),
+          resolveRepoRoot(cwd)
+        ]);
+        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -559,13 +588,17 @@ function createServer() {
         lock_id: z.string().describe("The id of the lock to update (as returned by lock_create or lock_query)."),
         task_text: z.string().describe("The exact text of an existing task on this lock."),
         done: z.boolean().describe("true to mark the task done, false to mark it not done."),
-        note: z.string().optional().describe("Optional free-text note to append to the lock's Notes section.")
+        note: z.string().optional().describe("Optional free-text note to append to the lock's Notes section."),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). The lock is looked up in that repository's shared .git directory. Omit to use the current working directory."
+        )
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
     },
-    async ({ lock_id, task_text, done, note }) => {
+    async ({ lock_id, task_text, done, note, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await updateLock(locksRoot, { lock_id, task_text, done, note });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
@@ -580,13 +613,17 @@ function createServer() {
       description: "Marks an active lock as done, optionally appending a closing summary to its Notes, and moves its file from the active set into the done archive. Once finished, the lock stops appearing in lock_query's default (status-omitted) view. Errors clearly if lock_id does not exist, or if it exists but is already done (rather than silently no-op-ing).",
       inputSchema: {
         lock_id: z.string().describe("The id of the active lock to finish."),
-        summary: z.string().optional().describe("Optional closing summary appended to the Notes section before the lock is archived.")
+        summary: z.string().optional().describe("Optional closing summary appended to the Notes section before the lock is archived."),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). The lock is looked up in that repository's shared .git directory. Omit to use the current working directory."
+        )
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
     },
-    async ({ lock_id, summary }) => {
+    async ({ lock_id, summary, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await finishLock(locksRoot, { lock_id, summary });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
@@ -600,13 +637,17 @@ function createServer() {
       title: "Heartbeat a lock",
       description: "Bumps ONLY a lock's updated timestamp \u2014 no task, note, or scope change. Call this periodically during a long stretch of work that isn't naturally hitting lock_update often enough (completing a task also counts as a heartbeat for free) to keep the lock from being computed as stale by lock_query / lock_check_conflict. Restricted to active locks \u2014 errors clearly if lock_id does not exist, or exists but is already done (heartbeating finished work is not a meaningful operation).",
       inputSchema: {
-        lock_id: z.string().describe("The id of the active lock to heartbeat.")
+        lock_id: z.string().describe("The id of the active lock to heartbeat."),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). The lock is looked up in that repository's shared .git directory. Omit to use the current working directory."
+        )
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
     },
-    async ({ lock_id }) => {
+    async ({ lock_id, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await heartbeatLock(locksRoot, { lock_id });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
@@ -622,13 +663,17 @@ function createServer() {
       inputSchema: {
         lock_id: z.string().optional().describe("Reap only this lock id. Omit to reap every currently-stale active lock."),
         stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
-        dry_run: z.boolean().optional().describe("If true, report what would be reaped without actually mutating anything.")
+        dry_run: z.boolean().optional().describe("If true, report what would be reaped without actually mutating anything."),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). Locks are reaped from that repository's shared .git directory. Omit to use the current working directory."
+        )
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
     },
-    async ({ lock_id, stale_minutes, dry_run }) => {
+    async ({ lock_id, stale_minutes, dry_run, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await reapStaleLocks(locksRoot, { lock_id, stale_minutes, dry_run });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
@@ -664,6 +709,7 @@ Options:
   --agent <id>                  Only locks with this exact agent_id.
   --text <query>                Case-insensitive substring search over title + notes.
   --stale-minutes <n>           Override the staleness threshold (minutes) for this call only.
+  --base-dir <path>             Resolve locks from a different repository (any path inside it).
   --json                        Print raw JSON instead of a formatted table.`;
 var CLAIM_USAGE = `agent-locks claim [options]
 
@@ -673,6 +719,7 @@ Options:
   --task <text>          A task to track on this lock. Repeatable; order preserved.
   --agent <id>           Your own agent id, if you have one. Never fabricated if omitted.
   --parent <id>          Your parent agent's id, if known.
+  --base-dir <path>      Create the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
 var UPDATE_USAGE = `agent-locks update <lock-id> [options]
 
@@ -681,6 +728,7 @@ Options:
   --done                 Mark the task done (default if neither --done nor --undone given).
   --undone               Mark the task not done.
   --note <text>           Append a free-text note to the lock.
+  --base-dir <path>      Look up the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
 var REAP_USAGE = `agent-locks reap [lock-id] [options]
 
@@ -692,6 +740,7 @@ Options:
   --stale-minutes <n>    Override the staleness threshold for this call only. Defaults
                           to AGENT_LOCKS_STALE_MINUTES or 60.
   --dry-run              Report what would be reaped without writing anything.
+  --base-dir <path>      Reap locks in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
 var CliUsageError = class extends Error {
 };
@@ -759,6 +808,10 @@ function parseStaleMinutesFlag(flags) {
   }
   return parsed;
 }
+function resolveBaseDir(flags) {
+  const raw = oneOf(flags.flags, "--base-dir");
+  return raw ?? process.cwd();
+}
 async function cmdStatus() {
   const locksRoot = await resolveLocksRoot();
   const locks = await queryLocks(locksRoot, {});
@@ -779,7 +832,8 @@ async function cmdList(flags) {
   const agent_id = oneOf(flags.flags, "--agent");
   const text = oneOf(flags.flags, "--text");
   const stale_minutes = parseStaleMinutesFlag(flags);
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {
     status,
     scope: scope.length > 0 ? scope : void 0,
@@ -799,7 +853,8 @@ async function cmdCheck(flags) {
     throw new CliUsageError('agent-locks check requires at least one scope glob, e.g. "agent-locks check src/auth/**".');
   }
   const stale_minutes = parseStaleMinutesFlag(flags);
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const conflicts = await checkConflicts(locksRoot, scope, stale_minutes);
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(conflicts, null, 2));
@@ -825,8 +880,12 @@ async function cmdClaim(flags) {
   const tasks = allOf(flags.flags, "--task");
   const agent_id = oneOf(flags.flags, "--agent") ?? null;
   const parent_agent_id = oneOf(flags.flags, "--parent") ?? null;
-  const locksRoot = await resolveLocksRoot();
-  const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id });
+  const cwd = resolveBaseDir(flags);
+  const [locksRoot, repoRoot] = await Promise.all([
+    resolveLocksRoot(cwd),
+    resolveRepoRoot(cwd)
+  ]);
+  const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
   } else {
@@ -847,7 +906,8 @@ async function cmdUpdate(flags) {
   }
   const done = !flags.boolFlags.has("--undone");
   const note = oneOf(flags.flags, "--note");
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const result = await updateLock(locksRoot, { lock_id: lockId, task_text: taskText, done, note });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
@@ -859,7 +919,8 @@ async function cmdFinish(flags) {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError("agent-locks finish requires a lock id as its first argument.");
   const summary = oneOf(flags.flags, "--summary");
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const result = await finishLock(locksRoot, { lock_id: lockId, summary });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
@@ -870,7 +931,8 @@ async function cmdFinish(flags) {
 async function cmdHeartbeat(flags) {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError("agent-locks heartbeat requires a lock id as its first argument.");
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const result = await heartbeatLock(locksRoot, { lock_id: lockId });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
@@ -886,7 +948,8 @@ async function cmdReap(flags) {
   const lockId = flags.positionals[0];
   const stale_minutes = parseStaleMinutesFlag(flags);
   const dry_run = flags.boolFlags.has("--dry-run");
-  const locksRoot = await resolveLocksRoot();
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(reaped, null, 2));

@@ -36,6 +36,14 @@ export interface LockFrontmatter {
   updated: string;
   /** Glob patterns describing which files/paths this lock claims. */
   scope: string[];
+  /**
+   * Resolved repository root path — the directory returned by
+   * `git rev-parse --show-toplevel` when the lock was created. Lets an agent
+   * reading a lock summary tell which repository it governs without inferring
+   * it from the scope glob. Empty string on lock files created before this
+   * field was added (backward compatibility).
+   */
+  repository: string;
 }
 
 export interface LockTask {
@@ -64,6 +72,7 @@ export interface LockSummary {
   status: LockStatus;
   percentComplete: number;
   scope: string[];
+  repository: string;
   agent_id: string | null;
   parent_agent_id: string | null;
   /**
@@ -107,6 +116,7 @@ export function toSummary(record: LockRecord, options: StalenessOptions = {}): L
     status: record.frontmatter.status,
     percentComplete: computePercentComplete(record.tasks),
     scope: record.frontmatter.scope,
+    repository: record.frontmatter.repository ?? '',
     agent_id: record.frontmatter.agent_id,
     parent_agent_id: record.frontmatter.parent_agent_id,
     stale,

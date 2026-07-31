@@ -13,6 +13,8 @@ import {
   updateLock,
 } from '../lock/store.js';
 
+const TEST_REPO = '/tmp/fake-repo';
+
 let locksRoot: string;
 
 beforeEach(async () => {
@@ -30,6 +32,7 @@ describe('createLock', () => {
       title: 'Add hindsight route tests',
       scope: ['backend/src/hindsight/**'],
       tasks: ['write unit tests', 'write integration test'],
+      repository: TEST_REPO,
     });
 
     expect(id).toContain('add-hindsight-route-tests');
@@ -39,6 +42,21 @@ describe('createLock', () => {
     expect(raw).toContain('- [ ] write integration test');
     expect(raw).toContain('agent_id: null');
     expect(raw).toContain('parent_agent_id: null');
+  });
+
+  it('records repository in frontmatter and returns it in summaries', async () => {
+    const REPO = '/home/user/projects/test-repo';
+    const { id, filePath } = await createLock(locksRoot, {
+      title: 'repo-tracked lock',
+      scope: ['a/**'],
+      tasks: [],
+      repository: REPO,
+    });
+    const raw = await fs.readFile(filePath, 'utf8');
+    expect(raw).toContain(`repository: ${REPO}`);
+
+    const [summary] = await queryLocks(locksRoot, {});
+    expect(summary.repository).toBe(REPO);
   });
 
   it('records agent_id/parent_agent_id when explicitly provided, and never fabricates them otherwise', async () => {

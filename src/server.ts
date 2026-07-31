@@ -5,7 +5,7 @@
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { resolveLocksRoot, NotAGitRepoError } from './git.js';
+import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
   createLock,
   queryLocks,
@@ -84,12 +84,21 @@ export function createServer(): McpServer {
           .positive()
           .optional()
           .describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'Locks are resolved from that repository\'s shared .git directory instead of the current working directory. ' +
+              'Fails with a clear error if this path is not inside a git repository.',
+          ),
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ status, scope, agent_id, text, stale_minutes }) => {
+    async ({ status, scope, agent_id, text, stale_minutes, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
         return textResult(JSON.stringify(results, null, 2));
       } catch (error) {
@@ -116,12 +125,20 @@ export function createServer(): McpServer {
           .positive()
           .optional()
           .describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'Conflicts are checked against locks in that repository\'s shared .git directory instead of the current working directory.',
+          ),
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ scope, stale_minutes }) => {
+    async ({ scope, stale_minutes, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const results = await checkConflicts(locksRoot, scope, stale_minutes);
         return textResult(JSON.stringify(results, null, 2));
       } catch (error) {
@@ -155,13 +172,25 @@ export function createServer(): McpServer {
           .nullable()
           .optional()
           .describe('The id of whatever spawned you, ONLY if you already know it. Omit or pass null otherwise — never guess.'),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'The lock is created in that repository\'s shared .git directory instead of the current working directory. ' +
+              'Use this when an agent working in one repo needs to claim work in another — a lock the colliding agent cannot see is decorative.',
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ title, scope, tasks, agent_id, parent_agent_id }) => {
+    async ({ title, scope, tasks, agent_id, parent_agent_id, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
-        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id });
+        const cwd = base_dir ?? process.cwd();
+        const [locksRoot, repoRoot] = await Promise.all([
+          resolveLocksRoot(cwd),
+          resolveRepoRoot(cwd),
+        ]);
+        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -183,12 +212,20 @@ export function createServer(): McpServer {
         task_text: z.string().describe('The exact text of an existing task on this lock.'),
         done: z.boolean().describe('true to mark the task done, false to mark it not done.'),
         note: z.string().optional().describe('Optional free-text note to append to the lock\'s Notes section.'),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'The lock is looked up in that repository\'s shared .git directory. Omit to use the current working directory.',
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ lock_id, task_text, done, note }) => {
+    async ({ lock_id, task_text, done, note, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await updateLock(locksRoot, { lock_id, task_text, done, note });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
@@ -208,12 +245,20 @@ export function createServer(): McpServer {
       inputSchema: {
         lock_id: z.string().describe('The id of the active lock to finish.'),
         summary: z.string().optional().describe('Optional closing summary appended to the Notes section before the lock is archived.'),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'The lock is looked up in that repository\'s shared .git directory. Omit to use the current working directory.',
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ lock_id, summary }) => {
+    async ({ lock_id, summary, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await finishLock(locksRoot, { lock_id, summary });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
@@ -232,12 +277,20 @@ export function createServer(): McpServer {
         'Restricted to active locks — errors clearly if lock_id does not exist, or exists but is already done (heartbeating finished work is not a meaningful operation).',
       inputSchema: {
         lock_id: z.string().describe('The id of the active lock to heartbeat.'),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'The lock is looked up in that repository\'s shared .git directory. Omit to use the current working directory.',
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ lock_id }) => {
+    async ({ lock_id, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await heartbeatLock(locksRoot, { lock_id });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
@@ -264,12 +317,20 @@ export function createServer(): McpServer {
           .optional()
           .describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
         dry_run: z.boolean().optional().describe('If true, report what would be reaped without actually mutating anything.'),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'Locks are reaped from that repository\'s shared .git directory. Omit to use the current working directory.',
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ lock_id, stale_minutes, dry_run }) => {
+    async ({ lock_id, stale_minutes, dry_run, base_dir }) => {
       try {
-        const locksRoot = await resolveLocksRoot();
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
         const result = await reapStaleLocks(locksRoot, { lock_id, stale_minutes, dry_run });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {

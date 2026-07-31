@@ -11,6 +11,7 @@ const SAMPLE: ParsedLock = {
     created: '2026-07-17T18-45-12',
     updated: '2026-07-17T18-45-12',
     scope: ['backend/src/hindsight/**', 'apps/web/app/hindsight/**'],
+    repository: '/home/user/projects/my-app',
   },
   title: 'Add hindsight route tests',
   tasks: [
@@ -37,6 +38,7 @@ describe('lock markdown round-tripping', () => {
         created: '2026-07-17T18-45-12',
         updated: '2026-07-17T18-45-12',
         scope: ['**/*.ts'],
+        repository: '/home/user/projects/my-app',
       },
       title: 'Anonymous work claim',
       tasks: [{ text: 'do the thing', done: false }],
@@ -61,7 +63,7 @@ describe('lock markdown round-tripping', () => {
     expect(serialized).toContain('- Started after checking for conflicts with lock X');
   });
 
-  it('parses a hand-written file matching the README spec exactly', () => {
+  it('parses a hand-written file matching the README spec exactly (without repository field, for backward compat)', () => {
     const raw = `---
 id: 2026-07-17T09-45-00-example-lock
 agent_id: null

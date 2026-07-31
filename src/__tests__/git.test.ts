@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { NotAGitRepoError, resolveLocksRoot } from '../git.js';
+import { NotAGitRepoError, resolveLocksRoot, resolveRepoRoot } from '../git.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -93,6 +93,52 @@ describe('resolveLocksRoot', () => {
     const first = await resolveLocksRoot(repo);
     const second = await resolveLocksRoot(repo);
     expect(first).toBe(second);
+  });
+});
+
+describe('resolveRepoRoot', () => {
+  it('rejects with NotAGitRepoError when cwd is not inside a git repository', async () => {
+    const plainDir = path.join(sandbox, 'not-a-repo');
+    await fs.mkdir(plainDir, { recursive: true });
+    await expect(resolveRepoRoot(plainDir)).rejects.toThrow(NotAGitRepoError);
+  });
+
+  it('returns the repository root from --show-toplevel', async () => {
+    const repo = path.join(sandbox, 'main');
+    await fs.mkdir(repo, { recursive: true });
+    await git(repo, ['init', '-q', '-b', 'main', '.']);
+    await git(repo, ['config', 'user.email', 'test@test.com']);
+    await git(repo, ['config', 'user.name', 'test']);
+    await fs.writeFile(path.join(repo, 'a.txt'), 'hi\n');
+    await git(repo, ['add', 'a.txt']);
+    await git(repo, ['commit', '-q', '-m', 'init']);
+
+    const repoRoot = await resolveRepoRoot(repo);
+    const realRepo = await fs.realpath(repo);
+    expect(repoRoot).toBe(realRepo);
+  });
+
+  it('returns each worktree\'s own root — linked worktrees differ from main (--show-toplevel is per-worktree)', async () => {
+    const repo = path.join(sandbox, 'main');
+    await fs.mkdir(repo, { recursive: true });
+    await git(repo, ['init', '-q', '-b', 'main', '.']);
+    await git(repo, ['config', 'user.email', 'test@test.com']);
+    await git(repo, ['config', 'user.name', 'test']);
+    await fs.writeFile(path.join(repo, 'a.txt'), 'hi\n');
+    await git(repo, ['add', 'a.txt']);
+    await git(repo, ['commit', '-q', '-m', 'init']);
+
+    const linkedWorktree = path.join(sandbox, 'linked');
+    await git(repo, ['worktree', 'add', '-q', '-b', 'feature-x', linkedWorktree]);
+
+    const mainRoot = await resolveRepoRoot(repo);
+    const linkedRoot = await resolveRepoRoot(linkedWorktree);
+    const realRepo = await fs.realpath(repo);
+    const realLinked = await fs.realpath(linkedWorktree);
+    // --show-toplevel returns the worktree's own root, not the shared repo root
+    expect(mainRoot).toBe(realRepo);
+    expect(linkedRoot).toBe(realLinked);
+    expect(linkedRoot).not.toBe(mainRoot); // they are genuinely different paths
   });
 });
 

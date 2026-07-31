@@ -78,6 +78,28 @@ export class NotAGitRepoError extends Error {
  * handler rather than accepting a cached path.
  */
 export async function resolveLocksRoot(cwd: string = process.cwd()): Promise<string> {
+  const realGitCommonDir = await getRealGitCommonDir(cwd);
+  return path.join(realGitCommonDir, 'agents-locks');
+}
+
+/**
+ * Runs `git rev-parse --show-toplevel` in `cwd` and returns the canonical
+ * repository root path. Used to record which repository a lock governs.
+ */
+export async function resolveRepoRoot(cwd: string = process.cwd()): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd });
+    return stdout.trim();
+  } catch (error) {
+    throw new NotAGitRepoError(cwd, error);
+  }
+}
+
+/**
+ * Shared implementation for resolveLocksRoot — runs `git rev-parse
+ * --git-common-dir` and returns the realpath'd (canonical) directory.
+ */
+async function getRealGitCommonDir(cwd: string): Promise<string> {
   let stdout: string;
   try {
     ({ stdout } = await execFileAsync('git', ['rev-parse', '--git-common-dir'], { cwd }));
@@ -97,5 +119,5 @@ export async function resolveLocksRoot(cwd: string = process.cwd()): Promise<str
   // under us mid-call; surface that rather than silently falling back to
   // the unresolved path, which would reintroduce the very bug this fixes.
   const realGitCommonDir = await fs.realpath(absoluteGitCommonDir);
-  return path.join(realGitCommonDir, 'agents-locks');
+  return realGitCommonDir;
 }

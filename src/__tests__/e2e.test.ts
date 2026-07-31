@@ -101,8 +101,12 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     expect(created.filePath).toContain(path.join('.git', 'agents-locks'));
 
     const queryResult = await client.callTool({ name: 'lock_query', arguments: {} });
-    const queried = toolResultJson(queryResult) as Array<{ id: string; percentComplete: number }>;
-    expect(queried.find((l) => l.id === created.id)?.percentComplete).toBe(0);
+    const queried = toolResultJson(queryResult) as Array<{ id: string; percentComplete: number; repository: string }>;
+    const match = queried.find((l) => l.id === created.id);
+    expect(match?.percentComplete).toBe(0);
+    // The repository field records which repo the lock governs
+    expect(match?.repository).toBeTruthy();
+    expect(match?.repository).toContain('agent-locks-e2e-');
 
     const updateResult = await client.callTool({
       name: 'lock_update',
