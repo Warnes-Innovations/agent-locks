@@ -54,7 +54,12 @@ Usage:
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks --help                    Show this message.
 
-Every subcommand talks to the exact same lock store the MCP tools use — a human running "agent-locks status" and an agent calling lock_query see identical, live state.`;
+Every subcommand talks to the exact same lock store the MCP tools use — a human running "agent-locks status" and an agent calling lock_query see identical, live state.
+
+Every lock subcommand above (all except "serve") accepts --base-dir <path> to operate on a
+different repository instead of the current directory — any path inside the target repo will
+do. A --base-dir that is not inside a git repository is a hard error, never a silent fallback
+to the current directory.`;
 
 const LIST_USAGE = `agent-locks list [options]
 
@@ -102,6 +107,22 @@ Options:
   --json                 Print raw JSON instead of a short confirmation line.`;
 
 class CliUsageError extends Error {}
+
+const CLI_PREFIX = 'agent-locks: ';
+
+/**
+ * Writes an error line prefixed with the tool name, unless the message already
+ * carries that prefix.
+ *
+ * NotAGitRepoError deliberately self-identifies: its message is also surfaced
+ * verbatim through the MCP error path, where nothing else names the tool, so
+ * the prefix has to live in the message itself. Blindly re-prefixing it here
+ * produced "agent-locks: agent-locks: ...". Checking rather than special-casing
+ * that one class keeps this correct for any future self-identifying message.
+ */
+function printError(message: string): void {
+  console.error(message.startsWith(CLI_PREFIX) ? message : `${CLI_PREFIX}${message}`);
+}
 
 interface ParsedFlags {
   positionals: string[];
@@ -188,8 +209,9 @@ function resolveBaseDir(flags: ParsedFlags): string {
   return raw ?? process.cwd();
 }
 
-async function cmdStatus(): Promise<void> {
-  const locksRoot = await resolveLocksRoot();
+async function cmdStatus(flags: ParsedFlags): Promise<void> {
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {});
   console.log(`agent-locks: ${locks.length} active lock(s) in ${locksRoot}\n`);
   console.log(formatLockTable(locks));
@@ -375,7 +397,7 @@ export async function runCli(argv: string[]): Promise<number> {
   try {
     switch (command) {
       case 'status':
-        await cmdStatus();
+        await cmdStatus(parseArgs(rest));
         return 0;
       case 'list':
         await cmdList(parseArgs(rest));
@@ -405,7 +427,7 @@ export async function runCli(argv: string[]): Promise<number> {
     }
   } catch (error) {
     if (error instanceof CliUsageError) {
-      console.error(`agent-locks: ${error.message}`);
+      printError(error.message);
       return 1;
     }
     if (
@@ -415,10 +437,10 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof LockNotActiveError ||
       error instanceof LockNotStaleError
     ) {
-      console.error(`agent-locks: ${error.message}`);
+      printError(error.message);
       return 1;
     }
-    console.error(`agent-locks: unexpected error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    printError(`unexpected error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
     return 1;
   }
 }

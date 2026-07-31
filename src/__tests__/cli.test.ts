@@ -179,6 +179,67 @@ describe('runCli', () => {
     expect(code).toBe(1);
     expect(errors[0]).toContain('does not appear to be inside a git repository');
   });
+
+  it('status honours --base-dir instead of silently reporting the current repo', async () => {
+    // Regression: cmdStatus was the one subcommand that never called
+    // resolveBaseDir, so `status --base-dir <other repo>` accepted the flag,
+    // ignored it, and printed the CURRENT repo's locks — the exact
+    // silent-fallback failure the base_dir feature exists to prevent, and the
+    // worst shape for it, because the output looks like a real answer.
+    const otherRepo = path.join(sandbox, 'other-repo');
+    await fs.mkdir(otherRepo, { recursive: true });
+    await git(otherRepo, ['init', '-q', '-b', 'main', '.']);
+    await git(otherRepo, ['config', 'user.email', 'test@test.com']);
+    await git(otherRepo, ['config', 'user.name', 'test']);
+    await fs.writeFile(path.join(otherRepo, 'a.txt'), 'hi\n');
+    await git(otherRepo, ['add', 'a.txt']);
+    await git(otherRepo, ['commit', '-q', '-m', 'init']);
+
+    // A lock in `repo`, and nothing at all in `otherRepo`.
+    const claim = captureConsole();
+    expect(await runCliIn(repo, ['claim', '--title', 'local work', '--scope', 'src/**'])).toBe(0);
+    expect(claim.logs.join('\n')).toContain('local work');
+
+    // Asking about otherRepo from inside repo must report otherRepo's state.
+    const { logs } = captureConsole();
+    const code = await runCliIn(repo, ['status', '--base-dir', otherRepo]);
+    expect(code).toBe(0);
+    const output = logs.join('\n');
+    expect(output).toContain('0 active lock(s)');
+    expect(output).not.toContain('local work');
+    // It also names the store it actually read, which must be otherRepo's.
+    expect(output).toContain(path.join('other-repo', '.git', 'agents-locks'));
+  });
+
+  it('prefixes an error with the tool name exactly once, whether or not the message already names it', async () => {
+    // NotAGitRepoError self-identifies, because its message is also surfaced
+    // verbatim over the MCP error path where nothing else names the tool.
+    // The CLI used to add its own prefix unconditionally, yielding
+    // "agent-locks: agent-locks: ...".
+    const selfIdentifying = captureConsole();
+    const notARepo = path.join(sandbox, 'prefix-not-a-repo');
+    await fs.mkdir(notARepo, { recursive: true });
+    expect(await runCliIn(notARepo, ['status'])).toBe(1);
+    expect(selfIdentifying.errors[0]).not.toContain('agent-locks: agent-locks:');
+    expect(selfIdentifying.errors[0].match(/agent-locks: /g)).toHaveLength(1);
+    expect(selfIdentifying.errors[0].startsWith('agent-locks: ')).toBe(true);
+
+    // ...and a message that does NOT name the tool still gets the prefix, so
+    // the fix suppressed a duplicate rather than the prefix itself.
+    const plain = captureConsole();
+    expect(await runCliIn(repo, ['claim', '--scope', 'x/**'])).toBe(1); // missing --title
+    expect(plain.errors[0].startsWith('agent-locks: ')).toBe(true);
+    expect(plain.errors[0].match(/agent-locks: /g)).toHaveLength(1);
+  });
+
+  it('status rejects a --base-dir outside any git repository rather than falling back', async () => {
+    const notARepo = path.join(sandbox, 'status-not-a-repo');
+    await fs.mkdir(notARepo, { recursive: true });
+    const { errors } = captureConsole();
+    const code = await runCliIn(repo, ['status', '--base-dir', notARepo]);
+    expect(code).toBe(1);
+    expect(errors[0]).toContain('does not appear to be inside a git repository');
+  });
 });
 
 // Lock timestamps have whole-second precision (see timestamp.ts), so a check
