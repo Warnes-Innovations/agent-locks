@@ -46,7 +46,7 @@ describe('createLock', () => {
 
   it('records repository in frontmatter and returns it in summaries', async () => {
     const REPO = '/home/user/projects/test-repo';
-    const { id, filePath } = await createLock(locksRoot, {
+    const { filePath } = await createLock(locksRoot, {
       title: 'repo-tracked lock',
       scope: ['a/**'],
       tasks: [],
