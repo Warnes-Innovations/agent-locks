@@ -98,6 +98,8 @@ const REAP_USAGE = `agent-locks reap [lock-id] [options]
 Reaps (finishes, same as "agent-locks finish") every currently-stale active lock, or a
 single one if lock-id is given. Refuses to reap a named lock-id that isn't actually
 stale — never a back door to force-finish someone else's live work.
+A supplied --stale-minutes may only LENGTHEN the window, never shorten it: it is
+floored at the configured default, so this cannot be used to reap live locks.
 
 Options:
   --stale-minutes <n>    Override the staleness threshold for this call only. Defaults

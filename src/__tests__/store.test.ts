@@ -8,7 +8,9 @@ import {
   finishLock,
   LockNotActiveError,
   LockNotFoundError,
+  LockNotStaleError,
   queryLocks,
+  reapStaleLocks,
   TaskNotFoundError,
   updateLock,
 } from '../lock/store.js';
@@ -261,5 +263,90 @@ describe('full lifecycle: create -> update -> finish -> excluded from default qu
     const finished = doneView.find((l) => l.id === id);
     expect(finished).toBeDefined();
     expect(finished?.percentComplete).toBe(100);
+  });
+});
+
+describe('reapStaleLocks: a caller-supplied threshold may only LENGTHEN (regression)', () => {
+  // Regression for the 2026-09-03 committee finding. `reap` refuses to force-finish a
+  // NAMED non-stale lock, and the README promises it is "never a back door to
+  // force-finish someone else's live work" — but the plural form took stale_minutes
+  // straight from the caller with no floor, so `reap --stale-minutes 0.01` finished
+  // every active lock in a repo, exit 0, no refusal. These tests fail against the
+  // pre-fix code.
+  /**
+   * Backdate a lock's `updated` stamp so staleness is DETERMINISTIC rather than a race
+   * against how long createLock happens to take. An earlier version of this test used a
+   * fresh lock and a 0.6-second threshold; it passed against the pre-fix code too,
+   * because the lock was not old enough for EITHER version to reap — i.e. it tested
+   * nothing. Verified by running it against the reverted implementation.
+   */
+  async function backdateLock(id: string, minutesAgo: number): Promise<void> {
+    // Active locks live directly in locksRoot; `done/` is a subdirectory beside them.
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const file = path.join(locksRoot, name);
+      const text = await fs.readFile(file, 'utf8');
+      if (!text.includes(id)) continue;
+      const then = new Date(Date.now() - minutesAgo * 60_000);
+      const p2 = (n: number) => String(n).padStart(2, '0');
+      const stamp =
+        `${then.getUTCFullYear()}-${p2(then.getUTCMonth() + 1)}-${p2(then.getUTCDate())}` +
+        `T${p2(then.getUTCHours())}-${p2(then.getUTCMinutes())}-${p2(then.getUTCSeconds())}`;
+      await fs.writeFile(file, text.replace(/^updated: .*$/m, `updated: ${stamp}`), 'utf8');
+      return;
+    }
+    throw new Error(`no active lock file for ${id}`);
+  }
+
+  it('does not reap a lock older than a SUB-DEFAULT threshold but younger than the default', async () => {
+    // 5 minutes old: reapable at the caller's 1-minute threshold (pre-fix), but not at
+    // the 60-minute default. This is the exact window the exploit used.
+    const { id } = await createLock(locksRoot, { title: 'live work', scope: ['a/**'], tasks: [] });
+    await backdateLock(id, 5);
+
+    const reaped = await reapStaleLocks(locksRoot, { stale_minutes: 1 });
+
+    expect(reaped).toEqual([]);
+    const stillActive = await queryLocks(locksRoot, {});
+    expect(stillActive).toHaveLength(1);
+    expect(stillActive[0]!.title).toBe('live work');
+  });
+
+  it('DOES still reap a genuinely stale lock at the default threshold', async () => {
+    // The floor must not make reap useless: past the default, reaping still works.
+    const { id } = await createLock(locksRoot, { title: 'abandoned', scope: ['a/**'], tasks: [] });
+    await backdateLock(id, 90);
+
+    const reaped = await reapStaleLocks(locksRoot, {});
+
+    expect(reaped).toHaveLength(1);
+    expect(reaped[0]!.title).toBe('abandoned');
+    expect(await queryLocks(locksRoot, {})).toEqual([]);
+  });
+
+  it('does not reap OTHER sessions\' live locks via a sub-default threshold', async () => {
+    await createLock(locksRoot, { title: 'held by Red', scope: ['a/**'], tasks: [], agent_id: 'Red [bd9522]' });
+    await createLock(locksRoot, { title: 'held by Blue', scope: ['b/**'], tasks: [], agent_id: 'Blue [aa1111]' });
+
+    const reaped = await reapStaleLocks(locksRoot, { stale_minutes: 0.001 });
+
+    expect(reaped).toEqual([]);
+    expect(await queryLocks(locksRoot, {})).toHaveLength(2);
+  });
+
+  it('still honours a LENGTHENED threshold (the floor must not clamp upward)', async () => {
+    await createLock(locksRoot, { title: 'fresh', scope: ['a/**'], tasks: [] });
+
+    // 10000 minutes is far above the default; nothing is that old, so nothing reaps.
+    expect(await reapStaleLocks(locksRoot, { stale_minutes: 10000 })).toEqual([]);
+    expect(await queryLocks(locksRoot, {})).toHaveLength(1);
+  });
+
+  it('still refuses a NAMED non-stale lock, as before', async () => {
+    const { id } = await createLock(locksRoot, { title: 'named live work', scope: ['a/**'], tasks: [] });
+
+    await expect(reapStaleLocks(locksRoot, { lock_id: id, stale_minutes: 0.01 })).rejects.toThrow(
+      LockNotStaleError,
+    );
   });
 });

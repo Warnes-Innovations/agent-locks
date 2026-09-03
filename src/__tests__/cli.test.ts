@@ -36,10 +36,16 @@ afterEach(async () => {
 /** Runs runCli with process.cwd() pointed at `repo` for the duration of the call, restoring it after. */
 async function runCliIn(repoDir: string, argv: string[]): Promise<number> {
   const originalCwd = process.cwd();
+  const originalStale = process.env.AGENT_LOCKS_STALE_MINUTES;
   process.chdir(repoDir);
+  // See e2e.test.ts: --stale-minutes may only LENGTHEN, so these tests lower the
+  // configured default instead of shortening per call.
+  process.env.AGENT_LOCKS_STALE_MINUTES = '0.03';
   try {
     return await runCli(argv);
   } finally {
+    if (originalStale === undefined) delete process.env.AGENT_LOCKS_STALE_MINUTES;
+    else process.env.AGENT_LOCKS_STALE_MINUTES = originalStale;
     process.chdir(originalCwd);
   }
 }

@@ -390,7 +390,24 @@ export class LockNotStaleError extends Error {
  * "nobody was heard from and this got cleaned up automatically."
  */
 export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksParams = {}): Promise<ReapedLock[]> {
-  const staleMinutes = resolveStaleMinutes(params.stale_minutes);
+  // A caller-supplied threshold may only LENGTHEN the reaping window, never shorten it.
+  //
+  // WHY THIS FLOOR EXISTS — do not remove it to "respect the caller's flag".
+  // The singular form (lock_id given) refuses a non-stale lock via LockNotStaleError,
+  // and the README promises reap is "never a back door to force-finish someone else's
+  // live work". That promise held for the singular form ONLY. The plural form took this
+  // threshold straight from the caller with no lower bound, so
+  // `reap --stale-minutes 0.01` finished every active lock in a repo — exit 0, no
+  // confirmation, no refusal. Demonstrated against this binary on 2026-09-03, against
+  // locks held by other sessions.
+  //
+  // The floor is applied HERE rather than in resolveStaleMinutes deliberately: read
+  // paths (lock_query, lock_check_conflict) may legitimately ask "what would look stale
+  // at 5 minutes?", which is informational and harmless. Only the destructive path
+  // needs the bound.
+  const requested = resolveStaleMinutes(params.stale_minutes);
+  const floor = resolveStaleMinutes(undefined);
+  const staleMinutes = Math.max(requested, floor);
   const now = new Date();
   const activeRecords = await readAllRecords(locksRoot, 'active');
 

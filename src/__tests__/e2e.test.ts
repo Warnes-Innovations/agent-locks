@@ -51,6 +51,11 @@ beforeEach(async () => {
     args: [DIST_ENTRY],
     cwd: repo,
     stderr: 'pipe',
+    // A per-call stale_minutes may only LENGTHEN the reaping window (see
+    // reapStaleLocks). These tests deliberately reap sub-minute-old locks, so they
+    // lower the CONFIGURED DEFAULT — an explicit operator-level choice — rather than
+    // relying on a per-call flag to shorten it, which is the hole that was closed.
+    env: { ...process.env, AGENT_LOCKS_STALE_MINUTES: '0.03' },
   });
   client = new Client({ name: 'agent-locks-e2e-test-client', version: '0.0.0' });
   await client.connect(transport);
