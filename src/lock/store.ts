@@ -123,6 +123,13 @@ async function writeRecord(record: LockRecord): Promise<void> {
   }
 }
 
+/**
+ * Set by reapStaleLocks when the configured floor RAISED the caller's requested
+ * threshold, so a caller can report what actually ran rather than what was asked for.
+ * null when the request was honoured as given.
+ */
+export let lastReapFloor: { requested: number; applied: number } | null = null;
+
 /** A lock file that could not be read or parsed. Reported, never silently skipped. */
 export interface UnreadableLock {
   filePath: string;
@@ -483,6 +490,10 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
   const requested = resolveStaleMinutes(params.stale_minutes);
   const floor = resolveStaleMinutes(undefined);
   const staleMinutes = Math.max(requested, floor);
+  // Record it. A floor that silently changes the answer produces a FALSE report:
+  // "No stale locks to reap" when locks are stale by the threshold the caller asked
+  // for and were merely protected. Callers must be able to say what actually ran.
+  lastReapFloor = staleMinutes === requested ? null : { requested, applied: staleMinutes };
   const now = new Date();
   const activeRecords = await readAllRecords(locksRoot, 'active');
 

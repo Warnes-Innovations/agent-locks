@@ -8,6 +8,7 @@ import {
   finishLock,
   LockNotActiveError,
   LockNotFoundError,
+  lastReapFloor,
   lastUnreadableLocks,
   LockNotStaleError,
   queryLocks,
@@ -400,5 +401,24 @@ describe('a corrupt lock file must not take down the whole store (regression)', 
     // A stray temp file (e.g. from a killed process) must not be read as a lock.
     await fs.writeFile(path.join(locksRoot, '.stray.md.999.tmp'), 'not a lock', 'utf8');
     expect(await queryLocks(locksRoot, {})).toHaveLength(1);
+  });
+});
+
+describe('the reap floor reports itself (regression)', () => {
+  // The floor silently changed the answer, so `reap --stale-minutes 1` printed
+  // "No stale locks to reap" while locks WERE stale by the requested threshold and
+  // merely protected. A floor that cannot be reported produces a false report.
+  it('records the raise when the caller asked for less than the configured default', async () => {
+    await createLock(locksRoot, { title: 'x', scope: ['a/**'], tasks: [] });
+    await reapStaleLocks(locksRoot, { stale_minutes: 1 });
+    expect(lastReapFloor).not.toBeNull();
+    expect(lastReapFloor!.requested).toBe(1);
+    expect(lastReapFloor!.applied).toBe(60);
+  });
+
+  it('records nothing when the request was honoured as given', async () => {
+    await createLock(locksRoot, { title: 'x', scope: ['a/**'], tasks: [] });
+    await reapStaleLocks(locksRoot, { stale_minutes: 120 });
+    expect(lastReapFloor).toBeNull();
   });
 });

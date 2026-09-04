@@ -274,6 +274,7 @@ async function writeRecord(record) {
     throw err;
   }
 }
+var lastReapFloor = null;
 var lastUnreadableLocks = [];
 async function readAllRecords(locksRoot, status) {
   const dirs = [];
@@ -465,6 +466,7 @@ async function reapStaleLocks(locksRoot, params = {}) {
   const requested = resolveStaleMinutes(params.stale_minutes);
   const floor = resolveStaleMinutes(void 0);
   const staleMinutes = Math.max(requested, floor);
+  lastReapFloor = staleMinutes === requested ? null : { requested, applied: staleMinutes };
   const now = /* @__PURE__ */ new Date();
   const activeRecords = await readAllRecords(locksRoot, "active");
   const candidates = activeRecords.filter((record) => {
@@ -513,7 +515,7 @@ Recommended workflow, in order:
 1. Before starting work on a set of files, call lock_query (default view, active locks only) to see what other agents are already doing, and call lock_check_conflict with the globs you're about to touch to see if anyone's active lock overlaps them. lock_check_conflict is purely informational \u2014 it never blocks you, it just gives you information to make your own judgment call with.
 2. If you decide to proceed, call lock_create to claim the work: give it a title, the glob patterns describing what you're touching, and a checklist of the tasks you plan to do.
 3. As you actually complete each task, call lock_update immediately \u2014 not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime. If you're doing a long stretch of work without a task boundary to check off, call lock_heartbeat periodically so your lock doesn't read as abandoned to anyone else watching.
-4. When the work is done, call lock_finish with a short summary. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
+4. When the work is COMMITTED \u2014 not merely when the edits are done \u2014 call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
 
 Working in a different repository than the one you are rooted in: every tool accepts an optional base_dir \u2014 any path inside the target repository. Locks then resolve from THAT repository's shared .git rather than from the current working directory. Use it whenever you are about to write into another repo: a lock created where you happen to be standing, instead of where you are writing, is invisible to the one agent who needed to see it. A base_dir that is not inside a git repository is a hard error, never a silent fallback to the current directory.
 
@@ -1007,6 +1009,12 @@ async function cmdReap(flags) {
     return;
   }
   if (reaped.length === 0) {
+    if (lastReapFloor) {
+      console.log(
+        `No locks reaped. You asked for a ${lastReapFloor.requested}-minute threshold, but a per-call value may only LENGTHEN the reaping window \u2014 it was raised to the configured default of ${lastReapFloor.applied} minute(s). Locks stale by your value but not by that one were left alone. To reap more aggressively, lower the configured default (AGENT_LOCKS_STALE_MINUTES), which is a visible, global choice.`
+      );
+      return;
+    }
     console.log("No stale locks to reap.");
     return;
   }

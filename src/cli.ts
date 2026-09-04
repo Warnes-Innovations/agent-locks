@@ -25,6 +25,7 @@
  */
 import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
+  lastReapFloor,
   createLock,
   queryLocks,
   checkConflicts,
@@ -373,6 +374,16 @@ async function cmdReap(flags: ParsedFlags): Promise<void> {
     return;
   }
   if (reaped.length === 0) {
+    if (lastReapFloor) {
+      console.log(
+        `No locks reaped. You asked for a ${lastReapFloor.requested}-minute threshold, but a ` +
+          `per-call value may only LENGTHEN the reaping window — it was raised to the configured ` +
+          `default of ${lastReapFloor.applied} minute(s). Locks stale by your value but not by ` +
+          `that one were left alone. To reap more aggressively, lower the configured default ` +
+          `(AGENT_LOCKS_STALE_MINUTES), which is a visible, global choice.`,
+      );
+      return;
+    }
     console.log('No stale locks to reap.');
     return;
   }
