@@ -37,6 +37,7 @@ import {
   LockNotFoundError,
   TaskNotFoundError,
   LockNotActiveError,
+  LockNotOwnedError,
   LockNotStaleError,
 } from './lock/store.js';
 import type { LockSummary } from './lock/types.js';
@@ -51,7 +52,7 @@ Usage:
   agent-locks check <scope...>          Check whether any active lock overlaps the given glob(s). Informational only — exits 0 either way.
   agent-locks claim [options]           Create a new lock. See "agent-locks claim --help".
   agent-locks update <lock-id> [options]  Mark a task done/undone on an existing lock. See "agent-locks update --help".
-  agent-locks finish <lock-id> [--summary <text>]  Mark a lock done and archive it.
+  agent-locks finish <lock-id> [--summary <text>] [--agent <id>] [--force]  Mark a lock done and archive it. Pass --agent so ownership can be checked; --force is required (and recorded) to end another session's claim.
   agent-locks heartbeat <lock-id>        Bump a lock's updated timestamp with no other change. See "Staleness detection" in the README.
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks --help                    Show this message.
@@ -134,7 +135,10 @@ interface ParsedFlags {
   boolFlags: Set<string>;
 }
 
-const BOOLEAN_FLAGS = new Set(['--json', '--done', '--undone', '--help', '--dry-run']);
+const BOOLEAN_FLAGS = new Set(['--json', '--done', '--undone', '--help', '--dry-run', '--force']);
+// --force must be declared here or the parser treats it as value-taking and errors
+// with "Flag --force requires a value" — which reads as a usage mistake rather than
+// a missing registration, so the escape hatch appears broken rather than absent.
 
 function parseArgs(argv: string[]): ParsedFlags {
   const positionals: string[] = [];
@@ -358,10 +362,15 @@ async function cmdFinish(flags: ParsedFlags): Promise<void> {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError('agent-locks finish requires a lock id as its first argument.');
   const summary = oneOf(flags.flags, '--summary');
+  // Pass identity THROUGH. Store-level ownership enforcement is inert if the surface
+  // never supplies who is calling — the enforcement existed and the CLI still archived
+  // another session's lock, exit 0. Verified by running it.
+  const agent_id = oneOf(flags.flags, '--agent');
+  const force = flags.boolFlags.has('--force');
 
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
-  const result = await finishLock(locksRoot, { lock_id: lockId, summary });
+  const result = await finishLock(locksRoot, { lock_id: lockId, summary, agent_id, force });
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(result, null, 2));
@@ -484,6 +493,7 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof LockNotFoundError ||
       error instanceof TaskNotFoundError ||
       error instanceof LockNotActiveError ||
+      error instanceof LockNotOwnedError ||
       error instanceof LockNotStaleError
     ) {
       printError(error.message);

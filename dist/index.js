@@ -251,6 +251,14 @@ var TaskNotFoundError = class extends Error {
     this.name = "TaskNotFoundError";
   }
 };
+var LockNotOwnedError = class extends Error {
+  constructor(lockId, holder, caller) {
+    super(
+      `Lock "${lockId}" is held by ${holder}, not by ${caller}. Refusing to finish another session's live claim \u2014 that is the failure this system exists to prevent, and finishing it silently is how uncommitted work loses its only marker. Coordinate with the holder first. If you genuinely must end their claim: --force on the CLI, or force:true via MCP. Either is allowed, and either is recorded in the archive.`
+    );
+    this.name = "LockNotOwnedError";
+  }
+};
 var LockNotActiveError = class extends Error {
   constructor(lockId) {
     super(`Lock "${lockId}" is not active (it may already be finished), so it cannot be finished again.`);
@@ -450,9 +458,13 @@ async function finishLock(locksRoot, params) {
     record.notes.push(params.summary);
   }
   const holder = record.frontmatter.agent_id;
-  if (params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id)) {
+  const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
+  if (foreign && !params.force) {
+    throw new LockNotOwnedError(params.lock_id, holder, params.agent_id);
+  }
+  if (foreign) {
     record.notes.push(
-      `Finished by ${params.agent_id}, which is NOT the holder (${holder}). finishLock does not check ownership; this note is the only record that the claim was ended by someone other than whoever made it.`
+      `Force-finished by ${params.agent_id}, which is NOT the holder (${holder}). This note is the only record that the claim was ended by someone other than whoever made it.`
     );
   }
   record.frontmatter.status = "done";
@@ -704,17 +716,23 @@ function createServer() {
       inputSchema: {
         lock_id: z.string().describe("The id of the active lock to finish."),
         summary: z.string().optional().describe("Optional closing summary appended to the Notes section before the lock is archived."),
+        agent_id: z.string().optional().describe(
+          "Your own agent id. Supply it so ownership can be checked: finishing a lock held by a DIFFERENT session is refused unless force is set. Omit it and no check is possible."
+        ),
+        force: z.boolean().optional().describe(
+          "Deliberately finish a lock held by someone else. Required when both identities are known and differ; the fact is recorded in the archived lock."
+        ),
         base_dir: z.string().optional().describe(
           "Target a different repository by its working-tree path (or any path inside it). The lock is looked up in that repository's shared .git directory. Omit to use the current working directory."
         )
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
     },
-    async ({ lock_id, summary, base_dir }) => {
+    async ({ lock_id, summary, agent_id, force, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
-        const result = await finishLock(locksRoot, { lock_id, summary });
+        const result = await finishLock(locksRoot, { lock_id, summary, agent_id, force });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -785,7 +803,7 @@ Usage:
   agent-locks check <scope...>          Check whether any active lock overlaps the given glob(s). Informational only \u2014 exits 0 either way.
   agent-locks claim [options]           Create a new lock. See "agent-locks claim --help".
   agent-locks update <lock-id> [options]  Mark a task done/undone on an existing lock. See "agent-locks update --help".
-  agent-locks finish <lock-id> [--summary <text>]  Mark a lock done and archive it.
+  agent-locks finish <lock-id> [--summary <text>] [--agent <id>] [--force]  Mark a lock done and archive it. Pass --agent so ownership can be checked; --force is required (and recorded) to end another session's claim.
   agent-locks heartbeat <lock-id>        Bump a lock's updated timestamp with no other change. See "Staleness detection" in the README.
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks --help                    Show this message.
@@ -845,7 +863,7 @@ var CLI_PREFIX = "agent-locks: ";
 function printError(message) {
   console.error(message.startsWith(CLI_PREFIX) ? message : `${CLI_PREFIX}${message}`);
 }
-var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help", "--dry-run"]);
+var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help", "--dry-run", "--force"]);
 function parseArgs(argv) {
   const positionals = [];
   const flags = /* @__PURE__ */ new Map();
@@ -1033,9 +1051,11 @@ async function cmdFinish(flags) {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError("agent-locks finish requires a lock id as its first argument.");
   const summary = oneOf(flags.flags, "--summary");
+  const agent_id = oneOf(flags.flags, "--agent");
+  const force = flags.boolFlags.has("--force");
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
-  const result = await finishLock(locksRoot, { lock_id: lockId, summary });
+  const result = await finishLock(locksRoot, { lock_id: lockId, summary, agent_id, force });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
   } else {
@@ -1130,7 +1150,7 @@ async function runCli(argv) {
       printError(error.message);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotStaleError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError) {
       printError(error.message);
       return 1;
     }

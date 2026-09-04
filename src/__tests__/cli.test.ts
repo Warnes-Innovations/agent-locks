@@ -436,3 +436,50 @@ describe('a corrupt lock is surfaced on EVERY read surface (Y2 regression)', () 
     expect(errors.join('\n')).toMatch(/could not be read/i);
   });
 });
+
+describe('finish enforces ownership FROM THE CLI, not just in the store (pointer test)', () => {
+  /**
+   * The store-level refusal was implemented and passing its own tests while the CLI
+   * still archived another session's lock, exit 0 — because cmdFinish never passed
+   * `--agent` through. That is the same last-hop failure as Y2: the mechanism worked,
+   * nothing called it, and only store-level tests existed. These assert the SURFACE.
+   */
+  it('refuses to finish another session\'s lock', async () => {
+    await runCliIn(repo, ['claim', '--title', 'held by Blue', '--scope', 'a/**', '--agent', 'Blue [aa1111]']);
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['list', '--json']);
+    const id = (JSON.parse(logs.join('\n')) as Array<{ id: string }>)[0]!.id;
+
+    const { errors } = captureConsole();
+    const code = await runCliIn(repo, ['finish', id, '--agent', 'Red [bd9522]']);
+
+    expect(code).not.toBe(0);
+    expect(errors.join('\n')).toMatch(/held by Blue \[aa1111\]|not by Red/i);
+  });
+
+  it('allows it with --force, and records the fact', async () => {
+    await runCliIn(repo, ['claim', '--title', 'held by Blue', '--scope', 'a/**', '--agent', 'Blue [aa1111]']);
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['list', '--json']);
+    const id = (JSON.parse(logs.join('\n')) as Array<{ id: string }>)[0]!.id;
+
+    captureConsole();
+    const code = await runCliIn(repo, ['finish', id, '--agent', 'Red [bd9522]', '--force']);
+    expect(code).toBe(0);
+
+    const doneDir = path.join(repo, '.git', 'agents-locks', 'done');
+    const files = await fs.readdir(doneDir);
+    const text = await fs.readFile(path.join(doneDir, files[0]!), 'utf8');
+    expect(text).toContain('is NOT the holder');
+  });
+
+  it('still finishes an unowned lock without --agent, as before', async () => {
+    await runCliIn(repo, ['claim', '--title', 'legacy', '--scope', 'a/**']);
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['list', '--json']);
+    const id = (JSON.parse(logs.join('\n')) as Array<{ id: string }>)[0]!.id;
+
+    captureConsole();
+    expect(await runCliIn(repo, ['finish', id])).toBe(0);
+  });
+});

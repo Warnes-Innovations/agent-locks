@@ -283,6 +283,18 @@ export function createServer(): McpServer {
       inputSchema: {
         lock_id: z.string().describe('The id of the active lock to finish.'),
         summary: z.string().optional().describe('Optional closing summary appended to the Notes section before the lock is archived.'),
+        agent_id: z
+          .string()
+          .optional()
+          .describe(
+            'Your own agent id. Supply it so ownership can be checked: finishing a lock held by a DIFFERENT session is refused unless force is set. Omit it and no check is possible.',
+          ),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Deliberately finish a lock held by someone else. Required when both identities are known and differ; the fact is recorded in the archived lock.',
+          ),
         base_dir: z
           .string()
           .optional()
@@ -293,11 +305,13 @@ export function createServer(): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ lock_id, summary, base_dir }) => {
+    async ({ lock_id, summary, agent_id, force, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
-        const result = await finishLock(locksRoot, { lock_id, summary });
+        // Identity must reach the store here too, or the check is decorative on the
+        // surface agents actually use.
+        const result = await finishLock(locksRoot, { lock_id, summary, agent_id, force });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);

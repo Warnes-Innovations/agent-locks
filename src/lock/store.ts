@@ -121,6 +121,20 @@ export class TaskNotFoundError extends Error {
   }
 }
 
+export class LockNotOwnedError extends Error {
+  constructor(lockId: string, holder: string, caller: string) {
+    super(
+      `Lock "${lockId}" is held by ${holder}, not by ${caller}. Refusing to finish another ` +
+        `session's live claim — that is the failure this system exists to prevent, and ` +
+        `finishing it silently is how uncommitted work loses its only marker. ` +
+        `Coordinate with the holder first. If you genuinely must end their claim: ` +
+        `--force on the CLI, or force:true via MCP. Either is allowed, and either is ` +
+        `recorded in the archive.`,
+    );
+    this.name = 'LockNotOwnedError';
+  }
+}
+
 export class LockNotActiveError extends Error {
   constructor(lockId: string) {
     super(`Lock "${lockId}" is not active (it may already be finished), so it cannot be finished again.`);
@@ -431,6 +445,11 @@ export interface FinishLockParams {
    * unfinishable — a fix worse than the defect.
    */
   agent_id?: string | null;
+  /**
+   * Deliberately finish a lock held by someone else. Required when both identities are
+   * known and differ; the reason is recorded in the archive.
+   */
+  force?: boolean;
 }
 
 export interface FinishLockResult {
@@ -477,12 +496,26 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
   // by someone else is currently indistinguishable from one finished by its holder, so
   // the done archive cannot answer "who ended this claim?" and the audit that depends
   // on it inherits the gap.
+  // OWNERSHIP, enforced exactly as far as the data allows and no further.
+  //
+  // Refuse only when BOTH identities are known and differ. That closes the accidental
+  // path — the failure actually observed — without making any existing lock
+  // unfinishable: most carry agent_id null, and a caller that supplies no identity is
+  // unchanged. Enforcing more would strand real locks, which is worse than the defect.
+  //
+  // `force` is deliberate, recorded, and not hidden: a caller who must end someone
+  // else's claim can, and the archive says so afterwards. A refusal nobody can get past
+  // becomes a refusal everyone routes around.
   const holder = record.frontmatter.agent_id;
-  if (params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id)) {
+  const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
+  if (foreign && !params.force) {
+    throw new LockNotOwnedError(params.lock_id, holder, params.agent_id!);
+  }
+  if (foreign) {
     record.notes.push(
-      `Finished by ${params.agent_id}, which is NOT the holder (${holder}). ` +
-        `finishLock does not check ownership; this note is the only record that the ` +
-        `claim was ended by someone other than whoever made it.`,
+      `Force-finished by ${params.agent_id}, which is NOT the holder (${holder}). ` +
+        `This note is the only record that the claim was ended by someone other than ` +
+        `whoever made it.`,
     );
   }
   record.frontmatter.status = 'done';

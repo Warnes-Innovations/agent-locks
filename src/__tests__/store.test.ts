@@ -10,6 +10,7 @@ import {
   LockNotFoundError,
   lastReapFloor,
   lastUnreadableLocks,
+  LockNotOwnedError,
   LockNotStaleError,
   queryLocks,
   reapStaleLocks,
@@ -552,14 +553,33 @@ describe('finishing another session\'s lock leaves a record (CR-1a)', () => {
       agent_id: 'Blue [aa1111]',
     });
 
-    await finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]', summary: 'done' });
+    // REFUSED when both identities are known and differ.
+    await expect(
+      finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]', summary: 'done' }),
+    ).rejects.toThrow(LockNotOwnedError);
 
+    // ...and force is the deliberate, recorded escape.
+    await finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]', force: true });
     const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
     const text = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
-    // Ownership is NOT enforced — most locks have no agent_id, so requiring a match
-    // would make them unfinishable. What is fixed is the silence.
     expect(text).toContain('is NOT the holder');
     expect(text).toContain('Red [bd9522]');
+  });
+
+  it('still lets ANY caller finish an unowned lock — no existing lock becomes stuck', async () => {
+    // Most locks on disk carry agent_id null. Enforcing a match against them would
+    // strand them, which is worse than the defect being fixed.
+    const { id } = await createLock(locksRoot, { title: 'legacy', scope: ['a/**'], tasks: [] });
+    await expect(
+      finishLock(locksRoot, { lock_id: id, agent_id: 'Anyone [zz9999]' }),
+    ).resolves.toBeTruthy();
+  });
+
+  it('still lets a caller with no identity finish, as before', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'held', scope: ['a/**'], tasks: [], agent_id: 'Blue [aa1111]',
+    });
+    await expect(finishLock(locksRoot, { lock_id: id })).resolves.toBeTruthy();
   });
 
   it('adds no such note when the holder finishes its own lock', async () => {
