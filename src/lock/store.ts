@@ -58,16 +58,32 @@ export function agentMatches(stored: string | null, query: string | null): boole
   // locks have agent_id null, so this is the common case, not an edge one.
   if (query === null) return stored === null;
   if (stored === null) return false;
-  if (stored === query) return true;
+  if (stored.trim().toLowerCase() === query.trim().toLowerCase()) return true;
+
+  // A SESSION REF, not "whatever is in the last brackets". An earlier version treated
+  // any trailing [...] as a stable id, so `--agent 'Codex [main]'` matched a lock held
+  // by `Claude [main]` — a false positive on identity, which is worse than a miss
+  // because callers act on it. Session refs are hex; a bracketed word is not a ref.
+  const SESSION_REF = /^[0-9a-f]{4,}$/i;
   const refOf = (v: string): string | null => {
     const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
-    return m ? m[1]!.trim() : null;
+    if (!m) {
+      const bare = v.trim();
+      return SESSION_REF.test(bare) ? bare : null;
+    }
+    const inner = m[1]!.trim();
+    return SESSION_REF.test(inner) ? inner : null;
   };
+
   const storedRef = refOf(stored);
   const queryRef = refOf(query);
-  if (storedRef !== null && queryRef !== null) return storedRef === queryRef;
-  // A bare ref queried against a full label, e.g. 'bd9522' vs 'Red [bd9522]'.
-  if (storedRef !== null && queryRef === null) return storedRef === query.trim();
+  // Case-insensitive per critical rule 8: record verbatim, compare without case.
+  // Matching on the REF and not the name is the whole point — names are mutable.
+  // Symmetric, so a bare ref finds a labelled lock AND a labelled query finds a
+  // bare-ref lock; an earlier version only handled one direction.
+  if (storedRef !== null && queryRef !== null) {
+    return storedRef.toLowerCase() === queryRef.toLowerCase();
+  }
   return false;
 }
 
@@ -204,9 +220,21 @@ async function readAllRecords(locksRoot: string, status: 'active' | 'done' | 'al
       const missing: string[] = [];
       if (!fm) missing.push('frontmatter');
       else {
+        // Validate EXACTLY what the downstream parser requires, not something looser.
+        // An earlier attempt accepted a Date-typed value (js-yaml types colon-form
+        // ISO-8601 that way) on the theory that it was "well-formed enough" — but
+        // parseTimestamp then threw in toSummary, so the fix only MOVED the failure
+        // from a reported skip to an uncaught crash. Verified by running it.
+        //
+        // agent-locks only ever writes the dashed form, so a colon-form stamp is not a
+        // lock this tool produced. Rejecting it here is correct — and it is no longer
+        // silent, because unreadable locks are now reported (see warnUnreadable in the
+        // CLI and unreadable_locks in lock_query).
+        const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/;
+        const isStamp = (v: unknown): boolean => typeof v === 'string' && STAMP.test(v.trim());
         if (typeof fm.id !== 'string') missing.push('id');
-        if (typeof fm.created !== 'string') missing.push('created');
-        if (typeof fm.updated !== 'string') missing.push('updated');
+        if (!isStamp(fm.created)) missing.push('created');
+        if (!isStamp(fm.updated)) missing.push('updated');
         if (fm.status !== 'active' && fm.status !== 'done') missing.push('status');
         if (!Array.isArray(fm.scope)) missing.push('scope');
       }

@@ -7,6 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
+  lastUnreadableLocks,
   createLock,
   queryLocks,
   checkConflicts,
@@ -102,7 +103,18 @@ export function createServer(): McpServer {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
-        return textResult(JSON.stringify(results, null, 2));
+        // Surface unreadable locks HERE too — this is the surface agents actually use.
+        // Reporting only on the CLI would leave the agent-facing path silent, which is
+        // where the collision would then happen.
+        const payload =
+          lastUnreadableLocks.length > 0
+            ? {
+                locks: results,
+                unreadable_locks: lastUnreadableLocks,
+                warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included. A claim you cannot see is a claim you will collide with.`,
+              }
+            : results;
+        return textResult(JSON.stringify(payload, null, 2));
       } catch (error) {
         return errorResult(error);
       }

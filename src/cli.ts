@@ -26,6 +26,7 @@
 import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
   lastReapFloor,
+  lastUnreadableLocks,
   createLock,
   queryLocks,
   checkConflicts,
@@ -173,6 +174,26 @@ function allOf(flags: ParsedFlags['flags'], name: string): string[] {
   return flags.get(name) ?? [];
 }
 
+
+/**
+ * Print any lock the store could not read.
+ *
+ * WITHOUT THIS the corrupt-lock fix is worse than the bug it replaced: a truncated
+ * lock used to CRASH (loud, wrong, but visible); after the fix it is skipped, so the
+ * store reports "(no locks)" with exit 0 and a real claim is invisible. Recording the
+ * condition in `lastUnreadableLocks` is worth nothing until something prints it.
+ */
+function warnUnreadable(): void {
+  if (lastUnreadableLocks.length === 0) return;
+  console.error(
+    `WARNING: ${lastUnreadableLocks.length} lock file(s) could not be read and are NOT ` +
+      `included below. A claim you cannot see is a claim you will collide with.`,
+  );
+  for (const bad of lastUnreadableLocks) {
+    console.error(`  ${bad.filePath}: ${bad.reason}`);
+  }
+}
+
 function formatStaleForSeconds(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
@@ -180,6 +201,7 @@ function formatStaleForSeconds(seconds: number): string {
 }
 
 function formatLockTable(locks: LockSummary[]): string {
+  warnUnreadable();
   if (locks.length === 0) return '(no locks)';
   const rows = locks.map((lock) => [
     lock.id,
@@ -265,6 +287,7 @@ async function cmdCheck(flags: ParsedFlags): Promise<void> {
     return;
   }
   if (conflicts.length === 0) {
+    warnUnreadable();
     console.log(`No active locks overlap ${scope.join(', ')}.`);
     return;
   }
@@ -370,21 +393,27 @@ async function cmdReap(flags: ParsedFlags): Promise<void> {
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
 
   if (flags.boolFlags.has('--json')) {
-    console.log(JSON.stringify(reaped, null, 2));
+    console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));
     return;
   }
+  // Report the floor whether or not anything was reaped. An earlier version mentioned
+  // it only in the zero-reaped branch, so "asked for 1, used 60, reaped 2" said nothing
+  // about the threshold that actually ran.
+  if (lastReapFloor) {
+    console.log(
+      `Note: a per-call threshold may only LENGTHEN the reaping window. You asked for ` +
+        `${lastReapFloor.requested} minute(s); ${lastReapFloor.applied} minute(s) was used. ` +
+        `Lower AGENT_LOCKS_STALE_MINUTES to reap more aggressively — a visible, global choice.`,
+    );
+  }
   if (reaped.length === 0) {
-    if (lastReapFloor) {
-      console.log(
-        `No locks reaped. You asked for a ${lastReapFloor.requested}-minute threshold, but a ` +
-          `per-call value may only LENGTHEN the reaping window — it was raised to the configured ` +
-          `default of ${lastReapFloor.applied} minute(s). Locks stale by your value but not by ` +
-          `that one were left alone. To reap more aggressively, lower the configured default ` +
-          `(AGENT_LOCKS_STALE_MINUTES), which is a visible, global choice.`,
-      );
-      return;
-    }
-    console.log('No stale locks to reap.');
+    console.log(
+      lastReapFloor
+        ? `No locks reaped at the ${lastReapFloor.applied}-minute threshold that was used. ` +
+            `Locks stale by your requested ${lastReapFloor.requested} minute(s) but not by that ` +
+            `one were left alone.`
+        : 'No stale locks to reap.',
+    );
     return;
   }
   const verb = dry_run ? 'Would reap' : 'Reaped';

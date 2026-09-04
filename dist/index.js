@@ -219,15 +219,22 @@ function resolveStaleMinutes(override) {
 function agentMatches(stored, query) {
   if (query === null) return stored === null;
   if (stored === null) return false;
-  if (stored === query) return true;
+  if (stored.trim().toLowerCase() === query.trim().toLowerCase()) return true;
+  const SESSION_REF = /^[0-9a-f]{4,}$/i;
   const refOf = (v) => {
     const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
-    return m ? m[1].trim() : null;
+    if (!m) {
+      const bare = v.trim();
+      return SESSION_REF.test(bare) ? bare : null;
+    }
+    const inner = m[1].trim();
+    return SESSION_REF.test(inner) ? inner : null;
   };
   const storedRef = refOf(stored);
   const queryRef = refOf(query);
-  if (storedRef !== null && queryRef !== null) return storedRef === queryRef;
-  if (storedRef !== null && queryRef === null) return storedRef === query.trim();
+  if (storedRef !== null && queryRef !== null) {
+    return storedRef.toLowerCase() === queryRef.toLowerCase();
+  }
   return false;
 }
 var LockNotFoundError = class extends Error {
@@ -304,9 +311,11 @@ async function readAllRecords(locksRoot, status) {
       const missing = [];
       if (!fm) missing.push("frontmatter");
       else {
+        const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/;
+        const isStamp = (v) => typeof v === "string" && STAMP.test(v.trim());
         if (typeof fm.id !== "string") missing.push("id");
-        if (typeof fm.created !== "string") missing.push("created");
-        if (typeof fm.updated !== "string") missing.push("updated");
+        if (!isStamp(fm.created)) missing.push("created");
+        if (!isStamp(fm.updated)) missing.push("updated");
         if (fm.status !== "active" && fm.status !== "done") missing.push("status");
         if (!Array.isArray(fm.scope)) missing.push("scope");
       }
@@ -572,7 +581,12 @@ function createServer() {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
-        return textResult(JSON.stringify(results, null, 2));
+        const payload = lastUnreadableLocks.length > 0 ? {
+          locks: results,
+          unreadable_locks: lastUnreadableLocks,
+          warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included. A claim you cannot see is a claim you will collide with.`
+        } : results;
+        return textResult(JSON.stringify(payload, null, 2));
       } catch (error) {
         return errorResult(error);
       }
@@ -844,12 +858,22 @@ function oneOf(flags, name) {
 function allOf(flags, name) {
   return flags.get(name) ?? [];
 }
+function warnUnreadable() {
+  if (lastUnreadableLocks.length === 0) return;
+  console.error(
+    `WARNING: ${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included below. A claim you cannot see is a claim you will collide with.`
+  );
+  for (const bad of lastUnreadableLocks) {
+    console.error(`  ${bad.filePath}: ${bad.reason}`);
+  }
+}
 function formatStaleForSeconds(seconds) {
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
   return `${Math.round(seconds / 3600)}h`;
 }
 function formatLockTable(locks) {
+  warnUnreadable();
   if (locks.length === 0) return "(no locks)";
   const rows = locks.map((lock) => [
     lock.id,
@@ -928,6 +952,7 @@ async function cmdCheck(flags) {
     return;
   }
   if (conflicts.length === 0) {
+    warnUnreadable();
     console.log(`No active locks overlap ${scope.join(", ")}.`);
     return;
   }
@@ -1019,17 +1044,18 @@ async function cmdReap(flags) {
   const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
   if (flags.boolFlags.has("--json")) {
-    console.log(JSON.stringify(reaped, null, 2));
+    console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));
     return;
   }
+  if (lastReapFloor) {
+    console.log(
+      `Note: a per-call threshold may only LENGTHEN the reaping window. You asked for ${lastReapFloor.requested} minute(s); ${lastReapFloor.applied} minute(s) was used. Lower AGENT_LOCKS_STALE_MINUTES to reap more aggressively \u2014 a visible, global choice.`
+    );
+  }
   if (reaped.length === 0) {
-    if (lastReapFloor) {
-      console.log(
-        `No locks reaped. You asked for a ${lastReapFloor.requested}-minute threshold, but a per-call value may only LENGTHEN the reaping window \u2014 it was raised to the configured default of ${lastReapFloor.applied} minute(s). Locks stale by your value but not by that one were left alone. To reap more aggressively, lower the configured default (AGENT_LOCKS_STALE_MINUTES), which is a visible, global choice.`
-      );
-      return;
-    }
-    console.log("No stale locks to reap.");
+    console.log(
+      lastReapFloor ? `No locks reaped at the ${lastReapFloor.applied}-minute threshold that was used. Locks stale by your requested ${lastReapFloor.requested} minute(s) but not by that one were left alone.` : "No stale locks to reap."
+    );
     return;
   }
   const verb = dry_run ? "Would reap" : "Reaped";

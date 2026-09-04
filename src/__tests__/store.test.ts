@@ -488,3 +488,57 @@ describe('reaping preserves the last-touch timestamp (CR-10 regression)', () => 
     expect(before).not.toBe('');
   });
 });
+
+describe('round-4: defects introduced by the round-2/3 fixes', () => {
+  it('does not match a different session that shares a bracketed word (false positive)', async () => {
+    await createLock(locksRoot, { title: 'theirs', scope: ['a/**'], tasks: [], agent_id: 'Claude [main]' });
+    // `main` is a word, not a session ref. Treating any trailing [...] as a stable id
+    // made this return the lock — a false positive on IDENTITY, worse than a miss
+    // because callers act on it.
+    expect(await queryLocks(locksRoot, { agent_id: 'Codex [main]' })).toEqual([]);
+  });
+
+  it('matches refs case-insensitively (critical rule 8)', async () => {
+    await createLock(locksRoot, { title: 'mine', scope: ['a/**'], tasks: [], agent_id: 'Red [BD9522]' });
+    expect(await queryLocks(locksRoot, { agent_id: 'red [bd9522]' })).toHaveLength(1);
+  });
+
+  it('matches a bare-ref lock from a labelled query (the other direction)', async () => {
+    await createLock(locksRoot, { title: 'mine', scope: ['a/**'], tasks: [], agent_id: 'bd9523' });
+    expect(await queryLocks(locksRoot, { agent_id: 'Red [bd9523]' })).toHaveLength(1);
+  });
+
+  it('reports a foreign timestamp form as unreadable rather than crashing downstream', async () => {
+    await createLock(locksRoot, { title: 'iso form', scope: ['a/**'], tasks: [] });
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const f = path.join(locksRoot, name);
+      const t = await fs.readFile(f, 'utf8');
+      // Colon-form ISO: js-yaml types this as a Date, and a strict typeof==='string'
+      // check silently discarded the whole lock.
+      await fs.writeFile(f, t.replace(/^updated: .*$/m, 'updated: 2026-09-04T00:00:00Z'), 'utf8');
+    }
+    // agent-locks only ever writes the dashed form, so this is not a lock it produced.
+    // The right behaviour is a REPORTED skip, not a crash in toSummary and not a
+    // silent drop — an earlier fix accepted it here and moved the failure downstream.
+    expect(await queryLocks(locksRoot, {})).toEqual([]);
+    expect(lastUnreadableLocks).toHaveLength(1);
+    expect(lastUnreadableLocks[0]!.reason).toContain('updated');
+  });
+
+  it('reports the floor even when locks WERE reaped', async () => {
+    const { id } = await createLock(locksRoot, { title: 'old', scope: ['a/**'], tasks: [] });
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const f = path.join(locksRoot, name);
+      const t = await fs.readFile(f, 'utf8');
+      await fs.writeFile(f, t.replace(/^updated: .*$/m, 'updated: 2020-01-01T00-00-00'), 'utf8');
+    }
+    const reaped = await reapStaleLocks(locksRoot, { stale_minutes: 1 });
+    expect(reaped).toHaveLength(1);
+    expect(reaped[0]!.id).toBe(id);
+    // The earlier version only set this in the zero-reaped path.
+    expect(lastReapFloor).not.toBeNull();
+    expect(lastReapFloor!.applied).toBe(60);
+  });
+});
