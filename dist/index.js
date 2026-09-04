@@ -216,6 +216,20 @@ function resolveStaleMinutes(override) {
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_MINUTES;
 }
+function agentMatches(stored, query) {
+  if (query === null) return stored === null;
+  if (stored === null) return false;
+  if (stored === query) return true;
+  const refOf = (v) => {
+    const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
+    return m ? m[1].trim() : null;
+  };
+  const storedRef = refOf(stored);
+  const queryRef = refOf(query);
+  if (storedRef !== null && queryRef !== null) return storedRef === queryRef;
+  if (storedRef !== null && queryRef === null) return storedRef === query.trim();
+  return false;
+}
 var LockNotFoundError = class extends Error {
   constructor(lockId) {
     super(`No lock found with id "${lockId}".`);
@@ -362,7 +376,7 @@ async function queryLocks(locksRoot, params) {
   const scopeFilter = params.scope === void 0 ? void 0 : [].concat(params.scope);
   const textFilter = params.text?.trim().toLowerCase();
   const filtered = records.filter((record) => {
-    if (params.agent_id !== void 0 && record.frontmatter.agent_id !== params.agent_id) {
+    if (params.agent_id !== void 0 && !agentMatches(record.frontmatter.agent_id, params.agent_id)) {
       return false;
     }
     if (scopeFilter && !scopesOverlap(scopeFilter, record.frontmatter.scope)) {
@@ -492,7 +506,7 @@ async function reapStaleLocks(locksRoot, params = {}) {
     reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
     if (params.dry_run) continue;
     record.notes.push(
-      `Auto-reaped: no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s) (threshold: ${staleMinutes} minute(s)).`
+      `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
     );
     record.frontmatter.status = "done";
     record.frontmatter.updated = formatTimestamp();

@@ -37,6 +37,40 @@ export function resolveStaleMinutes(override?: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_MINUTES;
 }
 
+
+/**
+ * Does a stored agent_id match the one being queried?
+ *
+ * Exact string equality is WRONG here, and the failure is silent. Sessions record
+ * their identity as `Name [ref]`, and the NAME IS MUTABLE — a session renamed
+ * mid-work leaves locks under its old label, so an exact match returns nothing for
+ * a holder that is alive and working. That is not a missing result: callers read it
+ * as "no lock", which is how a renamed holder gets its own commit refused, and how
+ * "who holds this path?" answers nobody.
+ *
+ * So: match on the REF when both sides carry one (the ref is stable), accept a bare
+ * ref against a full label, and fall back to exact equality otherwise. Deliberately
+ * NOT a substring match — that would make one agent's query match another whose name
+ * merely contains it.
+ */
+export function agentMatches(stored: string | null, query: string | null): boolean {
+  // A null query is a real query: "locks nobody claimed ownership of". Most existing
+  // locks have agent_id null, so this is the common case, not an edge one.
+  if (query === null) return stored === null;
+  if (stored === null) return false;
+  if (stored === query) return true;
+  const refOf = (v: string): string | null => {
+    const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
+    return m ? m[1]!.trim() : null;
+  };
+  const storedRef = refOf(stored);
+  const queryRef = refOf(query);
+  if (storedRef !== null && queryRef !== null) return storedRef === queryRef;
+  // A bare ref queried against a full label, e.g. 'bd9522' vs 'Red [bd9522]'.
+  if (storedRef !== null && queryRef === null) return storedRef === query.trim();
+  return false;
+}
+
 export class LockNotFoundError extends Error {
   constructor(lockId: string) {
     super(`No lock found with id "${lockId}".`);
@@ -279,7 +313,7 @@ export async function queryLocks(locksRoot: string, params: QueryLocksParams): P
   const textFilter = params.text?.trim().toLowerCase();
 
   const filtered = records.filter((record) => {
-    if (params.agent_id !== undefined && record.frontmatter.agent_id !== params.agent_id) {
+    if (params.agent_id !== undefined && !agentMatches(record.frontmatter.agent_id, params.agent_id)) {
       return false;
     }
     if (scopeFilter && !scopesOverlap(scopeFilter, record.frontmatter.scope)) {
@@ -524,9 +558,14 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
     reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
     if (params.dry_run) continue;
 
+    // Record the EXACT prior last-touch stamp before overwriting it below.
+    // `updated` is set to now on reap, which erases the inter-touch interval — the
+    // one quantity anyone tuning the staleness threshold needs. A minute-rounded
+    // English sentence is not a recoverable datum, so keep the raw timestamp.
     record.notes.push(
-      `Auto-reaped: no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s) ` +
-        `(threshold: ${staleMinutes} minute(s)).`,
+      `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), ` +
+        `no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), ` +
+        `threshold ${staleMinutes} minute(s).`,
     );
     record.frontmatter.status = 'done';
     record.frontmatter.updated = formatTimestamp();

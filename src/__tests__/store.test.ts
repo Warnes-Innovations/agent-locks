@@ -422,3 +422,69 @@ describe('the reap floor reports itself (regression)', () => {
     expect(lastReapFloor).toBeNull();
   });
 });
+
+describe('agent identity matching survives a rename (CR-7 regression)', () => {
+  // Sessions record identity as `Name [ref]` and the NAME IS MUTABLE — one session
+  // was renamed mid-work on 2026-09-02. Exact string equality then returns nothing
+  // for a holder that is alive, and callers read "no result" as "no lock": a renamed
+  // holder gets its own commit refused, and "who holds this path?" answers nobody.
+  it('finds a lock by ref when the name has changed', async () => {
+    await createLock(locksRoot, {
+      title: 'claimed before the rename',
+      scope: ['a/**'],
+      tasks: [],
+      agent_id: 'mercor-asclepius-48 [bd9522]',
+    });
+
+    // Same session, new name — the ref is what is stable.
+    expect(await queryLocks(locksRoot, { agent_id: 'Red [bd9522]' })).toHaveLength(1);
+    // A bare ref must work too, which is what a hook or a lookup would have.
+    expect(await queryLocks(locksRoot, { agent_id: 'bd9522' })).toHaveLength(1);
+  });
+
+  it('does not match a DIFFERENT session', async () => {
+    await createLock(locksRoot, { title: 'theirs', scope: ['a/**'], tasks: [], agent_id: 'Blue [aa1111]' });
+    expect(await queryLocks(locksRoot, { agent_id: 'Red [bd9522]' })).toEqual([]);
+    expect(await queryLocks(locksRoot, { agent_id: 'aa11' })).toEqual([]); // no substring matching
+  });
+
+  it('still queries unowned locks with a null agent_id', async () => {
+    await createLock(locksRoot, { title: 'unowned', scope: ['a/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'owned', scope: ['b/**'], tasks: [], agent_id: 'Red [bd9522]' });
+    const unowned = await queryLocks(locksRoot, { agent_id: null });
+    expect(unowned).toHaveLength(1);
+    expect(unowned[0]!.title).toBe('unowned');
+  });
+});
+
+describe('reaping preserves the last-touch timestamp (CR-10 regression)', () => {
+  // reap sets updated = now, erasing the inter-touch interval — the one quantity
+  // anyone tuning the staleness threshold needs. The note must carry the raw stamp.
+  it('records the exact prior updated stamp in the reap note', async () => {
+    const { id } = await createLock(locksRoot, { title: 'abandoned', scope: ['a/**'], tasks: [] });
+    let before = '';
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const text = await fs.readFile(path.join(locksRoot, name), 'utf8');
+      before = /^updated: (.*)$/m.exec(text)![1]!.trim();
+    }
+
+    await reapStaleLocks(locksRoot, { stale_minutes: 0 === 0 ? 60 : 60 });
+    // Not stale yet, so force it: backdate then reap at the default.
+    const dir = locksRoot;
+    for (const name of await fs.readdir(dir)) {
+      if (!name.endsWith('.md')) continue;
+      const f = path.join(dir, name);
+      const t = await fs.readFile(f, 'utf8');
+      await fs.writeFile(f, t.replace(/^updated: .*$/m, 'updated: 2020-01-01T00-00-00'), 'utf8');
+    }
+    const reaped = await reapStaleLocks(locksRoot, {});
+    expect(reaped).toHaveLength(1);
+    expect(reaped[0]!.id).toBe(id);
+
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const doneText = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    expect(doneText).toContain('last touched 2020-01-01T00-00-00');
+    expect(before).not.toBe('');
+  });
+});
