@@ -262,15 +262,50 @@ async function readRecord(filePath) {
 }
 async function writeRecord(record) {
   const contents = serializeLockFile(record);
-  await fs2.mkdir(path2.dirname(record.filePath), { recursive: true });
-  await fs2.writeFile(record.filePath, contents, "utf8");
+  const dir = path2.dirname(record.filePath);
+  await fs2.mkdir(dir, { recursive: true });
+  const tmpPath = path2.join(dir, `.${path2.basename(record.filePath)}.${process.pid}.tmp`);
+  try {
+    await fs2.writeFile(tmpPath, contents, "utf8");
+    await fs2.rename(tmpPath, record.filePath);
+  } catch (err) {
+    await fs2.rm(tmpPath, { force: true }).catch(() => {
+    });
+    throw err;
+  }
 }
+var lastUnreadableLocks = [];
 async function readAllRecords(locksRoot, status) {
   const dirs = [];
   if (status === "active" || status === "all") dirs.push(activeDir(locksRoot));
   if (status === "done" || status === "all") dirs.push(doneDir(locksRoot));
   const files = (await Promise.all(dirs.map(listMarkdownFiles))).flat();
-  return Promise.all(files.map(readRecord));
+  const records = [];
+  const unreadable = [];
+  for (const filePath of files) {
+    try {
+      const record = await readRecord(filePath);
+      const fm = record.frontmatter;
+      const missing = [];
+      if (!fm) missing.push("frontmatter");
+      else {
+        if (typeof fm.id !== "string") missing.push("id");
+        if (typeof fm.created !== "string") missing.push("created");
+        if (typeof fm.updated !== "string") missing.push("updated");
+        if (fm.status !== "active" && fm.status !== "done") missing.push("status");
+        if (!Array.isArray(fm.scope)) missing.push("scope");
+      }
+      if (missing.length > 0) {
+        unreadable.push({ filePath, reason: `malformed lock: missing or invalid ${missing.join(", ")}` });
+        continue;
+      }
+      records.push(record);
+    } catch (err) {
+      unreadable.push({ filePath, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  lastUnreadableLocks = unreadable;
+  return records;
 }
 async function findRecordById(locksRoot, lockId) {
   for (const dir of [activeDir(locksRoot), doneDir(locksRoot)]) {

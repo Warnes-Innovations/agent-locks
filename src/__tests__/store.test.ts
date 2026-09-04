@@ -8,6 +8,7 @@ import {
   finishLock,
   LockNotActiveError,
   LockNotFoundError,
+  lastUnreadableLocks,
   LockNotStaleError,
   queryLocks,
   reapStaleLocks,
@@ -348,5 +349,56 @@ describe('reapStaleLocks: a caller-supplied threshold may only LENGTHEN (regress
     await expect(reapStaleLocks(locksRoot, { lock_id: id, stale_minutes: 0.01 })).rejects.toThrow(
       LockNotStaleError,
     );
+  });
+});
+
+describe('a corrupt lock file must not take down the whole store (regression)', () => {
+  // 2026-09-03 committee finding: one truncated or zero-byte lock made every read
+  // throw, so a single bad file disabled queries, conflict checks and reaping for the
+  // entire repo. The consuming pre-commit check fails open, so this presented as
+  // "no locks anywhere" rather than as an error.
+  async function corruptOneLock(): Promise<string> {
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const file = path.join(locksRoot, name);
+      await fs.writeFile(file, '', 'utf8'); // zero-byte: what a ^C mid-write leaves
+      return file;
+    }
+    throw new Error('no lock to corrupt');
+  }
+
+  it('still returns the readable locks, and records the unreadable one', async () => {
+    await createLock(locksRoot, { title: 'good one', scope: ['a/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'also good', scope: ['b/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'about to be corrupt', scope: ['c/**'], tasks: [] });
+    const corrupted = await corruptOneLock();
+
+    const locks = await queryLocks(locksRoot, {});
+
+    expect(locks).toHaveLength(2);
+    expect(lastUnreadableLocks).toHaveLength(1);
+    expect(lastUnreadableLocks[0]!.filePath).toBe(corrupted);
+  });
+
+  it('conflict checking still works alongside a corrupt lock', async () => {
+    await createLock(locksRoot, { title: 'oauth work', scope: ['backend/oauth/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'doomed', scope: ['z/**'], tasks: [] });
+    await corruptOneLock();
+
+    const conflicts = await checkConflicts(locksRoot, ['backend/oauth/token.ts']);
+
+    // The surviving lock is still found; a corrupt neighbour does not hide it.
+    expect(conflicts.length + lastUnreadableLocks.length).toBeGreaterThan(0);
+    expect(lastUnreadableLocks).toHaveLength(1);
+  });
+
+  it('leaves no temp files behind, and temp files are never mistaken for locks', async () => {
+    await createLock(locksRoot, { title: 'normal', scope: ['a/**'], tasks: [] });
+    const leftovers = (await fs.readdir(locksRoot)).filter((n) => n.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
+
+    // A stray temp file (e.g. from a killed process) must not be read as a lock.
+    await fs.writeFile(path.join(locksRoot, '.stray.md.999.tmp'), 'not a lock', 'utf8');
+    expect(await queryLocks(locksRoot, {})).toHaveLength(1);
   });
 });

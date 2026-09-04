@@ -92,11 +92,50 @@ async function readRecord(filePath: string): Promise<LockRecord> {
   return { ...parsed, filePath };
 }
 
+/**
+ * Writes a lock ATOMICALLY: full contents to a temp file in the same directory,
+ * then rename over the target. Rename is atomic within a filesystem, so a reader
+ * sees either the old file or the new one — never a half-written one.
+ *
+ * WHY THIS IS NOT A PLAIN writeFile (do not "simplify" it back):
+ * a partial write leaves a lock whose frontmatter will not parse, and one
+ * unparseable lock used to throw for the WHOLE store — so every query, conflict
+ * check and reap in that repo failed. An ordinary Ctrl-C during a write was
+ * enough to reach that state, and the pre-commit check that consumes this store
+ * fails open, which turned it into silent repo-wide non-enforcement rather than
+ * a visible error. Found by committee review 2026-09-03.
+ *
+ * The temp file lives in the SAME directory as the target because rename() is
+ * only atomic within one filesystem; via os.tmpdir() it can cross a mount and
+ * silently degrade to a copy.
+ */
 async function writeRecord(record: LockRecord): Promise<void> {
   const contents = serializeLockFile(record);
-  await fs.mkdir(path.dirname(record.filePath), { recursive: true });
-  await fs.writeFile(record.filePath, contents, 'utf8');
+  const dir = path.dirname(record.filePath);
+  await fs.mkdir(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.${path.basename(record.filePath)}.${process.pid}.tmp`);
+  try {
+    await fs.writeFile(tmpPath, contents, 'utf8');
+    await fs.rename(tmpPath, record.filePath);
+  } catch (err) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
 }
+
+/** A lock file that could not be read or parsed. Reported, never silently skipped. */
+export interface UnreadableLock {
+  filePath: string;
+  reason: string;
+}
+
+/**
+ * Lock files that failed to parse on the most recent readAllRecords call.
+ * Callers that report status (CLI `status`, MCP lock_query) should surface these:
+ * a lock nobody can read is a claim nobody can see, and silently dropping it
+ * would make an unreadable store indistinguishable from an empty one.
+ */
+export let lastUnreadableLocks: UnreadableLock[] = [];
 
 async function readAllRecords(locksRoot: string, status: 'active' | 'done' | 'all'): Promise<LockRecord[]> {
   const dirs: string[] = [];
@@ -104,7 +143,43 @@ async function readAllRecords(locksRoot: string, status: 'active' | 'done' | 'al
   if (status === 'done' || status === 'all') dirs.push(doneDir(locksRoot));
 
   const files = (await Promise.all(dirs.map(listMarkdownFiles))).flat();
-  return Promise.all(files.map(readRecord));
+
+  // One corrupt lock must not take down the whole store. Before this, a single
+  // truncated or zero-byte file made every read throw, and the consuming check
+  // fails open — so the failure presented as "no locks anywhere" rather than as
+  // an error. Skip the unreadable one, keep the rest, and RECORD it so the
+  // condition is reportable instead of silent.
+  const records: LockRecord[] = [];
+  const unreadable: UnreadableLock[] = [];
+  for (const filePath of files) {
+    try {
+      const record = await readRecord(filePath);
+      // readRecord does NOT throw on a truncated or empty file — it returns a record
+      // whose frontmatter fields are undefined, and the failure then surfaces far away
+      // (parseTimestamp on a `stale` computation, or scopesOverlap iterating a missing
+      // scope array). Verified by running it against a zero-byte lock. So VALIDATE
+      // here; catching around the read alone never fires.
+      const fm = record.frontmatter as Partial<LockRecord['frontmatter']> | undefined;
+      const missing: string[] = [];
+      if (!fm) missing.push('frontmatter');
+      else {
+        if (typeof fm.id !== 'string') missing.push('id');
+        if (typeof fm.created !== 'string') missing.push('created');
+        if (typeof fm.updated !== 'string') missing.push('updated');
+        if (fm.status !== 'active' && fm.status !== 'done') missing.push('status');
+        if (!Array.isArray(fm.scope)) missing.push('scope');
+      }
+      if (missing.length > 0) {
+        unreadable.push({ filePath, reason: `malformed lock: missing or invalid ${missing.join(', ')}` });
+        continue;
+      }
+      records.push(record);
+    } catch (err) {
+      unreadable.push({ filePath, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  lastUnreadableLocks = unreadable;
+  return records;
 }
 
 /** Finds a lock by id, searching active first, then done. Returns null if not found in either. */
