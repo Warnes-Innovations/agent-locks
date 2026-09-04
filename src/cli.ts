@@ -182,6 +182,11 @@ function allOf(flags: ParsedFlags['flags'], name: string): string[] {
  * lock used to CRASH (loud, wrong, but visible); after the fix it is skipped, so the
  * store reports "(no locks)" with exit 0 and a real claim is invisible. Recording the
  * condition in `lastUnreadableLocks` is worth nothing until something prints it.
+ *
+ * CALL IT FROM EVERY READ COMMAND, not from the table renderer. An earlier version
+ * lived inside formatLockTable, so `--json` — the form a hook or script uses — skipped
+ * it entirely and reported a corrupt lock as no lock. Placement, not presence, was the
+ * defect. Verified by running each surface.
  */
 function warnUnreadable(): void {
   if (lastUnreadableLocks.length === 0) return;
@@ -201,7 +206,6 @@ function formatStaleForSeconds(seconds: number): string {
 }
 
 function formatLockTable(locks: LockSummary[]): string {
-  warnUnreadable();
   if (locks.length === 0) return '(no locks)';
   const rows = locks.map((lock) => [
     lock.id,
@@ -238,6 +242,7 @@ async function cmdStatus(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {});
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
   console.log(`agent-locks: ${locks.length} active lock(s) in ${locksRoot}\n`);
   console.log(formatLockTable(locks));
 }
@@ -265,6 +270,7 @@ async function cmdList(flags: ParsedFlags): Promise<void> {
     text,
     stale_minutes,
   });
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(locks, null, 2));
@@ -282,12 +288,12 @@ async function cmdCheck(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const conflicts = await checkConflicts(locksRoot, scope, stale_minutes);
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(conflicts, null, 2));
     return;
   }
   if (conflicts.length === 0) {
-    warnUnreadable();
     console.log(`No active locks overlap ${scope.join(', ')}.`);
     return;
   }
@@ -391,6 +397,7 @@ async function cmdReap(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));

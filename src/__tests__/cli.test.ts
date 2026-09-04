@@ -372,3 +372,67 @@ describe('CLI dispatch via the actual compiled binary', () => {
     expect(stdout).toContain('0 active lock');
   });
 });
+
+describe('a corrupt lock is surfaced on EVERY read surface (Y2 regression)', () => {
+  /**
+   * These tests assert the POINTER, not the mechanism.
+   *
+   * The round-4 fix recorded unreadable locks in `lastUnreadableLocks` and wired a
+   * warning into the human table renderer. Five tests were added and all five asserted
+   * the STORE-LEVEL recording, which already worked — so deleting every call site and
+   * the whole MCP payload left the suite fully green. The wiring, which was the actual
+   * fix, was untested. That is the failure this project keeps repeating: a control
+   * built and nothing pointing at it, including nothing in the tests.
+   *
+   * Each test below fails if its call site is removed.
+   */
+  async function corruptTheOnlyLock(): Promise<void> {
+    const locksDir = path.join(repo, '.git', 'agents-locks');
+    for (const name of await fs.readdir(locksDir)) {
+      if (name.endsWith('.md')) await fs.writeFile(path.join(locksDir, name), '', 'utf8');
+    }
+  }
+
+  it('warns on `list --json` — the form a hook or script uses', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { logs, errors } = captureConsole();
+
+    await runCliIn(repo, ['list', '--json', '--status', 'active']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+    // And the payload itself is still the empty array, which is exactly why the
+    // warning has to exist: the data cannot express "I could not tell you".
+    expect(logs.join('\n')).toContain('[]');
+  });
+
+  it('warns on `check` — the call made before writing, where silence is worst', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { errors } = captureConsole();
+
+    await runCliIn(repo, ['check', 'src/main.ts']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+  });
+
+  it('warns on `status`', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { errors } = captureConsole();
+
+    await runCliIn(repo, ['status']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+  });
+
+  it('warns on `reap`', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { errors } = captureConsole();
+
+    await runCliIn(repo, ['reap', '--dry-run']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+  });
+});

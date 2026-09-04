@@ -220,7 +220,7 @@ function agentMatches(stored, query) {
   if (query === null) return stored === null;
   if (stored === null) return false;
   if (stored.trim().toLowerCase() === query.trim().toLowerCase()) return true;
-  const SESSION_REF = /^[0-9a-f]{4,}$/i;
+  const SESSION_REF = /^(?=.*\d)[A-Za-z0-9_-]{2,}$/;
   const refOf = (v) => {
     const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
     if (!m) {
@@ -581,12 +581,17 @@ function createServer() {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
-        const payload = lastUnreadableLocks.length > 0 ? {
-          locks: results,
-          unreadable_locks: lastUnreadableLocks,
-          warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included. A claim you cannot see is a claim you will collide with.`
-        } : results;
-        return textResult(JSON.stringify(payload, null, 2));
+        return textResult(
+          JSON.stringify(
+            {
+              locks: results,
+              unreadable_locks: lastUnreadableLocks,
+              ...lastUnreadableLocks.length > 0 ? { warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included in "locks". A claim you cannot see is a claim you will collide with.` } : {}
+            },
+            null,
+            2
+          )
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -611,7 +616,17 @@ function createServer() {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await checkConflicts(locksRoot, scope, stale_minutes);
-        return textResult(JSON.stringify(results, null, 2));
+        return textResult(
+          JSON.stringify(
+            {
+              conflicts: results,
+              unreadable_locks: lastUnreadableLocks,
+              ...lastUnreadableLocks.length > 0 ? { warning: `${lastUnreadableLocks.length} lock file(s) could not be read, so this is NOT a complete conflict check.` } : {}
+            },
+            null,
+            2
+          )
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -744,7 +759,7 @@ function createServer() {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const result = await reapStaleLocks(locksRoot, { lock_id, stale_minutes, dry_run });
-        return textResult(JSON.stringify(result, null, 2));
+        return textResult(JSON.stringify({ reaped: result, floor: lastReapFloor }, null, 2));
       } catch (error) {
         return errorResult(error);
       }
@@ -873,7 +888,6 @@ function formatStaleForSeconds(seconds) {
   return `${Math.round(seconds / 3600)}h`;
 }
 function formatLockTable(locks) {
-  warnUnreadable();
   if (locks.length === 0) return "(no locks)";
   const rows = locks.map((lock) => [
     lock.id,
@@ -906,6 +920,7 @@ async function cmdStatus(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {});
+  warnUnreadable();
   console.log(`agent-locks: ${locks.length} active lock(s) in ${locksRoot}
 `);
   console.log(formatLockTable(locks));
@@ -932,6 +947,7 @@ async function cmdList(flags) {
     text,
     stale_minutes
   });
+  warnUnreadable();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(locks, null, 2));
   } else {
@@ -947,12 +963,12 @@ async function cmdCheck(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const conflicts = await checkConflicts(locksRoot, scope, stale_minutes);
+  warnUnreadable();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(conflicts, null, 2));
     return;
   }
   if (conflicts.length === 0) {
-    warnUnreadable();
     console.log(`No active locks overlap ${scope.join(", ")}.`);
     return;
   }
@@ -1043,6 +1059,7 @@ async function cmdReap(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
+  warnUnreadable();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));
     return;

@@ -60,11 +60,26 @@ export function agentMatches(stored: string | null, query: string | null): boole
   if (stored === null) return false;
   if (stored.trim().toLowerCase() === query.trim().toLowerCase()) return true;
 
-  // A SESSION REF, not "whatever is in the last brackets". An earlier version treated
-  // any trailing [...] as a stable id, so `--agent 'Codex [main]'` matched a lock held
-  // by `Claude [main]` — a false positive on identity, which is worse than a miss
-  // because callers act on it. Session refs are hex; a bracketed word is not a ref.
-  const SESSION_REF = /^[0-9a-f]{4,}$/i;
+  // A SESSION REF, not "whatever is in the last brackets".
+  //
+  // TWO WRONG VERSIONS PRECEDED THIS, in opposite directions — worth recording, because
+  // the middle is narrow:
+  //  1. Any trailing [...] counted, so `--agent 'Codex [main]'` matched `Claude [main]`.
+  //  2. Requiring hex `[0-9a-f]{4,}` rejected legitimate refs — `[w7x2k9]`, `[48]`,
+  //     `[a1b2-c3d4]` all stopped matching. That alphabet was invented here and appears
+  //     in no document; constraining an identifier format we do not own is how a
+  //     matcher silently stops finding real holders.
+  //
+  // So: ref-shaped token AND at least one digit. The digit is the discriminator that
+  // both previous attempts lacked — every real session ref carries one (bd9522, w7x2k9,
+  // 48, a1b2-c3d4) and the bracketed WORDS that caused the false positives do not
+  // (main, beef). It admits refs the hex rule wrongly rejected without admitting words.
+  //
+  // KNOWN LIMIT, stated rather than hidden: an all-letter ref would be rejected and
+  // fall back to exact matching, and two sessions genuinely sharing a ref would still
+  // match each other. Neither is solvable in a matcher — identity here is self-asserted
+  // and documented as unverified, so this narrows accidents, not impersonation.
+  const SESSION_REF = /^(?=.*\d)[A-Za-z0-9_-]{2,}$/;
   const refOf = (v: string): string | null => {
     const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
     if (!m) {

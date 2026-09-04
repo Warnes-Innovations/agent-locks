@@ -7,6 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
+  lastReapFloor,
   lastUnreadableLocks,
   createLock,
   queryLocks,
@@ -106,15 +107,23 @@ export function createServer(): McpServer {
         // Surface unreadable locks HERE too — this is the surface agents actually use.
         // Reporting only on the CLI would leave the agent-facing path silent, which is
         // where the collision would then happen.
-        const payload =
-          lastUnreadableLocks.length > 0
-            ? {
-                locks: results,
-                unreadable_locks: lastUnreadableLocks,
-                warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included. A claim you cannot see is a claim you will collide with.`,
-              }
-            : results;
-        return textResult(JSON.stringify(payload, null, 2));
+        // ALWAYS this shape. An earlier version returned a bare array normally and an
+        // object only when a lock was unreadable — so a consumer would test the happy
+        // path, ship, and break in exactly the failure case the field exists to report.
+        // A conditional shape is discovered only when things are already going wrong.
+        return textResult(
+          JSON.stringify(
+            {
+              locks: results,
+              unreadable_locks: lastUnreadableLocks,
+              ...(lastUnreadableLocks.length > 0
+                ? { warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included in "locks". A claim you cannot see is a claim you will collide with.` }
+                : {}),
+            },
+            null,
+            2,
+          ),
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -154,7 +163,22 @@ export function createServer(): McpServer {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await checkConflicts(locksRoot, scope, stale_minutes);
-        return textResult(JSON.stringify(results, null, 2));
+        // A corrupt lock here reads as "no conflict", which is the most dangerous
+        // possible answer from this tool — it is the check an agent runs before writing.
+        // Always this shape, for the same reason as lock_query above.
+        return textResult(
+          JSON.stringify(
+            {
+              conflicts: results,
+              unreadable_locks: lastUnreadableLocks,
+              ...(lastUnreadableLocks.length > 0
+                ? { warning: `${lastUnreadableLocks.length} lock file(s) could not be read, so this is NOT a complete conflict check.` }
+                : {}),
+            },
+            null,
+            2,
+          ),
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -346,7 +370,10 @@ export function createServer(): McpServer {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const result = await reapStaleLocks(locksRoot, { lock_id, stale_minutes, dry_run });
-        return textResult(JSON.stringify(result, null, 2));
+        // The floor must be reported HERE too. A CLI-only version left the surface
+        // agents actually use claiming nothing was stale, when locks were stale by the
+        // requested threshold and merely protected.
+        return textResult(JSON.stringify({ reaped: result, floor: lastReapFloor }, null, 2));
       } catch (error) {
         return errorResult(error);
       }

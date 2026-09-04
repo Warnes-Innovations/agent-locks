@@ -148,7 +148,7 @@ Lists locks. **Hard requirement, enforced and tested** (`src/__tests__/store.tes
 { "name": "lock_query", "arguments": { "scope": "backend/src/oauth/client.ts" } }
 ```
 
-Returns `Array<{id, title, status, percentComplete, scope, repository, agent_id, parent_agent_id, stale, staleForSeconds}>`. `percentComplete` is the ratio of checked to total tasks (a lock with zero tasks reports 100). `repository` is the root of the repo the lock governs, so a reader never has to infer that from the scope glob. See "Staleness detection" below for `stale`/`staleForSeconds` and the optional `stale_minutes` argument.
+Returns `{ locks: Array<{id, title, status, percentComplete, scope, repository, agent_id, parent_agent_id, stale, staleForSeconds}>, unreadable_locks: Array<{filePath, reason}>, warning?: string }`. **The shape does not change when something is wrong** — `unreadable_locks` is always present, empty in the normal case. An earlier version returned a bare array and switched to an object only when a lock could not be read, so a consumer would test the happy path, ship, and break in exactly the failure case the field exists to report. `lock_check_conflict` uses the same envelope with `conflicts` in place of `locks`; `lock_reap` returns `{ reaped, floor }`, where `floor` is non-null when a per-call `stale_minutes` was raised to the configured default. `percentComplete` is the ratio of checked to total tasks (a lock with zero tasks reports 100). `repository` is the root of the repo the lock governs, so a reader never has to infer that from the scope glob. See "Staleness detection" below for `stale`/`staleForSeconds` and the optional `stale_minutes` argument.
 
 ### `lock_check_conflict`
 

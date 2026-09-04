@@ -87,7 +87,19 @@ afterEach(async () => {
 function toolResultJson(result: Awaited<ReturnType<Client['callTool']>>): unknown {
   const first = (result.content as Array<{ type: string; text?: string }>)[0];
   expect(first?.type).toBe('text');
-  return JSON.parse(first.text as string);
+  const parsed = JSON.parse(first.text as string);
+  // lock_query / lock_check_conflict / lock_reap return a STABLE envelope carrying the
+  // payload plus out-of-band condition reporting (unreadable locks, the reap floor).
+  // The envelope is asserted explicitly in its own test; unwrapping here keeps every
+  // other assertion about the thing under test rather than about the wrapper.
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    for (const key of ['locks', 'conflicts', 'reaped']) {
+      if (Array.isArray((parsed as Record<string, unknown>)[key])) {
+        return (parsed as Record<string, unknown>)[key];
+      }
+    }
+  }
+  return parsed;
 }
 
 function errorText(result: Awaited<ReturnType<Client['callTool']>>): string {
