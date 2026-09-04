@@ -41,6 +41,8 @@ import {
   LockNotStaleError,
   LockNotDoneError,
   ArchivedLockImmutableError,
+  DuplicateLockIdError,
+  MutationLockTimeoutError,
   NoOpUpdateError,
   ScopeNotHeldError,
   EmptyScopeError,
@@ -49,6 +51,7 @@ import {
 } from './lock/store.js';
 import { readEvents, lastEventLogErrors } from './lock/events.js';
 import type { LockSummary } from './lock/types.js';
+import { VERSION } from './version.js';
 
 const USAGE = `agent-locks — filesystem-based work-claiming locks for AI coding agents, shared across every git worktree of the current repository.
 
@@ -65,6 +68,9 @@ Usage:
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks reopen <lock-id> [options]  Return an archived lock to active. See "agent-locks reopen --help".
   agent-locks events [options]          Read the append-only lock event log. See "agent-locks events --help".
+  agent-locks --version                 Print the INSTALLED build. Compare it against the version the MCP
+                                        server reports: a long-lived server does not reload, so the two
+                                        differing means your session holds a stale build.
   agent-locks --help                    Show this message.
 
 Every subcommand talks to the exact same lock store the MCP tools use — a human running "agent-locks status" and an agent calling lock_query see identical, live state.
@@ -146,13 +152,21 @@ Options:
 
 const EVENTS_USAGE = `agent-locks events [options]
 
-Reads the append-only event log — reaps and reopens, oldest first. This is the data behind
-any future change to the staleness threshold: tune on the distribution of inter-touch
-intervals for locks that turned out to be ALIVE, which means the reaps that were later
-reopened. The threshold must exceed the TAIL of that distribution, not its median.
+Reads the append-only event log — touches, reaps and reopens, oldest first. This is the data behind
+any future change to the staleness threshold. Tune on the distribution of inter-touch
+intervals for locks that turned out to be ALIVE — that is the "touch" events, not the
+reaps. The threshold must exceed the TAIL of that distribution, not its median.
+
+Two limits travel with the number and must not be dropped from a report of it: the
+false-positive count is a LOWER BOUND on wrong reaps (a holder who never noticed leaves
+no record), and the live intervals are right-truncated (a lock still open contributes
+nothing).
 
 Options:
-  --type <reap|reopen>   Only events of this type.
+  --type <reap|reopen|touch>
+                         Only events of this type. "touch" is the live inter-touch
+                          interval of a lock that was ALIVE — the distribution the
+                          threshold must sit above.
   --lock <lock-id>       Only events for this lock.
   --limit <n>            Return at most n events, the most recent ones.
   --base-dir <path>      Read the log of a different repository (any path inside it).
@@ -252,6 +266,21 @@ const BOOLEAN_FLAGS = new Set(['--json', '--done', '--undone', '--help', '--dry-
 // with "Flag --force requires a value" — which reads as a usage mistake rather than
 // a missing registration, so the escape hatch appears broken rather than absent.
 
+/**
+ * Every flag any subcommand accepts. An unknown flag is REFUSED rather than ignored.
+ *
+ * Silently swallowing an unrecognised flag meant `--agentid` — a plausible typo for
+ * `--agent` — ran the command anonymously at exit 0, which is precisely the path that
+ * skips the ownership check. A safety argument that vanishes on a typo is not one.
+ */
+const KNOWN_FLAGS = new Set([
+  '--json', '--done', '--undone', '--help', '--dry-run', '--force',
+  '--title', '--scope', '--task', '--agent', '--parent', '--note',
+  '--add-scope', '--remove-scope', '--summary', '--reason',
+  '--status', '--text', '--stale-minutes', '--base-dir',
+  '--type', '--lock', '--limit',
+]);
+
 function parseArgs(argv: string[]): ParsedFlags {
   const positionals: string[] = [];
   const flags = new Map<string, string[]>();
@@ -262,6 +291,13 @@ function parseArgs(argv: string[]): ParsedFlags {
     if (!arg.startsWith('--')) {
       positionals.push(arg);
       continue;
+    }
+    if (arg.startsWith('--') && !KNOWN_FLAGS.has(arg)) {
+      throw new CliUsageError(
+        `Unknown flag ${arg}. Refusing rather than ignoring it: a swallowed flag runs the command ` +
+          `without whatever you meant it to do — a mistyped --agent runs anonymously, which is the ` +
+          `path that skips the ownership check. Run the subcommand with --help for its flags.`,
+      );
     }
     if (BOOLEAN_FLAGS.has(arg)) {
       boolFlags.add(arg);
@@ -607,12 +643,40 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
   warnEventLog();
 
   if (flags.boolFlags.has('--json')) {
-    console.log(JSON.stringify(events, null, 2));
+    // An envelope, not a bare array: the caveats are part of the answer. A consumer
+    // reading a bare list of reopens would take the false-positive count as an
+    // estimate of wrong reaps, when it is only ever a lower bound.
+    const liveJson = all.filter((e) => e.event === 'touch').map((e) => (e as { idle_seconds: number }).idle_seconds);
+    console.log(
+      JSON.stringify(
+        {
+          events,
+          summary: {
+            matched: events.length,
+            whole_log: all.length,
+            reaps: all.filter((e) => e.event === 'reap').length,
+            false_positives: all.filter((e) => e.event === 'reopen' && e.verdict === 'false-positive').length,
+            live_intervals_n: liveJson.length,
+            caveats: [
+              'false_positives is a LOWER BOUND on wrong reaps: a holder who never noticed, or who re-claimed instead of reopening, leaves no record.',
+              'live_intervals are right-truncated — a lock still open, or whose holder never returned, contributes nothing.',
+              'Tune above the TAIL of the live distribution, not its median.',
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
   if (events.length === 0) {
-    console.log('No matching lock events recorded.');
-    return;
+    // Do NOT return here. Returning made `events --type touch` on a log of four reaps
+    // print output byte-identical to an empty log — and since no log has touch events
+    // until this build runs, that was the state of every log in existence. The
+    // whole-log summary below is exactly what distinguishes "nothing matched your
+    // filter" from "nothing has ever happened".
+    console.log('No events matched. (The summary below covers the WHOLE log.)');
   }
   for (const event of events) {
     if (event.event === 'reap') {
@@ -762,6 +826,11 @@ async function cmdReap(flags: ParsedFlags): Promise<void> {
 export async function runCli(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
 
+  if (command === '--version' || command === '-v') {
+    console.log(VERSION);
+    return 0;
+  }
+
   if (command === undefined || command === '--help' || command === '-h') {
     console.log(USAGE);
     return 0;
@@ -818,6 +887,8 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof LockNotStaleError ||
       error instanceof LockNotDoneError ||
       error instanceof ArchivedLockImmutableError ||
+      error instanceof DuplicateLockIdError ||
+      error instanceof MutationLockTimeoutError ||
       error instanceof NoOpUpdateError ||
       error instanceof ScopeNotHeldError ||
       error instanceof EmptyScopeError ||

@@ -1,10 +1,17 @@
 /**
- * Module: builds the agent-locks McpServer instance and registers its 7
- * tools. Kept separate from index.ts (the stdio entrypoint) so tests can
- * construct a server and drive it without spawning a real subprocess.
+ * Module: builds the agent-locks McpServer instance and registers its tools.
+ * Kept separate from index.ts (the stdio entrypoint) so tests can construct a
+ * server and drive it without spawning a real subprocess.
+ *
+ * The tool COUNT is deliberately not written here. It was stated as 7 in this
+ * comment while the README said 9 and the roster was 8 — and it survived a
+ * correction pass because the number wrapped across two comment lines and the
+ * grep for it missed the wrap. The count is asserted in exactly one place that
+ * cannot go stale: the exhaustive roster test in src/__tests__/e2e.test.ts.
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { VERSION } from './version.js';
 import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
   lastReapFloor,
@@ -25,7 +32,7 @@ import {
 import { DEFAULT_STALE_MINUTES } from './lock/types.js';
 
 const SERVER_NAME = 'agent-locks';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = VERSION;
 
 const INSTRUCTIONS = `agent-locks: filesystem-based work-claiming locks shared across every git worktree of the current repository. No database — everything lives as markdown files under the repo's shared .git directory, so it is automatically invisible to git and never gets committed.
 
@@ -39,6 +46,8 @@ Recommended workflow, in order:
 Working in a different repository than the one you are rooted in: every tool accepts an optional base_dir — any path inside the target repository. Locks then resolve from THAT repository's shared .git rather than from the current working directory. Use it whenever you are about to write into another repo: a lock created where you happen to be standing, instead of where you are writing, is invisible to the one agent who needed to see it. A base_dir that is not inside a git repository is a hard error, never a silent fallback to the current directory.
 
 Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) — true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict — nothing is ever cleaned up as a side effect of reading. If your OWN lock vanishes mid-work, it was reaped: call lock_reopen to get it back, rather than re-claiming. If you see someone else's stale lock blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it. A supplied stale_minutes may only LENGTHEN the window — it is floored at the CONFIGURED default — so the parameter cannot be used to reap live locks. Note the floor is the configured default rather than a constant: AGENT_LOCKS_STALE_MINUTES sets it, and where that is set small, reap does finish live locks.
+
+Build identity, and why it matters here: this server reports version ${SERVER_VERSION}. It is a long-lived process started once per session, and it does NOT reload when the installed build changes — so if this repository has been updated since your session began, the tools you can call here are the OLD ones, while the README and the CLI describe the new ones. Compare this number against "agent-locks --version" in a shell; if they differ, restart the session before relying on any guarantee documented elsewhere, and prefer the CLI in the meantime. Two review rounds found every high-impact defect traced to exactly this gap.
 
 Honesty note on agent identity: this server cannot detect your agent id or your parent agent's id automatically — no MCP transport mechanism exposes that. Pass agent_id/parent_agent_id to lock_create only if you already know them from your own context (e.g. an orchestration harness gave you an explicit id); otherwise omit them and they will be recorded as null. Do not guess or fabricate an id.`;
 
@@ -271,7 +280,7 @@ export function createServer(): McpServer {
           .array(z.string())
           .optional()
           .describe(
-            'Glob patterns to ADD to this lock\'s scope. Patterns the lock already holds are ignored, so this is safely idempotent. ' +
+            'Glob patterns to ADD to this lock\'s scope. Adding a pattern the lock already holds changes nothing and is REFUSED as a no-op, so this cannot be used as a disguised heartbeat — pass only patterns you actually need. ' +
               'This is how you handle scope drift: extend the claim you already made instead of making a second one.',
           ),
         remove_scope: z

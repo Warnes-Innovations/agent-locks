@@ -212,7 +212,17 @@ back door into the archive.
 ## The event log
 
 `.git/agents-locks/events.jsonl` is an append-only, one-JSON-object-per-line record of
-reaps and reopens. Read it with `agent-locks events`.
+**touches, reaps and reopens**. Read it with `agent-locks events`.
+
+A **touch** is the interval since a live lock's previous touch, recorded on every
+update, heartbeat and finish. It is the observation the threshold is actually about,
+and the log is useless without it: a reap event carries `idle_seconds >= threshold` by
+construction, so a log of reaps alone contains no observation of an interval BELOW the
+threshold and can only ever argue the threshold up.
+
+Every line carries a schema version `v`. Lines written by older builds are migrated on
+read — a pre-`verdict` reopen becomes `unknown` rather than being scored benign, since
+which of several situations it represented is not recoverable.
 
 Three separate needs converge on it — staleness tuning, retention/compaction, and (later)
 recording pre-commit refusals and overrides. They share one log deliberately: three stores
@@ -231,8 +241,8 @@ Three invariants hold, and all three are load-bearing:
 
 ### Tuning the staleness threshold from it
 
-Do not tune on lock *age*; tune on the **inter-touch interval** of locks that turned out to
-be alive — that is, the reaps later reopened. The threshold must exceed the **tail** of
+Do not tune on lock *age*; tune on the **inter-touch interval** of locks that turned out
+to be alive — the `touch` events. The threshold must exceed the **tail** of
 that distribution, not its median: a threshold at the median reaps half of all live locks.
 
 The two errors are not symmetric, and the asymmetry should drive the default:
@@ -245,6 +255,12 @@ The two errors are not symmetric, and the asymmetry should drive the default:
 **Err long.** The costly error is the silent one. Reopen softens the short-side cost but
 does not remove it — recovery still costs a round trip and may not be noticed at all.
 
+**Two limits travel with any number drawn from this log, and must not be dropped when
+it is reported.** The false-positive count is a **lower bound** on wrong reaps: a holder
+who never noticed their lock vanished, or who re-claimed instead of reopening, leaves no
+record at all. And the live intervals are **right-truncated** — a lock still open, or
+whose holder never came back, contributes nothing to the tail.
+
 As of this writing the 60-minute default is **unvalidated in both directions**: across
 every lock ever created on the machine this was built on, nothing had gone stale and
 nothing had been reaped. Do not cite "sessions run for hours" as evidence the default is
@@ -252,6 +268,17 @@ wrong — that conflates session duration with the gap between touches, which is
 threshold actually measures. Collect the events first.
 
 ## The 8 MCP tools
+
+> **A long-lived MCP server does not reload.** It is started once per session, so if
+> this repository has been updated since a session began, that session's tool calls
+> reach the OLD build while this README describes the new one. The failure is silent
+> and it is not hypothetical: two review rounds here found that every high-impact
+> defect traced to sessions calling a server days older than the code.
+>
+> **How to tell:** the MCP handshake reports the RUNNING version; `agent-locks
+> --version` prints the INSTALLED one. If they differ, restart the session before
+> relying on anything below, and prefer the CLI meanwhile — it reloads on every
+> invocation, so it is always the build described here.
 
 All eight are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
 
@@ -305,7 +332,9 @@ Returns `{id, filePath}`.
 
 `task_text` must match an existing task **exactly** (chosen deliberately over fuzzy/partial matching — it's the unambiguous, predictable default). A non-matching `task_text` returns a real MCP tool error (`isError: true`) listing the lock's actual task texts, never a silent no-op.
 
-`add_scope` / `remove_scope` are **transition 5** — how you handle scope drift. Extend the claim you already hold rather than creating a second lock for one job. Adding a pattern the lock already holds is ignored, so it is safely idempotent. Removing one the lock does **not** hold is an error, not a silent no-op: a caller who believes it released a path it still holds is exactly the state this tool exists to prevent. Removing the last pattern is refused — a lock claiming nothing still reads as an active claim while covering no path.
+`lock_reopen` returns `{id, filePath, previously_finished_by, verdict}`. `verdict` is one of `false-positive` (the HOLDER came back for a reaped lock — the only value that is evidence the staleness threshold was too short), `reaped-by-other`, `identity-unknown` (one side carried no identity, so it cannot be determined), `not-a-reap`, or `unknown` (the lock predates provenance). It is deliberately not a boolean: collapsing these re-created the bias the field exists to remove.
+
+`add_scope` / `remove_scope` are **transition 5** — how you handle scope drift. Extend the claim you already hold rather than creating a second lock for one job. Adding a pattern the lock already holds changes nothing and is **refused as a no-op** — otherwise it would be a heartbeat under another name, which is exactly what the no-op refusal exists to prevent. Removing one the lock does **not** hold is an error, not a silent no-op: a caller who believes it released a path it still holds is exactly the state this tool exists to prevent. Removing the last pattern is refused — a lock claiming nothing still reads as an active claim while covering no path.
 
 Every scope change is validated **before any of them is applied**, so a half-applied scope edit — a claim whose extent nobody can state — is not a reachable state.
 

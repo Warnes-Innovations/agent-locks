@@ -18,6 +18,7 @@ import {
   createLock,
   finishLock,
   reopenLock,
+  reapStaleLocks,
   queryLocks,
   DuplicateLockIdError,
 } from '../lock/store.js';
@@ -90,5 +91,26 @@ describe('guard 2 — a move never clobbers, even if a duplicate arises another 
     await expect(finishLock(locksRoot, { lock_id: a.id })).rejects.toThrow(DuplicateLockIdError);
     const archived = await fs.readFile(path.join(locksRoot, 'done', `${a.id}.md`), 'utf8');
     expect(archived).toContain('old/**');
+  });
+});
+
+describe('guard 2, continued — reap performs the same move and needs the same guard', () => {
+  it('reap REFUSES when a done file with that id already exists', async () => {
+    // reap does the identical active -> done move as finishLock. Fixing the guard in
+    // one of the two functions that make the move is fixing the instance and leaving
+    // the class: reap was demonstrated overwriting a holder's archived record —
+    // summary gone, finished_by rewritten from holder to reap.
+    const a = await createLock(locksRoot, { ...shared, scope: ['old/**'], agent_id: 'agent-A [aaa]' });
+    const activeFile = path.join(locksRoot, `${a.id}.md`);
+
+    // Forge a colliding archive entry, then make the active lock stale.
+    await fs.mkdir(path.join(locksRoot, 'done'), { recursive: true });
+    await fs.copyFile(activeFile, path.join(locksRoot, 'done', `${a.id}.md`));
+    const raw = await fs.readFile(activeFile, 'utf8');
+    await fs.writeFile(activeFile, raw.replace(/^updated: .*$/m, 'updated: 2020-01-01T00-00-00'), 'utf8');
+
+    await expect(reapStaleLocks(locksRoot, {})).rejects.toThrow(DuplicateLockIdError);
+    const archived = await fs.readFile(path.join(locksRoot, 'done', `${a.id}.md`), 'utf8');
+    expect(archived, 'reap overwrote an existing archived record').toContain('status: active');
   });
 });

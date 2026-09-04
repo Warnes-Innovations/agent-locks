@@ -7,6 +7,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+// src/version.ts
+var VERSION = "0.2.0";
+
 // src/git.ts
 import { execFile } from "child_process";
 import { promises as fs } from "fs";
@@ -182,14 +185,21 @@ function scopesOverlap(a, b) {
 import { promises as fs2 } from "fs";
 import path2 from "path";
 var EVENTS_FILENAME = "events.jsonl";
+var EVENT_SCHEMA_VERSION = 2;
 var lastEventLogErrors = [];
+function recordEventLogFailure(err) {
+  lastEventLogErrors = [
+    ...lastEventLogErrors,
+    { phase: "append", reason: err instanceof Error ? err.message : String(err) }
+  ];
+}
 function eventsPath(locksRoot) {
   return path2.join(locksRoot, EVENTS_FILENAME);
 }
 async function appendEvent(locksRoot, event) {
   try {
     await fs2.mkdir(locksRoot, { recursive: true });
-    await fs2.appendFile(eventsPath(locksRoot), JSON.stringify(event) + "\n", "utf8");
+    await fs2.appendFile(eventsPath(locksRoot), JSON.stringify({ v: EVENT_SCHEMA_VERSION, ...event }) + "\n", "utf8");
   } catch (err) {
     lastEventLogErrors = [
       ...lastEventLogErrors,
@@ -225,7 +235,7 @@ async function readEvents(locksRoot, options = {}) {
       errors.push({ phase: "read", reason: `line ${i + 1}: not a recognised lock event` });
       continue;
     }
-    events.push(candidate);
+    events.push(migrate(candidate));
   }
   lastEventLogErrors = errors;
   let result = events;
@@ -233,6 +243,12 @@ async function readEvents(locksRoot, options = {}) {
   if (options.lock_id !== void 0) result = result.filter((e) => e.lock_id === options.lock_id);
   if (options.limit !== void 0 && result.length > options.limit) result = result.slice(-options.limit);
   return result;
+}
+function migrate(event) {
+  if (event.event !== "reopen") return event;
+  const legacy = event;
+  if (legacy.verdict !== void 0) return event;
+  return { ...legacy, verdict: legacy.false_positive === true ? "false-positive" : "unknown" };
 }
 async function lastReapEventFor(locksRoot, lockId) {
   const events = await readEvents(locksRoot, { type: "reap", lock_id: lockId });
@@ -386,6 +402,7 @@ async function writeRecord(record) {
   }
 }
 var lastReapFloor = null;
+var lastReapSkipped = 0;
 var lastUnreadableLocks = [];
 async function readAllRecords(locksRoot, status) {
   const dirs = [];
@@ -422,15 +439,29 @@ async function readAllRecords(locksRoot, status) {
   return records;
 }
 var MUTATION_LOCK_STALE_MS = 3e4;
+var MUTATION_LOCK_WAIT_MS = MUTATION_LOCK_STALE_MS * 3;
+var MutationLockTimeoutError = class extends Error {
+  constructor(lockId, lockPath) {
+    super(
+      `Timed out after ${MUTATION_LOCK_WAIT_MS / 1e3}s waiting to mutate "${lockId}": another process holds ${lockPath} and is still refreshing it. Refusing rather than writing concurrently, which would silently discard one of the two changes. If no such process exists, remove that file by hand.`
+    );
+    this.name = "MutationLockTimeoutError";
+  }
+};
 async function withRecordLock(filePath, fn) {
   const dir = path3.dirname(filePath);
   const lockPath = path3.join(dir, `.${path3.basename(filePath)}.mutation.lock`);
-  const deadline = Date.now() + MUTATION_LOCK_STALE_MS;
+  const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 12)}`;
+  const deadline = Date.now() + MUTATION_LOCK_WAIT_MS;
   for (; ; ) {
     try {
       await fs3.mkdir(dir, { recursive: true });
       const handle = await fs3.open(lockPath, "wx");
-      await handle.close();
+      try {
+        await handle.writeFile(token, "utf8");
+      } finally {
+        await handle.close();
+      }
       break;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
@@ -443,50 +474,77 @@ async function withRecordLock(filePath, fn) {
       } catch {
         continue;
       }
-      if (Date.now() > deadline) {
-        throw new Error(
-          `Timed out waiting to mutate "${path3.basename(filePath)}": another process has held ${lockPath} for over ${MUTATION_LOCK_STALE_MS / 1e3}s. Refusing rather than writing concurrently, which would silently discard one of the two changes.`
-        );
-      }
+      if (Date.now() > deadline) throw new MutationLockTimeoutError(path3.basename(filePath), lockPath);
       await new Promise((resolve) => setTimeout(resolve, 5 + Math.random() * 20));
     }
   }
+  const keepAlive = setInterval(() => {
+    const now = /* @__PURE__ */ new Date();
+    fs3.utimes(lockPath, now, now).catch(() => {
+    });
+  }, Math.floor(MUTATION_LOCK_STALE_MS / 3));
+  if (typeof keepAlive.unref === "function") keepAlive.unref();
   try {
     return await fn();
   } finally {
-    await fs3.rm(lockPath, { force: true }).catch(() => {
-    });
+    clearInterval(keepAlive);
+    try {
+      const held = await fs3.readFile(lockPath, "utf8");
+      if (held === token) await fs3.rm(lockPath, { force: true });
+    } catch {
+    }
   }
 }
-async function recordTouch(locksRoot, record, previousUpdated, via) {
-  const idleMs = Date.now() - parseTimestamp(previousUpdated).getTime();
-  await appendEvent(locksRoot, {
-    event: "touch",
-    ts: record.frontmatter.updated,
-    lock_id: record.frontmatter.id,
-    repository: record.frontmatter.repository ?? "",
-    agent_id: record.frontmatter.agent_id,
-    idle_seconds: Math.max(0, Math.round(idleMs / 1e3)),
-    via,
-    tasks_total: record.tasks.length,
-    tasks_done: record.tasks.filter((t) => t.done).length
-  });
+async function recordTouch(locksRoot, record, previousUpdated, via, actor) {
+  try {
+    const idleMs = Date.now() - parseTimestamp(previousUpdated).getTime();
+    const holder = record.frontmatter.agent_id;
+    await appendEvent(locksRoot, {
+      event: "touch",
+      ts: record.frontmatter.updated,
+      lock_id: record.frontmatter.id,
+      repository: record.frontmatter.repository ?? "",
+      agent_id: holder,
+      actor: actor ?? null,
+      // Only assert "foreign" when BOTH sides are known and differ. Unknown is not
+      // evidence of either, and recording it as `false` is how a foreign mutation
+      // became invisible in the first place.
+      foreign: actor != null && holder != null && !agentMatches(holder, actor),
+      idle_seconds: Math.max(0, Math.round(idleMs / 1e3)),
+      via,
+      tasks_total: record.tasks.length,
+      tasks_done: record.tasks.filter((t) => t.done).length
+    });
+  } catch (err) {
+    recordEventLogFailure(err);
+  }
+}
+async function tryReadRecord(filePath) {
+  try {
+    return await readRecord(filePath);
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    lastUnreadableLocks = [
+      ...lastUnreadableLocks,
+      { filePath, reason: err instanceof Error ? err.message : String(err) }
+    ];
+    return null;
+  }
 }
 async function findRecordById(locksRoot, lockId) {
   for (const dir of [activeDir(locksRoot), doneDir(locksRoot)]) {
     const files = await listMarkdownFiles(dir);
     for (const filePath of files) {
-      const record = await readRecord(filePath);
-      if (record.frontmatter.id === lockId) return record;
+      const record = await tryReadRecord(filePath);
+      if (record !== null && record.frontmatter.id === lockId) return record;
     }
   }
   return null;
 }
-async function uniqueFilePath(activeDirPath, doneDirPath, timestamp, slug) {
+async function writeNewLock(activeDirPath, doneDirPath, timestamp, slug, build) {
   let suffix = 0;
   for (; ; ) {
     const candidateId = suffix === 0 ? `${timestamp}-${slug}` : `${timestamp}-${slug}-${suffix + 1}`;
-    const filePath = path3.join(activeDirPath, `${candidateId}.md`);
     let archived = false;
     try {
       await fs3.access(path3.join(doneDirPath, `${candidateId}.md`));
@@ -498,10 +556,18 @@ async function uniqueFilePath(activeDirPath, doneDirPath, timestamp, slug) {
       suffix += 1;
       continue;
     }
+    const filePath = path3.join(activeDirPath, `${candidateId}.md`);
+    const record = build(candidateId);
+    record.filePath = filePath;
+    const contents = serializeLockFile(record);
     try {
       const handle = await fs3.open(filePath, "wx");
-      await handle.close();
-      return { filePath, id: candidateId };
+      try {
+        await handle.writeFile(contents, "utf8");
+      } finally {
+        await handle.close();
+      }
+      return { record, id: candidateId };
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
       suffix += 1;
@@ -520,36 +586,31 @@ async function createLock(locksRoot, params) {
   await ensureDirs(locksRoot);
   const now = formatTimestamp();
   const slug = slugify(params.title);
-  const { filePath, id } = await uniqueFilePath(activeDir(locksRoot), doneDir(locksRoot), now, slug);
-  const frontmatter = {
-    id,
-    agent_id: params.agent_id ?? null,
-    parent_agent_id: params.parent_agent_id ?? null,
-    status: "active",
-    created: now,
-    updated: now,
-    scope: params.scope,
-    repository: params.repository ?? "",
-    // Written explicitly as null rather than left absent, so an active lock and a
-    // pre-provenance legacy lock are distinguishable on disk. Both read back as
-    // null; only one of them was ever written by a version that knew the field.
-    finished_by: null
-  };
-  const record = {
-    filePath,
-    frontmatter,
-    title: params.title,
-    tasks: params.tasks.map((text) => ({ text, done: false })),
-    notes: []
-  };
-  try {
-    await writeRecord(record);
-  } catch (err) {
-    await fs3.rm(filePath, { force: true }).catch(() => {
-    });
-    throw err;
-  }
-  return { id, filePath };
+  const { id, record } = await writeNewLock(activeDir(locksRoot), doneDir(locksRoot), now, slug, (candidateId) => {
+    const frontmatter = {
+      id: candidateId,
+      agent_id: params.agent_id ?? null,
+      parent_agent_id: params.parent_agent_id ?? null,
+      status: "active",
+      created: now,
+      updated: now,
+      scope: params.scope,
+      repository: params.repository ?? "",
+      // Written explicitly as null rather than left absent, so an active lock and a
+      // pre-provenance legacy lock are distinguishable on disk. Both read back as
+      // null; only one of them was ever written by a version that knew the field.
+      finished_by: null
+    };
+    return {
+      filePath: "",
+      // set by writeNewLock once the id is settled
+      frontmatter,
+      title: params.title,
+      tasks: params.tasks.map((text) => ({ text, done: false })),
+      notes: []
+    };
+  });
+  return { id, filePath: record.filePath };
 }
 async function queryLocks(locksRoot, params) {
   const status = params.status ?? "active";
@@ -607,12 +668,9 @@ async function updateLock(locksRoot, params) {
   if (!found) throw new LockNotFoundError(params.lock_id);
   if (found.frontmatter.status === "done") throw new ArchivedLockImmutableError(params.lock_id);
   return withRecordLock(found.filePath, async () => {
-    let record;
-    try {
-      record = await readRecord(found.filePath);
-    } catch {
-      throw new LockNotFoundError(params.lock_id);
-    }
+    const reread = await tryReadRecord(found.filePath);
+    if (reread === null) throw new LockNotFoundError(params.lock_id);
+    const record = reread;
     if (record.frontmatter.status === "done") throw new ArchivedLockImmutableError(params.lock_id);
     const holder = record.frontmatter.agent_id;
     const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
@@ -666,7 +724,7 @@ async function updateLock(locksRoot, params) {
     const previousUpdated = record.frontmatter.updated;
     record.frontmatter.updated = formatTimestamp();
     await writeRecord(record);
-    await recordTouch(locksRoot, record, previousUpdated, "update");
+    await recordTouch(locksRoot, record, previousUpdated, "update", params.agent_id);
     return {
       id: record.frontmatter.id,
       percentComplete: computePercentComplete(record.tasks),
@@ -679,8 +737,8 @@ async function finishLock(locksRoot, params) {
   const activeFiles = await listMarkdownFiles(activeDir(locksRoot));
   let found = null;
   for (const filePath of activeFiles) {
-    const candidate = await readRecord(filePath);
-    if (candidate.frontmatter.id === params.lock_id) {
+    const candidate = await tryReadRecord(filePath);
+    if (candidate !== null && candidate.frontmatter.id === params.lock_id) {
       found = candidate;
       break;
     }
@@ -688,8 +746,8 @@ async function finishLock(locksRoot, params) {
   if (!found) {
     const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
     for (const filePath of doneFiles) {
-      const candidate = await readRecord(filePath);
-      if (candidate.frontmatter.id === params.lock_id) {
+      const candidate = await tryReadRecord(filePath);
+      if (candidate !== null && candidate.frontmatter.id === params.lock_id) {
         throw new LockNotActiveError(params.lock_id);
       }
     }
@@ -698,7 +756,9 @@ async function finishLock(locksRoot, params) {
   let record = found;
   const activeFilePath = record.filePath;
   return withRecordLock(activeFilePath, async () => {
-    record = await readRecord(activeFilePath);
+    const rereadActive = await tryReadRecord(activeFilePath);
+    if (rereadActive === null) throw new LockNotFoundError(params.lock_id);
+    record = rereadActive;
     if (params.summary) {
       record.notes.push(params.summary);
     }
@@ -722,21 +782,22 @@ async function finishLock(locksRoot, params) {
     record.filePath = newFilePath;
     await writeRecord(record);
     await fs3.unlink(oldFilePath);
-    await recordTouch(locksRoot, record, previousUpdated, "finish");
+    await recordTouch(locksRoot, record, previousUpdated, "finish", params.agent_id);
     return { id: record.frontmatter.id, filePath: newFilePath };
   });
 }
 async function heartbeatLock(locksRoot, params) {
   const activeFiles = await listMarkdownFiles(activeDir(locksRoot));
   for (const filePath of activeFiles) {
-    const found = await readRecord(filePath);
-    if (found.frontmatter.id === params.lock_id) {
+    const found = await tryReadRecord(filePath);
+    if (found !== null && found.frontmatter.id === params.lock_id) {
       return withRecordLock(filePath, async () => {
-        const record = await readRecord(filePath);
+        const record = await tryReadRecord(filePath);
+        if (record === null) throw new LockNotFoundError(params.lock_id);
         const previousUpdated = record.frontmatter.updated;
         record.frontmatter.updated = formatTimestamp();
         await writeRecord(record);
-        await recordTouch(locksRoot, record, previousUpdated, "heartbeat");
+        await recordTouch(locksRoot, record, previousUpdated, "heartbeat", params.agent_id);
         return { id: record.frontmatter.id, updated: record.frontmatter.updated };
       });
     }
@@ -763,6 +824,7 @@ async function reapStaleLocks(locksRoot, params = {}) {
   const floor = resolveStaleMinutes(void 0);
   const staleMinutes = Math.max(requested, floor);
   lastReapFloor = staleMinutes === requested ? null : { requested, applied: staleMinutes };
+  lastReapSkipped = 0;
   const now = /* @__PURE__ */ new Date();
   const activeRecords = await readAllRecords(locksRoot, "active");
   const candidates = activeRecords.filter((record) => {
@@ -777,25 +839,33 @@ async function reapStaleLocks(locksRoot, params = {}) {
     }
     const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
     for (const filePath of doneFiles) {
-      const candidate = await readRecord(filePath);
-      if (candidate.frontmatter.id === params.lock_id) throw new LockNotActiveError(params.lock_id);
+      const candidate = await tryReadRecord(filePath);
+      if (candidate !== null && candidate.frontmatter.id === params.lock_id) throw new LockNotActiveError(params.lock_id);
     }
     throw new LockNotFoundError(params.lock_id);
   }
   const reaped = [];
-  for (const record of candidates) {
-    const summary = toSummary(record, { staleMinutes, now });
-    reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
-    if (params.dry_run) continue;
-    record.notes.push(
-      `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
-    );
-    await withRecordLock(record.filePath, async () => {
+  for (const candidate of candidates) {
+    if (params.dry_run) {
+      const summary = toSummary(candidate, { staleMinutes, now });
+      reaped.push({ id: candidate.frontmatter.id, title: candidate.title, staleForSeconds: summary.staleForSeconds });
+      continue;
+    }
+    const outcome = await withRecordLock(candidate.filePath, async () => {
+      const record = await tryReadRecord(candidate.filePath);
+      if (record === null) return null;
+      if (record.frontmatter.status !== "active") return null;
+      const summary = toSummary(record, { staleMinutes, now: /* @__PURE__ */ new Date() });
+      if (!summary.stale) return null;
+      record.notes.push(
+        `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
+      );
       const lastTouch = record.frontmatter.updated;
       record.frontmatter.status = "done";
       record.frontmatter.finished_by = "reap";
       record.frontmatter.updated = formatTimestamp();
       const newFilePath = path3.join(doneDir(locksRoot), path3.basename(record.filePath));
+      await assertDestinationFree(newFilePath, record.frontmatter.id, "reap");
       const oldFilePath = record.filePath;
       record.filePath = newFilePath;
       await ensureDirs(locksRoot);
@@ -815,7 +885,10 @@ async function reapStaleLocks(locksRoot, params = {}) {
         tasks_done: record.tasks.filter((t) => t.done).length,
         threshold_minutes: staleMinutes
       });
+      return { id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds };
     });
+    if (outcome !== null) reaped.push(outcome);
+    else lastReapSkipped += 1;
   }
   return reaped;
 }
@@ -838,8 +911,8 @@ async function reopenLock(locksRoot, params) {
   const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
   let found = null;
   for (const filePath of doneFiles) {
-    const candidate = await readRecord(filePath);
-    if (candidate.frontmatter.id === params.lock_id) {
+    const candidate = await tryReadRecord(filePath);
+    if (candidate !== null && candidate.frontmatter.id === params.lock_id) {
       found = candidate;
       break;
     }
@@ -855,19 +928,32 @@ async function reopenLock(locksRoot, params) {
   let record = found;
   const doneFilePath = record.filePath;
   return withRecordLock(doneFilePath, async () => {
-    record = await readRecord(doneFilePath);
+    const rereadDone = await tryReadRecord(doneFilePath);
+    if (rereadDone === null) throw new LockNotFoundError(params.lock_id);
+    record = rereadDone;
     const finishedBy = record.frontmatter.finished_by ?? null;
     const wasReaped = finishedBy === "reap";
-    const reopenerIsHolder = params.agent_id != null && record.frontmatter.agent_id != null && agentMatches(record.frontmatter.agent_id, params.agent_id);
-    const verdict = finishedBy === null ? "unknown" : !wasReaped ? "not-a-reap" : reopenerIsHolder ? "false-positive" : "reaped-by-other";
+    const holderId = record.frontmatter.agent_id;
+    const identityKnown = params.agent_id != null && holderId != null;
+    const reopenerIsHolder = identityKnown && agentMatches(holderId, params.agent_id);
+    const verdict = finishedBy === null ? "unknown" : !wasReaped ? "not-a-reap" : !identityKnown ? "identity-unknown" : reopenerIsHolder ? "false-positive" : "reaped-by-other";
     const reason = params.reason?.trim() ?? "";
     if (!wasReaped && reason === "") throw new ReopenReasonRequiredError(params.lock_id, finishedBy);
     const priorReap = wasReaped ? await lastReapEventFor(locksRoot, params.lock_id) : null;
+    const who = params.agent_id ?? "an unidentified caller";
+    const reapDetail = priorReap ? ` that fired at ${priorReap.idle_seconds}s idle against a ${priorReap.threshold_minutes}-minute threshold` : "";
     record.notes.push(
-      wasReaped ? `Reopened by ${params.agent_id ?? "an unidentified caller"} after an auto-reap` + (priorReap ? ` that fired at ${priorReap.idle_seconds}s idle against a ${priorReap.threshold_minutes}-minute threshold` : "") + `. The reap was a FALSE POSITIVE: the holder was still working.` + (reason === "" ? "" : ` Reason: ${reason}`) : `Reopened by ${params.agent_id ?? "an unidentified caller"} from a ${finishedBy ?? "unrecorded"} finish. Reason: ${reason}`
+      {
+        "false-positive": `Reopened by ${who}, the holder, after an auto-reap${reapDetail}. The reap was a false positive: the holder was still working.`,
+        "reaped-by-other": `Reopened by ${who}, who is NOT the holder on record, after an auto-reap${reapDetail}. Not counted as evidence about the staleness threshold.`,
+        "identity-unknown": `Reopened by ${who} after an auto-reap${reapDetail}. Whether the holder returned is not determinable \u2014 one side carried no identity \u2014 so this is not counted as evidence about the staleness threshold.`,
+        "not-a-reap": `Reopened by ${who} from a ${finishedBy} finish.`,
+        unknown: `Reopened by ${who}. This lock predates finish-provenance, so how it ended is not recoverable.`
+      }[verdict] + (reason === "" ? "" : ` Reason: ${reason}`)
     );
     record.frontmatter.status = "active";
     record.frontmatter.finished_by = null;
+    const trueLastTouch = priorReap?.last_touch ?? record.frontmatter.updated;
     record.frontmatter.updated = formatTimestamp();
     const newFilePath = path3.join(activeDir(locksRoot), path3.basename(record.filePath));
     await assertDestinationFree(newFilePath, params.lock_id, "reopen");
@@ -875,6 +961,9 @@ async function reopenLock(locksRoot, params) {
     record.filePath = newFilePath;
     await writeRecord(record);
     await fs3.unlink(oldFilePath);
+    if (verdict === "false-positive") {
+      await recordTouch(locksRoot, record, trueLastTouch, "update", params.agent_id);
+    }
     await appendEvent(locksRoot, {
       event: "reopen",
       ts: record.frontmatter.updated,
@@ -897,7 +986,7 @@ async function reopenLock(locksRoot, params) {
 
 // src/server.ts
 var SERVER_NAME = "agent-locks";
-var SERVER_VERSION = "0.1.0";
+var SERVER_VERSION = VERSION;
 var INSTRUCTIONS = `agent-locks: filesystem-based work-claiming locks shared across every git worktree of the current repository. No database \u2014 everything lives as markdown files under the repo's shared .git directory, so it is automatically invisible to git and never gets committed.
 
 Recommended workflow, in order:
@@ -910,6 +999,8 @@ Recommended workflow, in order:
 Working in a different repository than the one you are rooted in: every tool accepts an optional base_dir \u2014 any path inside the target repository. Locks then resolve from THAT repository's shared .git rather than from the current working directory. Use it whenever you are about to write into another repo: a lock created where you happen to be standing, instead of where you are writing, is invisible to the one agent who needed to see it. A base_dir that is not inside a git repository is a hard error, never a silent fallback to the current directory.
 
 Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) \u2014 true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict \u2014 nothing is ever cleaned up as a side effect of reading. If your OWN lock vanishes mid-work, it was reaped: call lock_reopen to get it back, rather than re-claiming. If you see someone else's stale lock blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it. A supplied stale_minutes may only LENGTHEN the window \u2014 it is floored at the CONFIGURED default \u2014 so the parameter cannot be used to reap live locks. Note the floor is the configured default rather than a constant: AGENT_LOCKS_STALE_MINUTES sets it, and where that is set small, reap does finish live locks.
+
+Build identity, and why it matters here: this server reports version ${SERVER_VERSION}. It is a long-lived process started once per session, and it does NOT reload when the installed build changes \u2014 so if this repository has been updated since your session began, the tools you can call here are the OLD ones, while the README and the CLI describe the new ones. Compare this number against "agent-locks --version" in a shell; if they differ, restart the session before relying on any guarantee documented elsewhere, and prefer the CLI in the meantime. Two review rounds found every high-impact defect traced to exactly this gap.
 
 Honesty note on agent identity: this server cannot detect your agent id or your parent agent's id automatically \u2014 no MCP transport mechanism exposes that. Pass agent_id/parent_agent_id to lock_create only if you already know them from your own context (e.g. an orchestration harness gave you an explicit id); otherwise omit them and they will be recorded as null. Do not guess or fabricate an id.`;
 function textResult(text) {
@@ -1045,7 +1136,7 @@ function createServer() {
         done: z.boolean().optional().describe("true to mark the task done, false to mark it not done. Required when task_text is given."),
         note: z.string().optional().describe("Optional free-text note to append to the lock's Notes section."),
         add_scope: z.array(z.string()).optional().describe(
-          "Glob patterns to ADD to this lock's scope. Patterns the lock already holds are ignored, so this is safely idempotent. This is how you handle scope drift: extend the claim you already made instead of making a second one."
+          "Glob patterns to ADD to this lock's scope. Adding a pattern the lock already holds changes nothing and is REFUSED as a no-op, so this cannot be used as a disguised heartbeat \u2014 pass only patterns you actually need. This is how you handle scope drift: extend the claim you already made instead of making a second one."
         ),
         remove_scope: z.array(z.string()).optional().describe(
           "Glob patterns to REMOVE from this lock's scope. Each must currently be held \u2014 removing one the lock does not hold is an error, not a silent no-op, because a caller who believes it released a path it still holds is exactly the state this tool exists to prevent. Removing the LAST pattern is refused: a lock claiming nothing still reads as an active claim while covering no path."
@@ -1193,6 +1284,9 @@ Usage:
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks reopen <lock-id> [options]  Return an archived lock to active. See "agent-locks reopen --help".
   agent-locks events [options]          Read the append-only lock event log. See "agent-locks events --help".
+  agent-locks --version                 Print the INSTALLED build. Compare it against the version the MCP
+                                        server reports: a long-lived server does not reload, so the two
+                                        differing means your session holds a stale build.
   agent-locks --help                    Show this message.
 
 Every subcommand talks to the exact same lock store the MCP tools use \u2014 a human running "agent-locks status" and an agent calling lock_query see identical, live state.
@@ -1269,13 +1363,21 @@ Options:
   --json                 Print raw JSON instead of a short confirmation line.`;
 var EVENTS_USAGE = `agent-locks events [options]
 
-Reads the append-only event log \u2014 reaps and reopens, oldest first. This is the data behind
-any future change to the staleness threshold: tune on the distribution of inter-touch
-intervals for locks that turned out to be ALIVE, which means the reaps that were later
-reopened. The threshold must exceed the TAIL of that distribution, not its median.
+Reads the append-only event log \u2014 touches, reaps and reopens, oldest first. This is the data behind
+any future change to the staleness threshold. Tune on the distribution of inter-touch
+intervals for locks that turned out to be ALIVE \u2014 that is the "touch" events, not the
+reaps. The threshold must exceed the TAIL of that distribution, not its median.
+
+Two limits travel with the number and must not be dropped from a report of it: the
+false-positive count is a LOWER BOUND on wrong reaps (a holder who never noticed leaves
+no record), and the live intervals are right-truncated (a lock still open contributes
+nothing).
 
 Options:
-  --type <reap|reopen>   Only events of this type.
+  --type <reap|reopen|touch>
+                         Only events of this type. "touch" is the live inter-touch
+                          interval of a lock that was ALIVE \u2014 the distribution the
+                          threshold must sit above.
   --lock <lock-id>       Only events for this lock.
   --limit <n>            Return at most n events, the most recent ones.
   --base-dir <path>      Read the log of a different repository (any path inside it).
@@ -1346,6 +1448,31 @@ function printError(message) {
   console.error(message.startsWith(CLI_PREFIX) ? message : `${CLI_PREFIX}${message}`);
 }
 var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help", "--dry-run", "--force"]);
+var KNOWN_FLAGS = /* @__PURE__ */ new Set([
+  "--json",
+  "--done",
+  "--undone",
+  "--help",
+  "--dry-run",
+  "--force",
+  "--title",
+  "--scope",
+  "--task",
+  "--agent",
+  "--parent",
+  "--note",
+  "--add-scope",
+  "--remove-scope",
+  "--summary",
+  "--reason",
+  "--status",
+  "--text",
+  "--stale-minutes",
+  "--base-dir",
+  "--type",
+  "--lock",
+  "--limit"
+]);
 function parseArgs(argv) {
   const positionals = [];
   const flags = /* @__PURE__ */ new Map();
@@ -1355,6 +1482,11 @@ function parseArgs(argv) {
     if (!arg.startsWith("--")) {
       positionals.push(arg);
       continue;
+    }
+    if (arg.startsWith("--") && !KNOWN_FLAGS.has(arg)) {
+      throw new CliUsageError(
+        `Unknown flag ${arg}. Refusing rather than ignoring it: a swallowed flag runs the command without whatever you meant it to do \u2014 a mistyped --agent runs anonymously, which is the path that skips the ownership check. Run the subcommand with --help for its flags.`
+      );
     }
     if (BOOLEAN_FLAGS.has(arg)) {
       boolFlags.add(arg);
@@ -1634,12 +1766,32 @@ async function cmdEvents(flags) {
   const all = type === void 0 && limit === void 0 && lockFilter === void 0 ? events : await readEvents(locksRoot, {});
   warnEventLog();
   if (flags.boolFlags.has("--json")) {
-    console.log(JSON.stringify(events, null, 2));
+    const liveJson = all.filter((e) => e.event === "touch").map((e) => e.idle_seconds);
+    console.log(
+      JSON.stringify(
+        {
+          events,
+          summary: {
+            matched: events.length,
+            whole_log: all.length,
+            reaps: all.filter((e) => e.event === "reap").length,
+            false_positives: all.filter((e) => e.event === "reopen" && e.verdict === "false-positive").length,
+            live_intervals_n: liveJson.length,
+            caveats: [
+              "false_positives is a LOWER BOUND on wrong reaps: a holder who never noticed, or who re-claimed instead of reopening, leaves no record.",
+              "live_intervals are right-truncated \u2014 a lock still open, or whose holder never returned, contributes nothing.",
+              "Tune above the TAIL of the live distribution, not its median."
+            ]
+          }
+        },
+        null,
+        2
+      )
+    );
     return;
   }
   if (events.length === 0) {
-    console.log("No matching lock events recorded.");
-    return;
+    console.log("No events matched. (The summary below covers the WHOLE log.)");
   }
   for (const event of events) {
     if (event.event === "reap") {
@@ -1752,6 +1904,10 @@ async function cmdReap(flags) {
 }
 async function runCli(argv) {
   const [command, ...rest] = argv;
+  if (command === "--version" || command === "-v") {
+    console.log(VERSION);
+    return 0;
+  }
   if (command === void 0 || command === "--help" || command === "-h") {
     console.log(USAGE);
     return 0;
@@ -1799,7 +1955,7 @@ async function runCli(argv) {
       printError(error.message);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError || error instanceof LockNotDoneError || error instanceof ArchivedLockImmutableError || error instanceof NoOpUpdateError || error instanceof ScopeNotHeldError || error instanceof EmptyScopeError || error instanceof ReopenReasonRequiredError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError || error instanceof LockNotDoneError || error instanceof ArchivedLockImmutableError || error instanceof DuplicateLockIdError || error instanceof MutationLockTimeoutError || error instanceof NoOpUpdateError || error instanceof ScopeNotHeldError || error instanceof EmptyScopeError || error instanceof ReopenReasonRequiredError) {
       printError(error.message);
       return 1;
     }

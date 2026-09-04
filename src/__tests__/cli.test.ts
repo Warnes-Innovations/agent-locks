@@ -571,7 +571,10 @@ describe('runCli reopen / events (transition 9 and its instrument)', () => {
 
     logs.length = 0;
     await runCliIn(repo, ['events']);
-    expect(logs.join('\n')).toContain('No matching lock events recorded');
+    expect(logs.join('\n')).toContain('No events matched');
+    // Even with nothing matched, the whole-log summary must still print — otherwise a
+    // filtered view is byte-identical to an empty log.
+    expect(logs.join('\n')).toContain('cannot be argued DOWN');
 
     await sleepPastStaleThreshold();
     await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
@@ -587,9 +590,10 @@ describe('runCli reopen / events (transition 9 and its instrument)', () => {
     // The tally must name itself a LOWER BOUND: a holder who never noticed, or who
     // re-claimed instead of reopening, leaves no record at all.
     expect(out).toContain('LOWER BOUND');
-    // With no touch events yet, the log must SAY it cannot argue the threshold down,
-    // rather than printing a distribution it does not have.
-    expect(out).toContain('cannot be argued DOWN');
+    // Reopening a reap the holder came back for now contributes the TRUE interval to
+    // the live distribution: the case most worth measuring used to be erased by the
+    // act of recovering from it.
+    expect(out).toMatch(/Live inter-touch intervals \(n=\d+\)/);
 
     // Once a live lock is touched, the distribution appears and carries the
     // tune-on-the-tail instruction with it.
@@ -667,5 +671,30 @@ describe('event-log warnings on the WRITE path', () => {
     const code = await runCliIn(repo, argv);
     expect(code).toBe(0); // the operation itself must still succeed
     expect(errors.join('\n'), `${verb} swallowed an event-log failure`).toContain('problem(s) with the event log');
+  });
+});
+
+describe('the events filter never fabricates a zero', () => {
+  it('a zero-match filter still prints the WHOLE-log summary', async () => {
+    // `events --type touch` on a log containing only reaps used to print output
+    // byte-identical to an empty log — and since touch events did not exist before
+    // this build, that was the state of every log in existence.
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Z', '--scope', 'src/a/**', '--agent', 'Red [bd9522]']);
+    await sleepPastStaleThreshold();
+    await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
+
+    logs.length = 0;
+    await runCliIn(repo, ['events', '--type', 'reopen']);
+    const out = logs.join('\n');
+    expect(out).toContain('No events matched');
+    expect(out, 'a filtered view must not look like an empty log').toContain('1 reap(s)');
+  });
+
+  it('rejects an unknown flag rather than running without it', async () => {
+    const { errors } = captureConsole();
+    const code = await runCliIn(repo, ['claim', '--title', 'T', '--scope', 'a/**', '--agentid', 'Red [bd9522]']);
+    expect(code).toBe(1);
+    expect(errors.join('\n')).toContain('Unknown flag --agentid');
   });
 });

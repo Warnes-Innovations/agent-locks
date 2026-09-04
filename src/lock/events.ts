@@ -42,6 +42,8 @@ import path from 'node:path';
 export const EVENTS_FILENAME = 'events.jsonl';
 
 interface EventBase {
+  /** Schema version of the writer. Absent on lines written before versioning (treat as 1). */
+  v?: number;
   /** UTC, same dashed format as lock timestamps. */
   ts: string;
   lock_id: string;
@@ -95,15 +97,21 @@ export interface ReopenEvent extends EventBase {
    *
    * - `false-positive`   the holder came back for a lock REAP took. This, and only
    *                      this, is evidence the threshold was too short.
-   * - `reaped-by-other`  a reaped lock reopened by somebody who is not the holder.
-   *                      Says nothing about whether the reap was wrong.
+   * - `reaped-by-other`  a reaped lock reopened by somebody KNOWN to be a different
+   *                      party. Says nothing about whether the reap was wrong.
+   * - `identity-unknown` a reaped lock where one side carried no identity, so whether
+   *                      the holder returned is not determinable. Distinct from
+   *                      `reaped-by-other` because collapsing them re-created the very
+   *                      bias the four states were introduced to remove — most locks
+   *                      carry `agent_id: null`, and the MCP surface tells agents to
+   *                      omit the field, so the unknown case is the COMMON one.
    * - `not-a-reap`       revived from a deliberate finish. Not about the threshold.
    * - `unknown`          the lock predates provenance, so how it ended is not
    *                      recoverable. Must NOT be silently scored as either, which
    *                      is what a boolean forced — and it defaulted to the benign
    *                      reading, biasing the measurement toward "60 minutes is fine".
    */
-  verdict: 'false-positive' | 'reaped-by-other' | 'not-a-reap' | 'unknown';
+  verdict: ReopenVerdict;
   /** Joined from this log's own most recent reap event for this lock; null if none. */
   idle_at_reap_seconds: number | null;
 }
@@ -120,7 +128,17 @@ export interface ReopenEvent extends EventBase {
  */
 export interface TouchEvent extends EventBase {
   event: 'touch';
+  /** The lock's HOLDER, copied from the record. */
   agent_id: string | null;
+  /**
+   * WHO PERFORMED this touch, as supplied by the caller — which is not always the
+   * holder. Recording only the holder made an impersonated update and an anonymous
+   * heartbeat both appear in the log as the holder's own activity, so no surface
+   * anywhere showed a foreign mutation. Null when the caller supplied no identity.
+   */
+  actor: string | null;
+  /** True when the actor is known to differ from the holder (a forced foreign mutation). */
+  foreign: boolean;
   /** Seconds since this lock's PREVIOUS touch. The datum the threshold is about. */
   idle_seconds: number;
   /** Which operation bumped it: a task/scope/note update, a bare heartbeat, or the closing finish. */
@@ -129,7 +147,26 @@ export interface TouchEvent extends EventBase {
   tasks_done: number;
 }
 
+export type ReopenVerdict =
+  | 'false-positive'
+  | 'reaped-by-other'
+  | 'identity-unknown'
+  | 'not-a-reap'
+  | 'unknown';
+
 export type LockEvent = ReapEvent | ReopenEvent | TouchEvent;
+
+/**
+ * Schema version stamped on every event written by this build.
+ *
+ * The log is append-only and long-lived, so lines written by different builds coexist
+ * forever. Without a version, a reader cannot tell an OLD line from a CORRUPT one, and
+ * the failure is silent in both directions: a pre-`verdict` reopen line (which carried
+ * `false_positive: boolean`) counted as zero in the false-positive tally — the single
+ * number the tuning procedure rests on — while an old build reads a new
+ * `verdict: "false-positive"` line as not a false positive at all.
+ */
+export const EVENT_SCHEMA_VERSION = 2;
 
 /** A log line that could not be parsed. Reported, never silently dropped. */
 export interface EventLogError {
@@ -154,6 +191,18 @@ export interface EventLogError {
  */
 export let lastEventLogErrors: EventLogError[] = [];
 
+/**
+ * Records a failure that happened around the log but outside appendEvent — e.g. while
+ * BUILDING an event. Exported so callers can keep the "never fail the operation you
+ * are describing" invariant without duplicating the reporting channel.
+ */
+export function recordEventLogFailure(err: unknown): void {
+  lastEventLogErrors = [
+    ...lastEventLogErrors,
+    { phase: 'append', reason: err instanceof Error ? err.message : String(err) },
+  ];
+}
+
 export function eventsPath(locksRoot: string): string {
   return path.join(locksRoot, EVENTS_FILENAME);
 }
@@ -174,7 +223,7 @@ export function eventsPath(locksRoot: string): string {
 export async function appendEvent(locksRoot: string, event: LockEvent): Promise<void> {
   try {
     await fs.mkdir(locksRoot, { recursive: true });
-    await fs.appendFile(eventsPath(locksRoot), JSON.stringify(event) + '\n', 'utf8');
+    await fs.appendFile(eventsPath(locksRoot), JSON.stringify({ v: EVENT_SCHEMA_VERSION, ...event }) + '\n', 'utf8');
   } catch (err) {
     lastEventLogErrors = [
       ...lastEventLogErrors,
@@ -235,7 +284,7 @@ export async function readEvents(locksRoot: string, options: ReadEventsOptions =
       errors.push({ phase: 'read', reason: `line ${i + 1}: not a recognised lock event` });
       continue;
     }
-    events.push(candidate as LockEvent);
+    events.push(migrate(candidate as LockEvent));
   }
 
   lastEventLogErrors = errors;
@@ -245,6 +294,22 @@ export async function readEvents(locksRoot: string, options: ReadEventsOptions =
   if (options.lock_id !== undefined) result = result.filter((e) => e.lock_id === options.lock_id);
   if (options.limit !== undefined && result.length > options.limit) result = result.slice(-options.limit);
   return result;
+}
+
+/**
+ * Brings a line written by an older build up to the current shape.
+ *
+ * Version 1 reopen events carried `false_positive: boolean` and no `verdict`. A `true`
+ * maps to `false-positive`; a `false` maps to `unknown` rather than `not-a-reap`,
+ * because v1 collapsed several situations into that `false` and we cannot recover
+ * which one — asserting the benign reading is exactly the bias `verdict` exists to
+ * remove. Touch events did not exist in v1, so nothing else needs migrating.
+ */
+function migrate(event: LockEvent): LockEvent {
+  if (event.event !== 'reopen') return event;
+  const legacy = event as ReopenEvent & { false_positive?: boolean };
+  if (legacy.verdict !== undefined) return event;
+  return { ...legacy, verdict: legacy.false_positive === true ? 'false-positive' : 'unknown' };
 }
 
 /**
