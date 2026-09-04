@@ -483,3 +483,119 @@ describe('finish enforces ownership FROM THE CLI, not just in the store (pointer
     expect(await runCliIn(repo, ['finish', id])).toBe(0);
   });
 });
+
+describe('runCli update --add-scope / --remove-scope (transition 5)', () => {
+  it('reports the resulting scope, so a claim boundary never changes invisibly', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Drifting job', '--scope', 'src/a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    logs.length = 0;
+    const code = await runCliIn(repo, ['update', lockId, '--add-scope', 'src/b/**']);
+    expect(code).toBe(0);
+    // The OUTPUT is the contract here, not the store call: a scope edit the caller
+    // cannot confirm without a second command is one they will not confirm.
+    expect(logs.join('\n')).toContain('scope +src/b/**');
+    expect(logs.join('\n')).toContain('scope now: src/a/**, src/b/**');
+
+    // ...and the extended claim is visible to a consumer.
+    logs.length = 0;
+    await runCliIn(repo, ['check', 'src/b/main.ts', '--json']);
+    expect(JSON.parse(logs[0])).toHaveLength(1);
+  });
+
+  it('refuses an update that changes nothing, naming heartbeat as the thing meant instead', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Idle job', '--scope', 'src/a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    const code = await runCliIn(repo, ['update', lockId]);
+    expect(code).toBe(1);
+    expect(errors.join('\n')).toMatch(/--task, --note, --add-scope or --remove-scope/);
+  });
+
+  it('errors rather than silently no-op-ing when asked to drop a scope the lock never held', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Job', '--scope', 'src/a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    const code = await runCliIn(repo, ['update', lockId, '--remove-scope', 'src/zzz/**']);
+    expect(code).toBe(1);
+    expect(errors.join('\n')).toContain('does not hold scope pattern');
+  });
+});
+
+describe('runCli reopen / events (transition 9 and its instrument)', () => {
+  it('reopen returns a reaped lock to active and SAYS the reap was a false positive', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Long quiet job', '--scope', 'src/a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    await sleepPastStaleThreshold();
+    await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
+
+    logs.length = 0;
+    const code = await runCliIn(repo, ['reopen', lockId, '--agent', 'Red [bd9522]']);
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toContain('reopened and returned to active');
+    // The signal has to be SAID, not merely logged: a false positive recorded only
+    // in a file nobody opens is a false positive nobody acts on.
+    expect(out).toContain('false positive');
+    expect(out).toContain('threshold is too short');
+
+    logs.length = 0;
+    await runCliIn(repo, ['list', '--json']);
+    expect(JSON.parse(logs[0])[0].id).toBe(lockId);
+  });
+
+  it('reopen of a deliberately finished lock demands a reason', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Done job', '--scope', 'src/a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+    await runCliIn(repo, ['finish', lockId]);
+
+    const code = await runCliIn(repo, ['reopen', lockId]);
+    expect(code).toBe(1);
+    expect(errors.join('\n')).toContain('requires a reason');
+
+    expect(await runCliIn(repo, ['reopen', lockId, '--reason', 'not actually done'])).toBe(0);
+  });
+
+  it('events prints the reap/reopen history and the tuning instruction', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Quiet job', '--scope', 'src/a/**']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    logs.length = 0;
+    await runCliIn(repo, ['events']);
+    expect(logs.join('\n')).toContain('No lock events recorded');
+
+    await sleepPastStaleThreshold();
+    await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
+    await runCliIn(repo, ['reopen', lockId]);
+
+    logs.length = 0;
+    await runCliIn(repo, ['events']);
+    const out = logs.join('\n');
+    expect(out).toContain('REAP');
+    expect(out).toContain('REOPEN');
+    expect(out).toContain('FALSE POSITIVE');
+    // Tune on the TAIL, not the median — the instruction travels with the data.
+    expect(out).toMatch(/1 reap\(s\), 1 later reopened as false positive/);
+    expect(out).toContain('TAIL');
+  });
+
+  it('warns when the event log is corrupt, so empty and broken are distinguishable', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'Job', '--scope', 'src/a/**']);
+    const locksDir = path.join(repo, '.git', 'agents-locks');
+    await fs.appendFile(path.join(locksDir, 'events.jsonl'), 'garbage\n', 'utf8');
+
+    logs.length = 0;
+    const code = await runCliIn(repo, ['events']);
+    expect(code).toBe(0);
+    expect(errors.join('\n')).toContain('problem(s) with the event log');
+    expect(errors.join('\n')).toContain('does NOT mean nothing happened');
+  });
+});

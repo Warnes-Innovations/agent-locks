@@ -13,6 +13,7 @@ import {
   queryLocks,
   checkConflicts,
   updateLock,
+  reopenLock,
   finishLock,
   heartbeatLock,
   reapStaleLocks,
@@ -32,11 +33,12 @@ Recommended workflow, in order:
 1. Before starting work on a set of files, call lock_query (default view, active locks only) to see what other agents are already doing, and call lock_check_conflict with the globs you're about to touch to see if anyone's active lock overlaps them. lock_check_conflict is purely informational — it never blocks you, it just gives you information to make your own judgment call with.
 2. If you decide to proceed, call lock_create to claim the work: give it a title, the glob patterns describing what you're touching, and a checklist of the tasks you plan to do.
 3. As you actually complete each task, call lock_update immediately — not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime. If you're doing a long stretch of work without a task boundary to check off, call lock_heartbeat periodically so your lock doesn't read as abandoned to anyone else watching.
-4. When the work is COMMITTED — not merely when the edits are done — call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
+4. If the job turns out to touch a file you did not claim, call lock_update with add_scope to EXTEND the claim you already have. Do not create a second lock for one job: that splits the checklist across two records and leaves a window where the new paths are claimed by nobody. Scope drift is the normal case, not an exception.
+5. When the work is COMMITTED — not merely when the edits are done — call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
 
 Working in a different repository than the one you are rooted in: every tool accepts an optional base_dir — any path inside the target repository. Locks then resolve from THAT repository's shared .git rather than from the current working directory. Use it whenever you are about to write into another repo: a lock created where you happen to be standing, instead of where you are writing, is invisible to the one agent who needed to see it. A base_dir that is not inside a git repository is a hard error, never a silent fallback to the current directory.
 
-Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) — true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict — nothing is ever cleaned up as a side effect of reading. If you see a stale lock that's blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it, so it can't be used as a workaround to force-finish someone else's live work. A supplied stale_minutes may only LENGTHEN the window (it is floored at the default), so a small value cannot be used to reap live locks.
+Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) — true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict — nothing is ever cleaned up as a side effect of reading. If your OWN lock vanishes mid-work, it was reaped: call lock_reopen to get it back, rather than re-claiming. If you see someone else's stale lock blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it, so it can't be used as a workaround to force-finish someone else's live work. A supplied stale_minutes may only LENGTHEN the window (it is floored at the default), so a small value cannot be used to reap live locks.
 
 Honesty note on agent identity: this server cannot detect your agent id or your parent agent's id automatically — no MCP transport mechanism exposes that. Pass agent_id/parent_agent_id to lock_create only if you already know them from your own context (e.g. an orchestration harness gave you an explicit id); otherwise omit them and they will be recorded as null. Do not guess or fabricate an id.`;
 
@@ -241,15 +243,33 @@ export function createServer(): McpServer {
     {
       title: 'Update a lock',
       description:
-        'Flips one task on an existing lock to done or not-done, and optionally appends a note. ' +
+        'Changes an existing lock: flips a task to done/not-done, appends a note, and/or CHANGES ITS SCOPE. ' +
         'Call this AS SOON as a task actually completes — not batched at the end of your work — so other agents watching lock_query see live progress. ' +
         'task_text must match an EXISTING task\'s text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock\'s actual task texts rather than silently doing nothing. ' +
+        'SCOPE DRIFT IS THE NORMAL CASE: you claim what you expect to touch, then find the job reaches one more file. Use add_scope to EXTEND THE EXISTING CLAIM rather than creating a second lock — ' +
+        'a second lock for one job splits the task checklist and leaves a window where the new paths are claimed by nobody. ' +
+        'At least one of task_text, note, add_scope or remove_scope is required; an update that would change nothing is refused rather than silently bumping the timestamp (use lock_heartbeat for that). ' +
         'Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).',
       inputSchema: {
         lock_id: z.string().describe('The id of the lock to update (as returned by lock_create or lock_query).'),
-        task_text: z.string().describe('The exact text of an existing task on this lock.'),
-        done: z.boolean().describe('true to mark the task done, false to mark it not done.'),
+        task_text: z.string().optional().describe('The exact text of an existing task on this lock. Omit for a scope-only or note-only update.'),
+        done: z.boolean().optional().describe('true to mark the task done, false to mark it not done. Required when task_text is given.'),
         note: z.string().optional().describe('Optional free-text note to append to the lock\'s Notes section.'),
+        add_scope: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'Glob patterns to ADD to this lock\'s scope. Patterns the lock already holds are ignored, so this is safely idempotent. ' +
+              'This is how you handle scope drift: extend the claim you already made instead of making a second one.',
+          ),
+        remove_scope: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'Glob patterns to REMOVE from this lock\'s scope. Each must currently be held — removing one the lock does not hold is an error, ' +
+              'not a silent no-op, because a caller who believes it released a path it still holds is exactly the state this tool exists to prevent. ' +
+              'Removing the LAST pattern is refused: a lock claiming nothing still reads as an active claim while covering no path.',
+          ),
         base_dir: z
           .string()
           .optional()
@@ -260,11 +280,54 @@ export function createServer(): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ lock_id, task_text, done, note, base_dir }) => {
+    async ({ lock_id, task_text, done, note, add_scope, remove_scope, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
-        const result = await updateLock(locksRoot, { lock_id, task_text, done, note });
+        const result = await updateLock(locksRoot, { lock_id, task_text, done, note, add_scope, remove_scope });
+        return textResult(JSON.stringify(result, null, 2));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'lock_reopen',
+    {
+      title: 'Reopen an archived lock',
+      description:
+        'Returns a lock from the done archive to ACTIVE. This is the recovery path for a lock that lock_reap took from a session that was in fact still working — ' +
+        'which happens whenever your work goes longer than the staleness threshold without a task boundary to check off. ' +
+        'Use this rather than re-claiming: a fresh claim creates a second record for one job, loses the task checklist, and leaves a window where the paths are claimed by nobody. ' +
+        'A lock finished by REAP reopens with no reason required. A lock its owner deliberately finished requires a reason, which is recorded — this is a recovery path, not a general back door into the archive. ' +
+        'Reopening a reaped lock also records a labelled FALSE POSITIVE in the event log: direct evidence, with the idle interval attached, that the staleness threshold is too short. ' +
+        'If your own lock disappears mid-work, this is the tool to reach for.',
+      inputSchema: {
+        lock_id: z.string().describe('The id of the done lock to return to active.'),
+        reason: z
+          .string()
+          .optional()
+          .describe('Why you are reopening. REQUIRED unless the lock was finished by reap; recorded either way.'),
+        agent_id: z
+          .string()
+          .optional()
+          .describe('Your own agent id, if you know it from your own context. Recorded, never enforced, never fabricated.'),
+        base_dir: z
+          .string()
+          .optional()
+          .describe(
+            'Target a different repository by its working-tree path (or any path inside it). ' +
+              'The lock is looked up in that repository\'s shared .git directory. Omit to use the current working directory.',
+          ),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ lock_id, reason, agent_id, base_dir }) => {
+      try {
+        const cwd = base_dir ?? process.cwd();
+        const locksRoot = await resolveLocksRoot(cwd);
+        const result = await reopenLock(locksRoot, { lock_id, reason, agent_id });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);

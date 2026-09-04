@@ -132,11 +132,107 @@ The `id` frontmatter field is, by design, **exactly the filename minus `.md`** �
 
 `{timestamp}-{kebab-case-title}.md` — purely chronological, no sequence numbers by design (these files are ephemeral coordination artifacts, not a numbered decision log).
 
-## The 7 MCP tools
+## The lock state machine
 
-All seven are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
+**This table is the point, not a summary of one.** Scope mutation was missing for the
+tool's entire life while three separate design decisions assumed it existed — and nobody
+noticed, because nothing anywhere enumerated the transitions. The gap was in the model,
+not in the API. Every transition is listed here, including the ones that are absent
+**on purpose**, so that a later reader can tell a deliberate omission from an oversight.
 
-All seven also accept an optional `base_dir` to operate on a different repository — omitted from the examples below for brevity; see [Claiming work in a *different* repository](#claiming-work-in-a-different-repository-base_dir).
+States: `(nonexistent)` → `active` → `done` → `(compacted)`
+
+| # | Transition | Verb | Status |
+|---|---|---|---|
+| 1 | none → active | `lock_create` / `claim` | supported |
+| 2 | active → active (task) | `lock_update` with `task_text` + `done` | supported |
+| 3 | active → active (note) | `lock_update` with `note` | supported |
+| 4 | active → active (time) | `lock_heartbeat`, and free on any update | supported |
+| 5 | active → active (**scope**) | `lock_update` with `add_scope` / `remove_scope` | supported |
+| 6 | active → done | `lock_finish` | supported |
+| 7 | active → done (stale) | `lock_reap` | supported |
+| 8 | done → compacted | — | **not built yet** — retention/compaction of the done archive |
+| 9 | done → active (**reopen**) | `lock_reopen` | supported |
+
+### Transitions that are deliberately ABSENT
+
+Not every gap is a missing feature. These two are refusals, and completing the API by
+adding them would undo a decision rather than finish an implementation:
+
+- **Setting `agent_id` on an existing lock.** An owner is recorded when the claim is
+  made or not at all. A tool-supported way to assign ownership afterwards would make a
+  misattribution *durable* — and misattribution is not hypothetical here; two sessions
+  made one by hand within a single day. Asserted by a test, not just by this paragraph.
+- **Force-finishing a non-stale lock via `lock_reap`.** `lock_reap` refuses a named lock
+  that is not stale, and its plural form is floored so a small `stale_minutes` cannot
+  reach live locks. `lock_finish` with `force` is the one deliberate, recorded path for
+  ending someone else's claim; a second route would re-open what that closed.
+
+### Why 5 and 9 exist
+
+**5 — scope drift is the normal case.** You claim what you expect to touch, then find the
+job reaches one more file. Without a mutator the only options were a second lock for one
+job (which splits the checklist and leaves the new paths unclaimed in the meantime) or
+hand-editing the markdown. Extend the claim you already have.
+
+**9 — reopen is the recovery path for a wrongful reap, and it doubles as the instrument.**
+Auto-reap can finish a live lock whose holder simply had no task boundary to check off
+inside the threshold. Reopening it restores the claim *with its checklist*, and records a
+**labelled false positive** in the event log with the idle interval that caused it
+attached. That is the only direct evidence available that the threshold is too short, and
+it arrives for free because the recovery path and the measurement are the same code.
+
+A lock finished by reap reopens with no reason required; one its owner deliberately
+finished requires a reason, which is recorded. Reopen is a recovery path, not a general
+back door into the archive.
+
+## The event log
+
+`.git/agents-locks/events.jsonl` is an append-only, one-JSON-object-per-line record of
+reaps and reopens. Read it with `agent-locks events`.
+
+Three separate needs converge on it — staleness tuning, retention/compaction, and (later)
+recording pre-commit refusals and overrides. They share one log deliberately: three stores
+holding overlapping facts about the same locks is three things to keep in sync, and the one
+that drifts is the one nobody reads.
+
+Three invariants hold, and all three are load-bearing:
+
+1. **Append-only, never pruned.** Retention may delete done *lock files*; it may never
+   delete lines here. That is the entire point of compaction.
+2. **A logging failure never fails the operation it describes.** Telemetry that can break
+   a reap turns an observability feature into an availability risk on the primary path.
+   Failures are swallowed — and *recorded*, then surfaced by the CLI, because a swallowed
+   error nobody surfaces makes "we have data" and "we have no data" indistinguishable.
+3. **A corrupt line is skipped and reported, never fatal.**
+
+### Tuning the staleness threshold from it
+
+Do not tune on lock *age*; tune on the **inter-touch interval** of locks that turned out to
+be alive — that is, the reaps later reopened. The threshold must exceed the **tail** of
+that distribution, not its median: a threshold at the median reaps half of all live locks.
+
+The two errors are not symmetric, and the asymmetry should drive the default:
+
+- **Too short** → live locks reaped → work taken from a session that was behaving
+  correctly, possibly without the holder noticing. Expensive and *quiet*.
+- **Too long** → dead locks linger → peers misdirected to a holder who is gone. Annoying,
+  but *visible* and recoverable: you message, get nothing, escalate.
+
+**Err long.** The costly error is the silent one. Reopen softens the short-side cost but
+does not remove it — recovery still costs a round trip and may not be noticed at all.
+
+As of this writing the 60-minute default is **unvalidated in both directions**: across
+every lock ever created on the machine this was built on, nothing had gone stale and
+nothing had been reaped. Do not cite "sessions run for hours" as evidence the default is
+wrong — that conflates session duration with the gap between touches, which is what the
+threshold actually measures. Collect the events first.
+
+## The 9 MCP tools
+
+All nine are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
+
+All nine also accept an optional `base_dir` to operate on a different repository — omitted from the examples below for brevity; see [Claiming work in a *different* repository](#claiming-work-in-a-different-repository-base_dir).
 
 ### `lock_query`
 
@@ -180,7 +276,17 @@ Returns `{id, filePath}`.
 { "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "task_text": "Reproduce the flake", "done": true, "note": "Repro'd via 50x loop with -t 30s" } }
 ```
 
+```json
+{ "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "add_scope": ["backend/src/auth/**"] } }
+```
+
 `task_text` must match an existing task **exactly** (chosen deliberately over fuzzy/partial matching — it's the unambiguous, predictable default). A non-matching `task_text` returns a real MCP tool error (`isError: true`) listing the lock's actual task texts, never a silent no-op.
+
+`add_scope` / `remove_scope` are **transition 5** — how you handle scope drift. Extend the claim you already hold rather than creating a second lock for one job. Adding a pattern the lock already holds is ignored, so it is safely idempotent. Removing one the lock does **not** hold is an error, not a silent no-op: a caller who believes it released a path it still holds is exactly the state this tool exists to prevent. Removing the last pattern is refused — a lock claiming nothing still reads as an active claim while covering no path.
+
+Every scope change is validated **before any of them is applied**, so a half-applied scope edit — a claim whose extent nobody can state — is not a reachable state.
+
+At least one of `task_text`, `note`, `add_scope` or `remove_scope` is required. An update that would change nothing is refused rather than silently bumping `updated`: that would be a heartbeat wearing an update's name, and would let a caller hold a claim open indefinitely while appearing to report progress on it. Use `lock_heartbeat` when that is what you mean.
 
 ### `lock_finish`
 
@@ -196,7 +302,7 @@ Moves the file from `agents-locks/` to `agents-locks/done/`, sets `status: done`
 { "name": "lock_heartbeat", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test" } }
 ```
 
-Bumps **only** a lock's `updated` timestamp — no task/note/scope change. Call this periodically during a long stretch of work that isn't naturally hitting `lock_update` often enough (completing a task already bumps `updated` for free) to keep the lock from reading as stale to anyone else watching. Restricted to active locks — errors clearly if `lock_id` doesn't exist, or exists but is already done.
+Bumps **only** a lock's `updated` timestamp — no task, note or scope change (for scope, see `lock_update`'s `add_scope`). Call this periodically during a long stretch of work that isn't naturally hitting `lock_update` often enough (completing a task already bumps `updated` for free) to keep the lock from reading as stale to anyone else watching. Restricted to active locks — errors clearly if `lock_id` doesn't exist, or exists but is already done.
 
 ### `lock_reap`
 
@@ -207,6 +313,19 @@ Bumps **only** a lock's `updated` timestamp — no task/note/scope change. Call 
 ```
 
 Finishes (same mechanism as `lock_finish`) every currently-stale active lock, or a single specific one if `lock_id` is given. **Explicit and deliberate — never a side effect of `lock_query`/`lock_check_conflict` reading state.** Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (and for how long), so the done archive stays honest about "the owning agent finished this" vs. "nobody was heard from and this got cleaned up." If `lock_id` is given but that lock is **not** actually stale, this errors (`LockNotStaleError`) rather than reaping it — `lock_reap` cannot be used as a back door to force-finish someone else's live work. **A caller-supplied `stale_minutes` may only LENGTHEN the window, never shorten it** (floored at the configured default). Without that floor the plural form *was* exactly the back door this sentence denies: `reap --stale-minutes 0.01` finished every active lock in a repo, and even the named form could be pushed past its own refusal. Fixed and regression-tested 2026-09-03. `dry_run: true` reports what would be reaped without writing anything.
+
+### `lock_reopen`
+
+```json
+{ "name": "lock_reopen", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test" } }
+{ "name": "lock_reopen", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "reason": "the work was not actually finished" } }
+```
+
+**Transition 9** — returns a lock from the done archive to active. This is what to reach for when **your own lock disappears mid-work**: it was reaped, and reopening restores the claim *with its task checklist*, where re-claiming would create a second record for one job and leave a window with the paths unclaimed.
+
+A lock finished by **reap** reopens with no reason. A lock its owner deliberately finished requires one, and it is recorded — this is a recovery path, not a general back door into the archive.
+
+Reopening a reaped lock also records a **labelled false positive** in the event log, with the idle interval that triggered the reap attached. See [The event log](#the-event-log).
 
 ## CLI usage
 
@@ -227,17 +346,24 @@ agent-locks check <scope-glob...>
 # Same as lock_create
 agent-locks claim --title <text> --scope <glob> [--scope <glob> ...] [--task <text> ...] [--agent <id>] [--parent <id>]
 
-# Same as lock_update
-agent-locks update <lock-id> --task <text> [--done | --undone] [--note <text>]
+# Same as lock_update. At least one of --task/--note/--add-scope/--remove-scope.
+agent-locks update <lock-id> [--task <text> [--done | --undone]] [--note <text>]
+                             [--add-scope <glob>]... [--remove-scope <glob>]...
 
-# Same as lock_finish
-agent-locks finish <lock-id> [--summary <text>]
+# Same as lock_finish. Pass --agent so ownership can be checked.
+agent-locks finish <lock-id> [--summary <text>] [--agent <id>] [--force]
 
 # Same as lock_heartbeat
 agent-locks heartbeat <lock-id>
 
 # Same as lock_reap
 agent-locks reap [lock-id] [--stale-minutes <n>] [--dry-run] [--json]
+
+# Same as lock_reopen — get your own lock back after it was reaped
+agent-locks reopen <lock-id> [--reason <text>] [--agent <id>]
+
+# Read the append-only event log (reaps and reopens). No MCP equivalent.
+agent-locks events [--type reap|reopen] [--lock <lock-id>] [--limit <n>] [--json]
 
 # Explicit alias for "no arguments" — starts the MCP server
 agent-locks serve
@@ -370,7 +496,8 @@ pnpm run dev         # run directly from source via tsx, no build step (for loca
 - `timestamp.test.ts` — timestamp formatting and slug generation.
 - `markdown.test.ts` — frontmatter + body round-tripping (`parseLockFile(serializeLockFile(x)) === x`), including the exact documented file shape.
 - `globOverlap.test.ts` — the overlap heuristic, including the extglob fallback case and the documented case-sensitivity gap.
-- `store.test.ts` — the full lock lifecycle (create → update → finish), the hard "done excluded from default query" requirement, exact task-text matching (with a clear error on mismatch, never a silent no-op), and conflict-checking.
+- `stateMachine.test.ts` — every transition in [the state machine table](#the-lock-state-machine): scope mutation (add/remove/idempotence/all-or-nothing validation/refusing an empty scope), reopen in both its forms, finish provenance, and the event log including a corrupt line and an unwritable log. Also asserts the two **deliberately absent** transitions stay absent — a policy erodes, a test does not.
+- `store.test.ts` — the core lock lifecycle (create → update → finish), the hard "done excluded from default query" requirement, exact task-text matching (with a clear error on mismatch, never a silent no-op), and conflict-checking.
 - `git.test.ts` — creates a **real** temporary git repository and a **real** linked worktree (via actual `git init`/`git worktree add` subprocess calls) and proves `resolveLocksRoot()` returns the identical path from both, that `--git-dir` would have differed, and that a path under `.git/agents-locks/` can never enter git's index.
 - `e2e.test.ts` — spawns the **actual compiled `dist/index.js`** as a real subprocess (via the MCP SDK's own `Client` + `StdioClientTransport`, exactly how Claude Code itself talks to an MCP server) and drives real JSON-RPC round trips: `initialize`, `tools/list`, and a full `lock_create` → `lock_query` → `lock_update` → `lock_finish` → `lock_query` cycle against the real filesystem, plus a real tool-error round trip for a bad `task_text`.
 

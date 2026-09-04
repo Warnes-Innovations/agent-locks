@@ -44,6 +44,25 @@ export interface LockFrontmatter {
    * field was added (backward compatibility).
    */
   repository: string;
+  /**
+   * HOW this lock reached `done` — 'holder' (its owner finished it), 'force'
+   * (someone else finished it deliberately), or 'reap' (nobody was heard from and
+   * it was cleaned up automatically). Null while active, and absent on locks
+   * written before this field existed.
+   *
+   * This is provenance, not decoration. Two things depend on telling a reap from a
+   * deliberate finish, and neither can recover it from anywhere else:
+   *   - `reopen` is allowed without a reason ONLY for a reap, because reviving a
+   *     lock its owner deliberately closed is a different act from recovering one
+   *     that was taken from a live session;
+   *   - a reopened reap is a LABELLED false positive for the staleness threshold,
+   *     which is the only direct evidence that the threshold is wrong.
+   *
+   * It was briefly tempting to infer this by matching the auto-reap note text.
+   * Don't: note text is prose, prose gets reworded, and the inference would then
+   * fail silently in the direction of "looks deliberate".
+   */
+  finished_by?: 'holder' | 'force' | 'reap' | null;
 }
 
 export interface LockTask {
@@ -87,6 +106,12 @@ export interface LockSummary {
   stale: boolean;
   /** Seconds since this lock's `updated` field, for display/sorting. Always >= 0. */
   staleForSeconds: number;
+  /**
+   * Provenance of the `done` transition — see LockFrontmatter.finished_by.
+   * Null while active, and null on locks written before the field existed, which
+   * is why callers must treat null as "not recorded" rather than "deliberate".
+   */
+  finished_by: 'holder' | 'force' | 'reap' | null;
 }
 
 export function computePercentComplete(tasks: LockTask[]): number {
@@ -121,5 +146,6 @@ export function toSummary(record: LockRecord, options: StalenessOptions = {}): L
     parent_agent_id: record.frontmatter.parent_agent_id,
     stale,
     staleForSeconds,
+    finished_by: record.frontmatter.finished_by ?? null,
   };
 }

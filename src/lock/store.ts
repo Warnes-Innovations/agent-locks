@@ -8,9 +8,10 @@
  */
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { formatTimestamp, slugify } from '../timestamp.js';
+import { formatTimestamp, parseTimestamp, slugify } from '../timestamp.js';
 import { parseLockFile, serializeLockFile } from './markdown.js';
 import { scopesOverlap } from './globOverlap.js';
+import { appendEvent, lastReapEventFor } from './events.js';
 import { computePercentComplete, toSummary, DEFAULT_STALE_MINUTES } from './types.js';
 import type { LockFrontmatter, LockRecord, LockSummary, LockTask } from './types.js';
 
@@ -336,6 +337,10 @@ export async function createLock(locksRoot: string, params: CreateLockParams): P
     updated: now,
     scope: params.scope,
     repository: params.repository ?? '',
+    // Written explicitly as null rather than left absent, so an active lock and a
+    // pre-provenance legacy lock are distinguishable on disk. Both read back as
+    // null; only one of them was ever written by a version that knew the field.
+    finished_by: null,
   };
   const record: LockRecord = {
     filePath,
@@ -402,29 +407,107 @@ export async function checkConflicts(locksRoot: string, scope: string[], staleMi
 
 export interface UpdateLockParams {
   lock_id: string;
-  task_text: string;
-  done: boolean;
+  /** Exact text of an existing task to flip. Optional — omit for a scope-only update. */
+  task_text?: string;
+  /** Required when task_text is given. */
+  done?: boolean;
   note?: string;
+  /** Glob patterns to ADD to this lock's scope. Duplicates are ignored. */
+  add_scope?: string[];
+  /** Glob patterns to REMOVE from this lock's scope. Each must currently be present. */
+  remove_scope?: string[];
 }
 
 export interface UpdateLockResult {
   id: string;
   percentComplete: number;
+  /** The lock's scope AFTER this update. Returned always, so a caller never has to re-query to confirm a scope change landed. */
+  scope: string[];
 }
 
+export class NoOpUpdateError extends Error {
+  constructor(lockId: string) {
+    super(
+      `Update to "${lockId}" would change nothing: no task_text, note, add_scope or remove_scope was given. ` +
+        `Refusing rather than silently bumping the lock's timestamp — that would be a heartbeat wearing an update's name, ` +
+        `and it would let a caller keep a claim alive while appearing to make progress on it. Use \`heartbeat\` if that is what you meant.`,
+    );
+    this.name = 'NoOpUpdateError';
+  }
+}
+
+export class ScopeNotHeldError extends Error {
+  constructor(lockId: string, pattern: string, held: string[]) {
+    super(
+      `Lock "${lockId}" does not hold scope pattern "${pattern}", so it cannot be removed. Currently held: ${held.join(', ') || '(none)'}. ` +
+        `This is an error rather than a silent no-op on purpose: a caller who believes it released a path it still holds is exactly ` +
+        `the state this tool exists to prevent.`,
+    );
+    this.name = 'ScopeNotHeldError';
+  }
+}
+
+export class EmptyScopeError extends Error {
+  constructor(lockId: string) {
+    super(
+      `Refusing to remove the last scope pattern from lock "${lockId}". A lock claiming nothing is worse than no lock: it still ` +
+        `appears in queries and still reads as an active claim, while covering no path and blocking nothing. Finish the lock instead.`,
+    );
+    this.name = 'EmptyScopeError';
+  }
+}
+
+/**
+ * Mutates an active or done lock: flips a task, appends a note, and/or CHANGES ITS SCOPE.
+ *
+ * SCOPE MUTATION IS TRANSITION 5 of the lock state machine (see the README table), and
+ * it was missing for the tool's whole life while three separate design decisions
+ * assumed it existed. The protocol's normal path is "claim, then discover the job
+ * touches one more file" — so without this, the most common case had no correct
+ * implementation and the workaround was to create a SECOND lock for one job, which
+ * splits the task checklist and leaves a window where the new paths are unclaimed.
+ */
 export async function updateLock(locksRoot: string, params: UpdateLockParams): Promise<UpdateLockResult> {
   const record = await findRecordById(locksRoot, params.lock_id);
   if (!record) throw new LockNotFoundError(params.lock_id);
 
-  const task = record.tasks.find((t) => t.text === params.task_text);
-  if (!task) {
-    throw new TaskNotFoundError(
-      params.lock_id,
-      params.task_text,
-      record.tasks.map((t) => t.text),
-    );
+  const wantsTask = params.task_text !== undefined;
+  const wantsScope = (params.add_scope?.length ?? 0) > 0 || (params.remove_scope?.length ?? 0) > 0;
+  const wantsNote = params.note !== undefined && params.note !== '';
+  if (!wantsTask && !wantsScope && !wantsNote) throw new NoOpUpdateError(params.lock_id);
+
+  if (wantsTask) {
+    if (params.done === undefined) {
+      throw new TypeError(`update to "${params.lock_id}" gave task_text without done; say which way to flip it`);
+    }
+    const task = record.tasks.find((t) => t.text === params.task_text);
+    if (!task) {
+      throw new TaskNotFoundError(
+        params.lock_id,
+        params.task_text!,
+        record.tasks.map((t) => t.text),
+      );
+    }
+    task.done = params.done;
   }
-  task.done = params.done;
+
+  // Scope changes are validated FULLY before any is applied, so a partially-applied
+  // scope edit is not a reachable state. A lock left half-way through a scope change
+  // is a claim whose extent nobody can state, which is the failure this whole tool is
+  // supposed to remove rather than introduce.
+  if (wantsScope) {
+    let next = [...record.frontmatter.scope];
+    for (const pattern of params.remove_scope ?? []) {
+      const at = next.indexOf(pattern);
+      if (at === -1) throw new ScopeNotHeldError(params.lock_id, pattern, record.frontmatter.scope);
+      next.splice(at, 1);
+    }
+    for (const pattern of params.add_scope ?? []) {
+      if (!next.includes(pattern)) next.push(pattern);
+    }
+    if (next.length === 0) throw new EmptyScopeError(params.lock_id);
+    record.frontmatter.scope = next;
+  }
 
   if (params.note) {
     record.notes.push(params.note);
@@ -433,7 +516,11 @@ export async function updateLock(locksRoot: string, params: UpdateLockParams): P
   record.frontmatter.updated = formatTimestamp();
   await writeRecord(record);
 
-  return { id: record.frontmatter.id, percentComplete: computePercentComplete(record.tasks) };
+  return {
+    id: record.frontmatter.id,
+    percentComplete: computePercentComplete(record.tasks),
+    scope: record.frontmatter.scope,
+  };
 }
 
 export interface FinishLockParams {
@@ -486,16 +573,6 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
     record.notes.push(params.summary);
   }
 
-  // finishLock enforces NEITHER staleness NOR ownership: any caller can finish any
-  // lock, including another session's live one, with no flag. `reap` refuses that for
-  // a named non-stale lock, so the guarantee people remember ("never a back door to
-  // force-finish someone else's live work") does not hold here at all.
-  //
-  // Enforcement is NOT the fix: most locks carry agent_id null, so requiring a match
-  // would make them unfinishable. What is fixable now is the SILENCE — a lock finished
-  // by someone else is currently indistinguishable from one finished by its holder, so
-  // the done archive cannot answer "who ended this claim?" and the audit that depends
-  // on it inherits the gap.
   // OWNERSHIP, enforced exactly as far as the data allows and no further.
   //
   // Refuse only when BOTH identities are known and differ. That closes the accidental
@@ -514,11 +591,17 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
   if (foreign) {
     record.notes.push(
       `Force-finished by ${params.agent_id}, which is NOT the holder (${holder}). ` +
-        `This note is the only record that the claim was ended by someone other than ` +
-        `whoever made it.`,
+        `Recorded here in prose and in frontmatter as finished_by: force, so the archive ` +
+        `can answer "who ended this claim?" whichever way it is read.`,
     );
   }
   record.frontmatter.status = 'done';
+  // Provenance, so `reopen` and any later audit can tell a deliberate close from a
+  // reap without parsing note prose. `force` means someone other than the holder
+  // ended the claim; `holder` covers both "its owner finished it" and "nobody's
+  // identity was known", which is the honest reading — an unattributed finish is not
+  // evidence of a takeover.
+  record.frontmatter.finished_by = foreign ? 'force' : 'holder';
   record.frontmatter.updated = formatTimestamp();
 
   const newFilePath = path.join(doneDir(locksRoot), path.basename(record.filePath));
@@ -668,7 +751,9 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
         `no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), ` +
         `threshold ${staleMinutes} minute(s).`,
     );
+    const lastTouch = record.frontmatter.updated;
     record.frontmatter.status = 'done';
+    record.frontmatter.finished_by = 'reap';
     record.frontmatter.updated = formatTimestamp();
     const newFilePath = path.join(doneDir(locksRoot), path.basename(record.filePath));
     const oldFilePath = record.filePath;
@@ -676,7 +761,168 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
     await ensureDirs(locksRoot);
     await writeRecord(record);
     await fs.unlink(oldFilePath);
+
+    // INSTRUMENT THE REAP. The threshold is currently unvalidated in both
+    // directions: across every lock ever created on this machine nothing has gone
+    // stale and nothing has been reaped, so 60 minutes is neither confirmed nor
+    // refuted. Tuning it later needs the distribution of inter-touch intervals for
+    // locks that turned out to be ALIVE, and that data does not exist unless it is
+    // captured at the moment of the reap — `updated` is overwritten one line above,
+    // which is exactly how the interval would otherwise be destroyed by the event
+    // that makes it interesting.
+    //
+    // Emitted AFTER the write succeeds, so the log never claims a reap that did not
+    // happen. appendEvent cannot throw (see events.ts invariant 2), so a broken log
+    // cannot break the reap.
+    await appendEvent(locksRoot, {
+      event: 'reap',
+      ts: record.frontmatter.updated,
+      lock_id: record.frontmatter.id,
+      repository: record.frontmatter.repository ?? '',
+      agent_id: record.frontmatter.agent_id,
+      created: record.frontmatter.created,
+      last_touch: lastTouch,
+      age_seconds: Math.max(0, Math.round((now.getTime() - parseTimestamp(record.frontmatter.created).getTime()) / 1000)),
+      idle_seconds: summary.staleForSeconds,
+      tasks_total: record.tasks.length,
+      tasks_done: record.tasks.filter((t) => t.done).length,
+      threshold_minutes: staleMinutes,
+    });
   }
 
   return reaped;
+}
+
+export interface ReopenLockParams {
+  lock_id: string;
+  /**
+   * Why this archived lock is being returned to active. REQUIRED unless the lock was
+   * finished by reap — see ReopenReasonRequiredError for why that asymmetry exists.
+   */
+  reason?: string;
+  /** The identity of whoever is reopening, if known. Recorded, never enforced. */
+  agent_id?: string | null;
+}
+
+export interface ReopenLockResult {
+  id: string;
+  filePath: string;
+  /** How the lock had been finished before this reopen — the provenance that gated it. */
+  previously_finished_by: 'holder' | 'force' | 'reap' | null;
+  /**
+   * True when this reopen is direct evidence the staleness threshold was too short:
+   * a lock reap took from a session that was, demonstrably, still there.
+   */
+  false_positive: boolean;
+}
+
+export class LockNotDoneError extends Error {
+  constructor(lockId: string) {
+    super(`Lock "${lockId}" is already active; reopen only applies to a lock in the done archive.`);
+    this.name = 'LockNotDoneError';
+  }
+}
+
+export class ReopenReasonRequiredError extends Error {
+  constructor(lockId: string, finishedBy: string | null) {
+    super(
+      `Reopening "${lockId}" requires a reason: it was finished by ${finishedBy ?? 'an unrecorded path'}, not by reap. ` +
+        `Recovering a claim that auto-reap took from a live session is routine and needs no justification; reviving one its ` +
+        `owner deliberately closed is a different act, and this refusal is what keeps reopen from becoming a general ` +
+        `back door into the archive.`,
+    );
+    this.name = 'ReopenReasonRequiredError';
+  }
+}
+
+/**
+ * TRANSITION 9: done -> active. The recovery path for a wrongful reap.
+ *
+ * WHY THIS EXISTS AT ALL. Auto-reap can finish a LIVE lock whose holder simply had
+ * no task boundary to check off for longer than the threshold. When that happens the
+ * holder needs its claim back, and both workarounds are bad in the same way the
+ * missing scope mutator was bad: re-claiming creates a second record for one job,
+ * loses the task checklist, and leaves a window with nothing claimed; hand-editing
+ * the markdown bypasses the API entirely and is untraceable.
+ *
+ * WHY IT DOUBLES AS THE INSTRUMENT. A reopen of a REAPED lock is a labelled false
+ * positive for the staleness threshold — the strongest evidence available that the
+ * threshold is too short, and it arrives already attached to the interval that
+ * triggered it. So the recovery path and the measurement are the same code, and
+ * there is no separate telemetry to remember to keep alive.
+ *
+ * WHAT IT IS NOT: a way to revive arbitrary archived work. A lock its owner
+ * deliberately finished can still be reopened, but only with a stated reason, which
+ * is recorded.
+ */
+export async function reopenLock(locksRoot: string, params: ReopenLockParams): Promise<ReopenLockResult> {
+  await ensureDirs(locksRoot);
+  const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
+
+  let record: LockRecord | null = null;
+  for (const filePath of doneFiles) {
+    const candidate = await readRecord(filePath);
+    if (candidate.frontmatter.id === params.lock_id) {
+      record = candidate;
+      break;
+    }
+  }
+
+  if (!record) {
+    const activeFiles = await listMarkdownFiles(activeDir(locksRoot));
+    for (const filePath of activeFiles) {
+      const candidate = await readRecord(filePath);
+      if (candidate.frontmatter.id === params.lock_id) throw new LockNotDoneError(params.lock_id);
+    }
+    throw new LockNotFoundError(params.lock_id);
+  }
+
+  const finishedBy = record.frontmatter.finished_by ?? null;
+  const wasReaped = finishedBy === 'reap';
+  const reason = params.reason?.trim() ?? '';
+  if (!wasReaped && reason === '') throw new ReopenReasonRequiredError(params.lock_id, finishedBy);
+
+  // Join the reap-time interval from this log's own history, so the false-positive
+  // record is self-contained. Doing it here rather than at analysis time means a
+  // later reader never has to reconstruct the pairing — and a pairing nobody
+  // reconstructs is a measurement nobody makes.
+  const priorReap = wasReaped ? await lastReapEventFor(locksRoot, params.lock_id) : null;
+
+  record.notes.push(
+    wasReaped
+      ? `Reopened by ${params.agent_id ?? 'an unidentified caller'} after an auto-reap` +
+          (priorReap ? ` that fired at ${priorReap.idle_seconds}s idle against a ${priorReap.threshold_minutes}-minute threshold` : '') +
+          `. The reap was a FALSE POSITIVE: the holder was still working.` +
+          (reason === '' ? '' : ` Reason: ${reason}`)
+      : `Reopened by ${params.agent_id ?? 'an unidentified caller'} from a ${finishedBy ?? 'unrecorded'} finish. Reason: ${reason}`,
+  );
+
+  record.frontmatter.status = 'active';
+  record.frontmatter.finished_by = null;
+  record.frontmatter.updated = formatTimestamp();
+
+  const newFilePath = path.join(activeDir(locksRoot), path.basename(record.filePath));
+  const oldFilePath = record.filePath;
+  record.filePath = newFilePath;
+  await writeRecord(record);
+  await fs.unlink(oldFilePath);
+
+  await appendEvent(locksRoot, {
+    event: 'reopen',
+    ts: record.frontmatter.updated,
+    lock_id: record.frontmatter.id,
+    repository: record.frontmatter.repository ?? '',
+    agent_id: params.agent_id ?? null,
+    finished_by: finishedBy,
+    reason: reason === '' ? null : reason,
+    false_positive: wasReaped,
+    idle_at_reap_seconds: priorReap?.idle_seconds ?? null,
+  });
+
+  return {
+    id: record.frontmatter.id,
+    filePath: newFilePath,
+    previously_finished_by: finishedBy,
+    false_positive: wasReaped,
+  };
 }

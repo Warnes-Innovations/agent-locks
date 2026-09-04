@@ -39,7 +39,14 @@ import {
   LockNotActiveError,
   LockNotOwnedError,
   LockNotStaleError,
+  LockNotDoneError,
+  NoOpUpdateError,
+  ScopeNotHeldError,
+  EmptyScopeError,
+  ReopenReasonRequiredError,
+  reopenLock,
 } from './lock/store.js';
+import { readEvents, lastEventLogErrors } from './lock/events.js';
 import type { LockSummary } from './lock/types.js';
 
 const USAGE = `agent-locks — filesystem-based work-claiming locks for AI coding agents, shared across every git worktree of the current repository.
@@ -55,6 +62,8 @@ Usage:
   agent-locks finish <lock-id> [--summary <text>] [--agent <id>] [--force]  Mark a lock done and archive it. Pass --agent so ownership can be checked; --force is required (and recorded) to end another session's claim.
   agent-locks heartbeat <lock-id>        Bump a lock's updated timestamp with no other change. See "Staleness detection" in the README.
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
+  agent-locks reopen <lock-id> [options]  Return an archived lock to active. See "agent-locks reopen --help".
+  agent-locks events [options]          Read the append-only lock event log. See "agent-locks events --help".
   agent-locks --help                    Show this message.
 
 Every subcommand talks to the exact same lock store the MCP tools use — a human running "agent-locks status" and an agent calling lock_query see identical, live state.
@@ -88,13 +97,60 @@ Options:
 
 const UPDATE_USAGE = `agent-locks update <lock-id> [options]
 
+Changes a lock: flip a task, append a note, and/or CHANGE ITS SCOPE. At least one of
+--task, --note, --add-scope or --remove-scope is required — an update that would change
+nothing is refused rather than silently bumping the timestamp, which would be a
+heartbeat wearing an update's name. Use "agent-locks heartbeat" if that is what you want.
+
 Options:
-  --task <text>          Required. Must match an existing task's text exactly.
+  --task <text>          Must match an existing task's text exactly.
   --done                 Mark the task done (default if neither --done nor --undone given).
   --undone               Mark the task not done.
   --note <text>           Append a free-text note to the lock.
+  --add-scope <glob>     Add a glob to this lock's scope. Repeatable. Already-held globs
+                          are ignored, so this is safely idempotent.
+  --remove-scope <glob>  Remove a glob from this lock's scope. Repeatable. Errors if the
+                          lock does not hold it, and refuses to empty the scope entirely.
+  --base-dir <path>      Look up the lock in a different repository (any path inside it).
+  --json                 Print raw JSON instead of a short confirmation line.
+
+Scope drift is the NORMAL case: you claim what you expect to touch, then discover the job
+reaches one more file. Extend the existing claim rather than creating a second lock — a
+second lock for one job splits the task checklist and leaves a window where the new paths
+are claimed by nobody.`;
+
+const REOPEN_USAGE = `agent-locks reopen <lock-id> [options]
+
+Returns a lock from the done archive to active. This is the recovery path for a lock that
+auto-reap took from a session that was still working: re-claiming instead would create a
+second record, lose the checklist, and leave the paths unclaimed in between.
+
+A lock finished by REAP reopens with no reason required. A lock its owner deliberately
+finished requires --reason, which is recorded — reopen is a recovery path, not a general
+back door into the archive.
+
+Reopening a reaped lock also records a labelled FALSE POSITIVE in the event log: direct
+evidence, with the interval attached, that the staleness threshold was too short.
+
+Options:
+  --reason <text>        Why. Required unless the lock was finished by reap.
+  --agent <id>           Your own agent id, if you have one. Recorded, never enforced.
   --base-dir <path>      Look up the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
+
+const EVENTS_USAGE = `agent-locks events [options]
+
+Reads the append-only event log — reaps and reopens, oldest first. This is the data behind
+any future change to the staleness threshold: tune on the distribution of inter-touch
+intervals for locks that turned out to be ALIVE, which means the reaps that were later
+reopened. The threshold must exceed the TAIL of that distribution, not its median.
+
+Options:
+  --type <reap|reopen>   Only events of this type.
+  --lock <lock-id>       Only events for this lock.
+  --limit <n>            Return at most n events, the most recent ones.
+  --base-dir <path>      Read the log of a different repository (any path inside it).
+  --json                 Print raw JSON instead of a formatted table.`;
 
 const REAP_USAGE = `agent-locks reap [lock-id] [options]
 
@@ -200,6 +256,24 @@ function warnUnreadable(): void {
   );
   for (const bad of lastUnreadableLocks) {
     console.error(`  ${bad.filePath}: ${bad.reason}`);
+  }
+}
+
+/**
+ * Same contract as warnUnreadable, for the event log: a corrupt or unwritable log must
+ * be visible, because "the log is empty" and "the log is broken" otherwise look
+ * identical — and the whole point of the log is that an empty result MEANS something
+ * (nothing was reaped). Wired into every command that reads or writes it, for the same
+ * reason warnUnreadable is wired into every read surface rather than the renderer.
+ */
+function warnEventLog(): void {
+  if (lastEventLogErrors.length === 0) return;
+  console.error(
+    `WARNING: ${lastEventLogErrors.length} problem(s) with the event log. Reap/reopen ` +
+      `history may be incomplete, so an empty result here does NOT mean nothing happened.`,
+  );
+  for (const bad of lastEventLogErrors) {
+    console.error(`  [${bad.phase}] ${bad.reason}`);
   }
 }
 
@@ -340,21 +414,132 @@ async function cmdUpdate(flags: ParsedFlags): Promise<void> {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError('agent-locks update requires a lock id as its first argument. See "agent-locks update --help".');
   const taskText = oneOf(flags.flags, '--task');
-  if (!taskText) throw new CliUsageError('agent-locks update requires --task. See "agent-locks update --help".');
+  const addScope = allOf(flags.flags, '--add-scope');
+  const removeScope = allOf(flags.flags, '--remove-scope');
+  const note = oneOf(flags.flags, '--note');
+  if (!taskText && addScope.length === 0 && removeScope.length === 0 && note === undefined) {
+    throw new CliUsageError(
+      'agent-locks update requires at least one of --task, --note, --add-scope or --remove-scope. See "agent-locks update --help".',
+    );
+  }
   if (flags.boolFlags.has('--done') && flags.boolFlags.has('--undone')) {
     throw new CliUsageError('Pass at most one of --done / --undone.');
   }
   const done = !flags.boolFlags.has('--undone');
-  const note = oneOf(flags.flags, '--note');
 
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
-  const result = await updateLock(locksRoot, { lock_id: lockId, task_text: taskText, done, note });
+  const result = await updateLock(locksRoot, {
+    lock_id: lockId,
+    task_text: taskText,
+    done: taskText === undefined ? undefined : done,
+    note,
+    add_scope: addScope.length > 0 ? addScope : undefined,
+    remove_scope: removeScope.length > 0 ? removeScope : undefined,
+  });
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  // Report every part that changed, including the scope — a scope edit that lands
+  // silently is one the caller cannot confirm without a second command, and an
+  // unconfirmed claim boundary is the thing this tool exists to make legible.
+  const parts: string[] = [];
+  if (taskText) parts.push(`"${taskText}" marked ${done ? 'done' : 'not done'} (${result.percentComplete}% complete overall)`);
+  if (addScope.length > 0) parts.push(`scope +${addScope.join(', +')}`);
+  if (removeScope.length > 0) parts.push(`scope -${removeScope.join(', -')}`);
+  if (note !== undefined) parts.push('note appended');
+  console.log(`Lock ${result.id}: ${parts.join('; ')}.`);
+  if (addScope.length > 0 || removeScope.length > 0) {
+    console.log(`  scope now: ${result.scope.join(', ')}`);
+  }
+}
+
+async function cmdReopen(flags: ParsedFlags): Promise<void> {
+  if (flags.boolFlags.has('--help')) {
+    console.log(REOPEN_USAGE);
+    return;
+  }
+  const lockId = flags.positionals[0];
+  if (!lockId) throw new CliUsageError('agent-locks reopen requires a lock id as its first argument. See "agent-locks reopen --help".');
+  const reason = oneOf(flags.flags, '--reason');
+  const agent_id = oneOf(flags.flags, '--agent');
+
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
+  const result = await reopenLock(locksRoot, { lock_id: lockId, reason, agent_id });
+  warnEventLog();
+
+  if (flags.boolFlags.has('--json')) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(`Lock ${result.id} reopened and returned to active.`);
+  if (result.false_positive) {
+    // Say it out loud. This is the one signal that says the staleness threshold is
+    // wrong, and a signal recorded only in a log nobody opens is a signal nobody acts on.
+    console.log(
+      `  This lock had been AUTO-REAPED, so the reap was a false positive: the holder was still working. ` +
+        `Recorded in the event log as evidence the staleness threshold is too short.`,
+    );
   } else {
-    console.log(`Lock ${result.id}: "${taskText}" marked ${done ? 'done' : 'not done'} (${result.percentComplete}% complete overall).`);
+    console.log(`  Previously finished by: ${result.previously_finished_by ?? 'an unrecorded path'}.`);
+  }
+}
+
+async function cmdEvents(flags: ParsedFlags): Promise<void> {
+  if (flags.boolFlags.has('--help')) {
+    console.log(EVENTS_USAGE);
+    return;
+  }
+  const type = oneOf(flags.flags, '--type');
+  if (type !== undefined && type !== 'reap' && type !== 'reopen') {
+    throw new CliUsageError(`--type must be one of reap, reopen (got "${type}").`);
+  }
+  const limitRaw = oneOf(flags.flags, '--limit');
+  let limit: number | undefined;
+  if (limitRaw !== undefined) {
+    limit = Number(limitRaw);
+    if (!Number.isInteger(limit) || limit <= 0) throw new CliUsageError(`--limit must be a positive integer (got "${limitRaw}").`);
+  }
+
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
+  const events = await readEvents(locksRoot, { type, lock_id: oneOf(flags.flags, '--lock'), limit });
+  warnEventLog();
+
+  if (flags.boolFlags.has('--json')) {
+    console.log(JSON.stringify(events, null, 2));
+    return;
+  }
+  if (events.length === 0) {
+    console.log('No lock events recorded. Nothing has been reaped or reopened in this repository.');
+    return;
+  }
+  for (const event of events) {
+    if (event.event === 'reap') {
+      console.log(
+        `${event.ts}  REAP    ${event.lock_id}\n` +
+          `    idle ${event.idle_seconds}s at a ${event.threshold_minutes}m threshold; ` +
+          `${event.tasks_done}/${event.tasks_total} tasks done; holder ${event.agent_id ?? '(none recorded)'}`,
+      );
+    } else {
+      console.log(
+        `${event.ts}  REOPEN  ${event.lock_id}\n` +
+          `    ${event.false_positive ? 'FALSE POSITIVE — reaped while alive' : `from a ${event.finished_by ?? 'unrecorded'} finish`}` +
+          (event.idle_at_reap_seconds === null ? '' : `; had been idle ${event.idle_at_reap_seconds}s when reaped`) +
+          (event.reason === null ? '' : `; reason: ${event.reason}`),
+      );
+    }
+  }
+  const falsePositives = events.filter((e) => e.event === 'reopen' && e.false_positive).length;
+  const reaps = events.filter((e) => e.event === 'reap').length;
+  if (reaps > 0) {
+    console.log(
+      `\n${reaps} reap(s), ${falsePositives} later reopened as false positive(s). ` +
+        `Tune the threshold above the TAIL of the idle intervals that turned out to be alive, not their median.`,
+    );
   }
 }
 
@@ -478,6 +663,12 @@ export async function runCli(argv: string[]): Promise<number> {
       case 'reap':
         await cmdReap(parseArgs(rest));
         return 0;
+      case 'reopen':
+        await cmdReopen(parseArgs(rest));
+        return 0;
+      case 'events':
+        await cmdEvents(parseArgs(rest));
+        return 0;
       default:
         console.error(`agent-locks: unknown command "${command}".\n`);
         console.error(USAGE);
@@ -494,7 +685,12 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof TaskNotFoundError ||
       error instanceof LockNotActiveError ||
       error instanceof LockNotOwnedError ||
-      error instanceof LockNotStaleError
+      error instanceof LockNotStaleError ||
+      error instanceof LockNotDoneError ||
+      error instanceof NoOpUpdateError ||
+      error instanceof ScopeNotHeldError ||
+      error instanceof EmptyScopeError ||
+      error instanceof ReopenReasonRequiredError
     ) {
       printError(error.message);
       return 1;

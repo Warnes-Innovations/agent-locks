@@ -91,12 +91,38 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     expect(instructions).toContain('cannot detect your agent id');
   });
 
-  it('lists exactly the 7 documented tools', async () => {
+  it('lists exactly the 9 documented tools — the roster cannot grow or shrink silently', async () => {
+    // An exhaustive list, deliberately. Adding a tool must be a decision someone makes
+    // in this file, not something that happens because a registerTool call was added
+    // elsewhere: the MCP surface is what every agent on the machine can reach, and it
+    // is the only real boundary around what this tool will do on request.
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
-      ['lock_check_conflict', 'lock_create', 'lock_finish', 'lock_heartbeat', 'lock_query', 'lock_reap', 'lock_update'].sort(),
+      [
+        'lock_check_conflict',
+        'lock_create',
+        'lock_finish',
+        'lock_heartbeat',
+        'lock_query',
+        'lock_reap',
+        'lock_reopen',
+        'lock_update',
+      ].sort(),
     );
+  });
+
+  it('exposes no administrative operation over MCP', async () => {
+    // Operations that reset history, rewrite a lock's stamped TTL, or prune the archive
+    // do not belong on the surface every agent can call. The separate-binary split for
+    // those is a speed bump and a signal, NOT a boundary — an agent with shell access
+    // can run any binary — so THIS assertion is the boundary, and it has to be
+    // mechanical rather than a documented intention. Stated as a prefix/word scan so a
+    // future admin verb has to be renamed or exempted here on purpose.
+    const { tools } = await client.listTools();
+    const forbidden = /(^|_)(admin|reset|prune|purge|truncate|set_ttl|config)(_|$)/;
+    const offenders = tools.map((t) => t.name).filter((name) => forbidden.test(name));
+    expect(offenders).toEqual([]);
   });
 
   it('drives a real create -> query -> update -> finish round trip against the filesystem', async () => {
