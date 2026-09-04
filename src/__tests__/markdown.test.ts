@@ -93,3 +93,41 @@ scope:
     expect(parsed.frontmatter.scope).toEqual(['glob/pattern/**']);
   });
 });
+
+describe('parser aliasing', () => {
+  it('returns an INDEPENDENT frontmatter object for identical raw text', () => {
+    // gray-matter caches by raw string and hands back the cached object, so without
+    // an explicit options argument two locks with identical text share one
+    // frontmatter — and store.ts mutates frontmatter in place before writing. The
+    // observable failure is a lock reporting a scope that was only ever set on a
+    // different lock. Identical text is reachable in normal use: lock ids are
+    // second-resolution, so same second + same title + same scope collide exactly.
+    const raw = [
+      '---',
+      'id: 2026-09-04T02-07-17-some-work',
+      'agent_id: null',
+      'parent_agent_id: null',
+      'status: active',
+      'created: 2026-09-04T02-07-17',
+      'updated: 2026-09-04T02-07-17',
+      'scope:',
+      '  - src/a/**',
+      'repository: /tmp/fake-repo',
+      '---',
+      '',
+      '# some work',
+      '',
+      '- [ ] first',
+      '',
+      '## Notes',
+      '',
+    ].join('\n');
+
+    const first = parseLockFile(raw);
+    const second = parseLockFile(raw);
+
+    expect(first.frontmatter).not.toBe(second.frontmatter);
+    first.frontmatter.scope = ['MUTATED/**'];
+    expect(second.frontmatter.scope).toEqual(['src/a/**']);
+  });
+});

@@ -96,9 +96,27 @@ function serializeBody(body: Body): string {
   return lines.join('\n') + '\n';
 }
 
-/** Parses a full lock file (frontmatter + body) already read from disk. */
+/**
+ * Parses a full lock file (frontmatter + body) already read from disk.
+ *
+ * THE `{}` PASSED TO `matter` IS LOAD-BEARING — do not "simplify" it away.
+ *
+ * gray-matter keeps a process-wide cache keyed on the raw input string, and it
+ * returns the CACHED OBJECT rather than a copy. It consults that cache only when
+ * called with no options, so passing any options object bypasses it.
+ *
+ * Without the bypass, two lock files whose raw text happens to be identical share
+ * one frontmatter object — and store.ts mutates `record.frontmatter` in place
+ * before writing. So a mutation to one lock silently appears on the other, and a
+ * re-read returns the mutated object instead of what is actually on disk. Identical
+ * text is not exotic: ids are second-resolution, so two locks created in the same
+ * second with the same title and scope collide exactly.
+ *
+ * Found 2026-09-04 by the scope-mutation tests, which reported a lock's scope as a
+ * value that only ever existed in a different test's lock.
+ */
 export function parseLockFile(raw: string): ParsedLock {
-  const { data, content } = matter(raw);
+  const { data, content } = matter(raw, {});
   const frontmatter = data as LockFrontmatter;
   const body = parseBody(content);
   return {
