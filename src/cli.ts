@@ -107,8 +107,13 @@ Options:
   --done                 Mark the task done (default if neither --done nor --undone given).
   --undone               Mark the task not done.
   --note <text>           Append a free-text note to the lock.
-  --add-scope <glob>     Add a glob to this lock's scope. Repeatable. Already-held globs
-                          are ignored, so this is safely idempotent.
+  --agent <id>           Your own agent id. Supply it so ownership can be checked:
+                          updating a lock held by a DIFFERENT session is refused unless
+                          --force is given. Omit it and no check is possible.
+  --force                Deliberately update another session's lock. Recorded in its notes.
+  --add-scope <glob>     Add a glob to this lock's scope. Repeatable. Adding a glob the
+                          lock already holds changes nothing and is refused as a no-op,
+                          so it cannot be used as a disguised heartbeat.
   --remove-scope <glob>  Remove a glob from this lock's scope. Repeatable. Errors if the
                           lock does not hold it, and refuses to empty the scope entirely.
   --base-dir <path>      Look up the lock in a different repository (any path inside it).
@@ -431,6 +436,11 @@ async function cmdUpdate(flags: ParsedFlags): Promise<void> {
   const locksRoot = await resolveLocksRoot(cwd);
   const result = await updateLock(locksRoot, {
     lock_id: lockId,
+    // Pass identity THROUGH. Store-level ownership is inert if the surface never says
+    // who is calling — the same last-hop failure that let the CLI archive another
+    // session's lock while finishLock's check was already in place.
+    agent_id: oneOf(flags.flags, '--agent'),
+    force: flags.boolFlags.has('--force'),
     task_text: taskText,
     done: taskText === undefined ? undefined : done,
     note,

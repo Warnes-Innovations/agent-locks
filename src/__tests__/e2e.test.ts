@@ -125,6 +125,109 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     expect(offenders).toEqual([]);
   });
 
+  // ---------------------------------------------------------------------------
+  // MCP-SIDE POINTER TESTS.
+  //
+  // These exist because every control below was, at one point, enforced in the store
+  // and NOT passed through by server.ts — and the suite stayed fully green through
+  // three separate deletion proofs. A store-level guarantee whose surface never
+  // supplies the argument is not a guarantee; it is a comment. The CLI got pointer
+  // tests for exactly this reason and the MCP surface did not, which is how the same
+  // last-hop failure recurred on the interface that agents actually use.
+  //
+  // Each test below fails if the corresponding argument stops being forwarded.
+  // ---------------------------------------------------------------------------
+
+  it('lock_update FORWARDS add_scope/remove_scope to the store', async () => {
+    const created = toolResultJson(
+      await client.callTool({
+        name: 'lock_create',
+        arguments: { title: 'Scope drift over MCP', scope: ['src/a/**'], tasks: ['t'] },
+      }),
+    ) as { id: string };
+
+    const updated = toolResultJson(
+      await client.callTool({
+        name: 'lock_update',
+        arguments: { lock_id: created.id, add_scope: ['src/b/**'] },
+      }),
+    ) as { scope: string[] };
+    expect(updated.scope).toEqual(['src/a/**', 'src/b/**']);
+
+    // ...and a consumer sees the extended claim, not just the return value.
+    const conflicts = toolResultJson(
+      await client.callTool({ name: 'lock_check_conflict', arguments: { scope: ['src/b/main.ts'] } }),
+    ) as Array<{ id: string }>;
+    expect(conflicts.map((c) => c.id)).toContain(created.id);
+  });
+
+  it('lock_update FORWARDS agent_id, so another session cannot silently shrink a claim', async () => {
+    const created = toolResultJson(
+      await client.callTool({
+        name: 'lock_create',
+        arguments: { title: 'Held by A', scope: ['src/a/**', 'src/b/**'], tasks: ['t'], agent_id: 'agent-A [aaa]' },
+      }),
+    ) as { id: string };
+
+    const refused = await client.callTool({
+      name: 'lock_update',
+      arguments: { lock_id: created.id, remove_scope: ['src/a/**'], agent_id: 'agent-B [bbb]' },
+    });
+    expect(refused.isError).toBe(true);
+
+    // The claim is intact: a refusal that still mutated would be worse than none.
+    const conflicts = toolResultJson(
+      await client.callTool({ name: 'lock_check_conflict', arguments: { scope: ['src/a/x.ts'] } }),
+    ) as Array<{ id: string }>;
+    expect(conflicts.map((c) => c.id)).toContain(created.id);
+  });
+
+  it('lock_finish FORWARDS agent_id and force', async () => {
+    const created = toolResultJson(
+      await client.callTool({
+        name: 'lock_create',
+        arguments: { title: 'Finish ownership', scope: ['src/f/**'], tasks: ['t'], agent_id: 'agent-A [aaa]' },
+      }),
+    ) as { id: string };
+
+    const refused = await client.callTool({
+      name: 'lock_finish',
+      arguments: { lock_id: created.id, agent_id: 'agent-B [bbb]' },
+    });
+    expect(refused.isError).toBe(true);
+
+    // force is the deliberate, recorded escape — and it must also be forwarded.
+    const forced = await client.callTool({
+      name: 'lock_finish',
+      arguments: { lock_id: created.id, agent_id: 'agent-B [bbb]', force: true },
+    });
+    expect(forced.isError).toBeFalsy();
+  });
+
+  it('lock_reopen FORWARDS reason, and enforces it only where the design says to', async () => {
+    const created = toolResultJson(
+      await client.callTool({
+        name: 'lock_create',
+        arguments: { title: 'Reopen gating', scope: ['src/r/**'], tasks: ['t'] },
+      }),
+    ) as { id: string };
+    await client.callTool({ name: 'lock_finish', arguments: { lock_id: created.id } });
+
+    // Deliberately finished => a reason is required. If `reason` stopped being
+    // forwarded, this call would succeed and the test fails.
+    const refused = await client.callTool({ name: 'lock_reopen', arguments: { lock_id: created.id } });
+    expect(refused.isError).toBe(true);
+
+    const allowed = await client.callTool({
+      name: 'lock_reopen',
+      arguments: { lock_id: created.id, reason: 'was not actually done' },
+    });
+    expect(allowed.isError).toBeFalsy();
+    const reopened = toolResultJson(allowed) as { false_positive: boolean; previously_finished_by: string };
+    expect(reopened.false_positive).toBe(false);
+    expect(reopened.previously_finished_by).toBe('holder');
+  });
+
   it('drives a real create -> query -> update -> finish round trip against the filesystem', async () => {
     const createResult = await client.callTool({
       name: 'lock_create',

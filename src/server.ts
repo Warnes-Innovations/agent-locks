@@ -252,6 +252,18 @@ export function createServer(): McpServer {
         'Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).',
       inputSchema: {
         lock_id: z.string().describe('The id of the lock to update (as returned by lock_create or lock_query).'),
+        agent_id: z
+          .string()
+          .optional()
+          .describe(
+            'Your own agent id. Supply it so ownership can be checked: updating a lock held by a DIFFERENT session — ' +
+              'including SHRINKING its scope, which frees paths for everyone while the lock still reads as held — is refused unless force is set. ' +
+              'Omit it and no check is possible.',
+          ),
+        force: z
+          .boolean()
+          .optional()
+          .describe('Deliberately update a lock held by another session. Required when both identities are known and differ; recorded in the lock\'s notes.'),
         task_text: z.string().optional().describe('The exact text of an existing task on this lock. Omit for a scope-only or note-only update.'),
         done: z.boolean().optional().describe('true to mark the task done, false to mark it not done. Required when task_text is given.'),
         note: z.string().optional().describe('Optional free-text note to append to the lock\'s Notes section.'),
@@ -280,11 +292,11 @@ export function createServer(): McpServer {
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ lock_id, task_text, done, note, add_scope, remove_scope, base_dir }) => {
+    async ({ lock_id, agent_id, force, task_text, done, note, add_scope, remove_scope, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
-        const result = await updateLock(locksRoot, { lock_id, task_text, done, note, add_scope, remove_scope });
+        const result = await updateLock(locksRoot, { lock_id, agent_id, force, task_text, done, note, add_scope, remove_scope });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);
