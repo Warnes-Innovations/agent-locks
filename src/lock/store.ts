@@ -425,6 +425,12 @@ export async function updateLock(locksRoot: string, params: UpdateLockParams): P
 export interface FinishLockParams {
   lock_id: string;
   summary?: string;
+  /**
+   * The identity of whoever is finishing this lock, if known. Optional, because most
+   * existing locks carry no agent_id and requiring a match would make them
+   * unfinishable — a fix worse than the defect.
+   */
+  agent_id?: string | null;
 }
 
 export interface FinishLockResult {
@@ -459,6 +465,25 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
 
   if (params.summary) {
     record.notes.push(params.summary);
+  }
+
+  // finishLock enforces NEITHER staleness NOR ownership: any caller can finish any
+  // lock, including another session's live one, with no flag. `reap` refuses that for
+  // a named non-stale lock, so the guarantee people remember ("never a back door to
+  // force-finish someone else's live work") does not hold here at all.
+  //
+  // Enforcement is NOT the fix: most locks carry agent_id null, so requiring a match
+  // would make them unfinishable. What is fixable now is the SILENCE — a lock finished
+  // by someone else is currently indistinguishable from one finished by its holder, so
+  // the done archive cannot answer "who ended this claim?" and the audit that depends
+  // on it inherits the gap.
+  const holder = record.frontmatter.agent_id;
+  if (params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id)) {
+    record.notes.push(
+      `Finished by ${params.agent_id}, which is NOT the holder (${holder}). ` +
+        `finishLock does not check ownership; this note is the only record that the ` +
+        `claim was ended by someone other than whoever made it.`,
+    );
   }
   record.frontmatter.status = 'done';
   record.frontmatter.updated = formatTimestamp();

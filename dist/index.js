@@ -449,6 +449,12 @@ async function finishLock(locksRoot, params) {
   if (params.summary) {
     record.notes.push(params.summary);
   }
+  const holder = record.frontmatter.agent_id;
+  if (params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id)) {
+    record.notes.push(
+      `Finished by ${params.agent_id}, which is NOT the holder (${holder}). finishLock does not check ownership; this note is the only record that the claim was ended by someone other than whoever made it.`
+    );
+  }
   record.frontmatter.status = "done";
   record.frontmatter.updated = formatTimestamp();
   const newFilePath = path2.join(doneDir(locksRoot), path2.basename(record.filePath));

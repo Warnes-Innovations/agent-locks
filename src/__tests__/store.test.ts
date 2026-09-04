@@ -542,3 +542,47 @@ describe('round-4: defects introduced by the round-2/3 fixes', () => {
     expect(lastReapFloor!.applied).toBe(60);
   });
 });
+
+describe('finishing another session\'s lock leaves a record (CR-1a)', () => {
+  it('notes the finisher when it is not the holder', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'held by Blue',
+      scope: ['a/**'],
+      tasks: [],
+      agent_id: 'Blue [aa1111]',
+    });
+
+    await finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]', summary: 'done' });
+
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const text = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    // Ownership is NOT enforced — most locks have no agent_id, so requiring a match
+    // would make them unfinishable. What is fixed is the silence.
+    expect(text).toContain('is NOT the holder');
+    expect(text).toContain('Red [bd9522]');
+  });
+
+  it('adds no such note when the holder finishes its own lock', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'mine',
+      scope: ['a/**'],
+      tasks: [],
+      agent_id: 'Red [bd9522]',
+    });
+    // Renamed since claiming: the ref still matches, so this is not a foreign finish.
+    await finishLock(locksRoot, { lock_id: id, agent_id: 'Renamed [bd9522]' });
+
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const text = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    expect(text).not.toContain('is NOT the holder');
+  });
+
+  it('adds no note when the lock has no recorded holder', async () => {
+    const { id } = await createLock(locksRoot, { title: 'unowned', scope: ['a/**'], tasks: [] });
+    await finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]' });
+
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const text = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    expect(text).not.toContain('is NOT the holder');
+  });
+});
