@@ -13,6 +13,15 @@ import { promises as fs } from "fs";
 import { promisify } from "util";
 import path from "path";
 var execFileAsync = promisify(execFile);
+var SAFE_GIT_PREFIX = ["--no-optional-locks", "-c", "core.fsmonitor=false"];
+var GitCommandFailedError = class extends Error {
+  constructor(command, cwd, cause) {
+    super(
+      `agent-locks: \`git ${command}\` failed in "${cwd}". This is NOT "not a git repository" \u2014 the repository was found, but the command could not complete, so nothing was measured and no conclusion should be drawn from an empty result. Original error: ${cause instanceof Error ? cause.message : String(cause)}`
+    );
+    this.name = "GitCommandFailedError";
+  }
+};
 var NotAGitRepoError = class extends Error {
   constructor(cwd, cause) {
     super(
@@ -31,6 +40,98 @@ async function resolveRepoRoot(cwd = process.cwd()) {
     return stdout.trim();
   } catch (error) {
     throw new NotAGitRepoError(cwd, error);
+  }
+}
+async function listChangedFiles(cwd = process.cwd()) {
+  return parseStatusPaths(await runStatus(cwd, []));
+}
+async function countIgnoredFiles(cwd = process.cwd()) {
+  const stdout = await runStatus(cwd, ["--ignored=matching"]);
+  let ignored = 0;
+  for (const entry of stdout.split("\0")) {
+    if (entry.length >= 4 && entry[0] === "!" && entry[1] === "!") ignored += 1;
+  }
+  return ignored;
+}
+async function countWorktrees(cwd = process.cwd()) {
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync("git", [...SAFE_GIT_PREFIX, "worktree", "list", "--porcelain"], {
+      cwd,
+      maxBuffer: 8 * 1024 * 1024
+    }));
+  } catch (error) {
+    throw new GitCommandFailedError("worktree list", cwd, error);
+  }
+  return stdout.split("\n").filter((line) => line.startsWith("worktree ")).length;
+}
+async function runStatus(cwd, extraArgs) {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      [...SAFE_GIT_PREFIX, "status", "--porcelain=v1", "-z", "-uall", ...extraArgs],
+      {
+        cwd,
+        // A large working tree can exceed the 1 MB default and would otherwise
+        // reject with ENOBUFS. Above this it still fails loudly (see below) —
+        // it never degrades into a short list, which would read as low drift.
+        maxBuffer: 64 * 1024 * 1024
+      }
+    );
+    return stdout;
+  } catch (error) {
+    if (await isGitRepo(cwd)) throw new GitCommandFailedError("status", cwd, error);
+    throw new NotAGitRepoError(cwd, error);
+  }
+}
+async function isGitRepo(cwd) {
+  try {
+    await execFileAsync("git", ["rev-parse", "--git-common-dir"], { cwd });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function parseStatusPaths(stdout) {
+  const fields = stdout.split("\0");
+  const files = /* @__PURE__ */ new Set();
+  for (let i = 0; i < fields.length; i += 1) {
+    const entry = fields[i];
+    if (entry.length < 4) continue;
+    const indexStatus = entry[0];
+    const worktreeStatus = entry[1];
+    files.add(entry.slice(3));
+    if (indexStatus === "R" || indexStatus === "C" || worktreeStatus === "R" || worktreeStatus === "C") {
+      i += 1;
+      const original = fields[i];
+      if (original) files.add(original);
+    }
+  }
+  return [...files].sort();
+}
+async function listCommittedFilesSince(cwd, since) {
+  const sinceUtc = since.toISOString();
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync(
+      "git",
+      [...SAFE_GIT_PREFIX, "log", "-z", "--name-only", "--pretty=format:", `--since=${sinceUtc}`, "HEAD"],
+      { cwd, maxBuffer: 64 * 1024 * 1024 }
+    ));
+  } catch (error) {
+    if (await hasNoCommits(cwd)) return [];
+    if (await isGitRepo(cwd)) throw new GitCommandFailedError("log", cwd, error);
+    throw new NotAGitRepoError(cwd, error);
+  }
+  const files = new Set(stdout.split("\0").filter((name) => name !== ""));
+  return [...files].sort();
+}
+async function hasNoCommits(cwd) {
+  try {
+    await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], { cwd });
+    return false;
+  } catch {
+    return true;
   }
 }
 async function getRealGitCommonDir(cwd) {
@@ -128,9 +229,56 @@ function serializeBody(body) {
   }
   return lines.join("\n") + "\n";
 }
-function parseLockFile(raw) {
-  const { data, content } = matter(raw);
-  const frontmatter = data;
+var NO_CACHE = {};
+var MalformedLockFileError = class extends Error {
+  constructor(reason, filePath) {
+    super(
+      `agent-locks: ${filePath ? `lock file "${filePath}"` : "lock file"} is malformed and was NOT used: ${reason}. Refusing to treat it as a valid lock: a partially-written or hand-edited lock file parses into a SMALLER claim rather than an error (a truncated YAML list does not fail, it shortens), which would silently hide whatever the missing part claimed. Inspect or delete the file.`
+    );
+    this.name = "MalformedLockFileError";
+  }
+};
+function isStringArray(value) {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+function validateFrontmatter(data, filePath) {
+  if (typeof data !== "object" || data === null) {
+    throw new MalformedLockFileError("its YAML frontmatter is missing or is not a mapping", filePath);
+  }
+  const fm = data;
+  if (typeof fm.id !== "string" || fm.id === "") {
+    throw new MalformedLockFileError("`id` is missing or not a non-empty string", filePath);
+  }
+  if (fm.status !== "active" && fm.status !== "done") {
+    throw new MalformedLockFileError(`\`status\` is ${JSON.stringify(fm.status)}, expected "active" or "done"`, filePath);
+  }
+  for (const field of ["created", "updated"]) {
+    if (typeof fm[field] !== "string" || !TIMESTAMP_RE.test(fm[field])) {
+      throw new MalformedLockFileError(`\`${field}\` is missing or not a YYYY-MM-DDTHH-MM-SS timestamp`, filePath);
+    }
+  }
+  if (!isStringArray(fm.scope) || fm.scope.length === 0) {
+    throw new MalformedLockFileError(
+      "`scope` is missing, empty, or not a list of strings \u2014 this is the field a truncated write mutilates silently",
+      filePath
+    );
+  }
+  if (fm.scope_history !== void 0) {
+    const history = fm.scope_history;
+    if (!Array.isArray(history) || !history.every(
+      (entry) => typeof entry === "object" && entry !== null && typeof entry.replaced_at === "string" && isStringArray(entry.scope)
+    )) {
+      throw new MalformedLockFileError(
+        "`scope_history` is present but is not a list of {replaced_at, scope} entries",
+        filePath
+      );
+    }
+  }
+  return fm;
+}
+function parseLockFile(raw, filePath) {
+  const { data, content } = matter(raw, NO_CACHE);
+  const frontmatter = validateFrontmatter(data, filePath);
   const body = parseBody(content);
   return {
     frontmatter,
@@ -178,6 +326,78 @@ function scopesOverlap(a, b) {
   return false;
 }
 
+// src/lock/scope.ts
+var ScopeAmendmentError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ScopeAmendmentError";
+  }
+};
+var EmptyScopeError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "EmptyScopeError";
+  }
+};
+function normalizeScope(patterns) {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const raw of patterns) {
+    const pattern = raw.trim();
+    if (pattern === "") continue;
+    if (seen.has(pattern)) continue;
+    seen.add(pattern);
+    out.push(pattern);
+  }
+  return out;
+}
+function scopesEqual(a, b) {
+  return a.length === b.length && a.every((pattern, i) => pattern === b[i]);
+}
+function applyScopeAmendment(current, request) {
+  const wantsReplace = request.scope !== void 0;
+  const wantsAdd = request.add_scope !== void 0;
+  if (wantsReplace && wantsAdd) {
+    throw new ScopeAmendmentError(
+      "Pass at most one of scope (replace the whole claim) / add_scope (widen the existing claim), not both. Applying them together would require guessing an order, and would produce a scope you did not ask for."
+    );
+  }
+  if (!wantsReplace && !wantsAdd) {
+    return { next: [...current], changed: false, removed: [] };
+  }
+  const currentNormalized = normalizeScope(current);
+  let next;
+  if (wantsReplace) {
+    next = normalizeScope(request.scope);
+    if (next.length === 0) {
+      throw new EmptyScopeError(
+        "scope must contain at least one non-empty glob pattern. A lock claiming nothing is worse than no lock at all: it still reads as an active claim in lock_query while matching no file in lock_check_conflict. To narrow a lock, pass the globs you are actually still touching; to give up the claim entirely, call lock_finish."
+      );
+    }
+  } else {
+    const additions = normalizeScope(request.add_scope);
+    if (additions.length === 0) {
+      throw new ScopeAmendmentError(
+        "add_scope must contain at least one non-empty glob pattern (an empty or whitespace-only list amends nothing)."
+      );
+    }
+    next = normalizeScope([...currentNormalized, ...additions]);
+  }
+  const removed = currentNormalized.filter((pattern) => !next.includes(pattern));
+  return { next, changed: !scopesEqual(currentNormalized, next), removed };
+}
+function formatPatterns(scope) {
+  if (scope.length === 0) return "(none)";
+  return scope.map((pattern) => `\`${pattern}\``).join(", ");
+}
+function formatScopeCheck(scope, dialect = "mcp", lockId) {
+  if (dialect === "mcp") {
+    return `Scope claimed: ${formatPatterns(scope)}. Does this still match what you are touching? Compare it against \`git status --porcelain\` / \`git diff --name-only\`, or call lock_check_drift, which does that comparison for you. If you are writing outside this scope, amend it now with lock_update's add_scope (widen) or scope (replace) \u2014 lock_check_conflict matches these globs, so every file outside them is invisible to any other agent looking for a conflict.`;
+  }
+  const id = lockId ?? "<lock-id>";
+  return `Scope claimed: ${formatPatterns(scope)}. Does this still match what you are touching? Compare it against \`git status --porcelain\` / \`git diff --name-only\`, or run \`agent-locks drift ${id}\`, which does that comparison for you. If you are writing outside this scope, amend it now with \`agent-locks update ${id} --add-scope <glob>\` (or \`--set-scope <glob>...\` to narrow an over-claim) \u2014 \`agent-locks check <glob>\` matches these globs, so every file outside them is invisible to any other agent looking for a conflict.`;
+}
+
 // src/lock/types.ts
 var DEFAULT_STALE_MINUTES = 60;
 function computePercentComplete(tasks) {
@@ -198,6 +418,7 @@ function toSummary(record, options = {}) {
     status: record.frontmatter.status,
     percentComplete: computePercentComplete(record.tasks),
     scope: record.frontmatter.scope,
+    ...record.frontmatter.scope_history && record.frontmatter.scope_history.length > 0 ? { scope_history: record.frontmatter.scope_history } : {},
     repository: record.frontmatter.repository ?? "",
     agent_id: record.frontmatter.agent_id,
     parent_agent_id: record.frontmatter.parent_agent_id,
@@ -286,22 +507,91 @@ async function listMarkdownFiles(dir) {
 }
 async function readRecord(filePath) {
   const raw = await fs2.readFile(filePath, "utf8");
-  const parsed = parseLockFile(raw);
+  const parsed = parseLockFile(raw, filePath);
   return { ...parsed, filePath };
 }
+async function readRecordWithRaw(filePath) {
+  const raw = await fs2.readFile(filePath, "utf8");
+  const parsed = parseLockFile(raw, filePath);
+  return { record: { ...parsed, filePath }, raw };
+}
+var tempFileCounter = 0;
 async function writeRecord(record) {
   const contents = serializeLockFile(record);
   const dir = path2.dirname(record.filePath);
   await fs2.mkdir(dir, { recursive: true });
-  const tmpPath = path2.join(dir, `.${path2.basename(record.filePath)}.${process.pid}.tmp`);
+  tempFileCounter += 1;
+  const tempPath = path2.join(
+    dir,
+    `.${path2.basename(record.filePath)}.tmp-${process.pid}-${Date.now()}-${tempFileCounter}`
+  );
   try {
-    await fs2.writeFile(tmpPath, contents, "utf8");
-    await fs2.rename(tmpPath, record.filePath);
-  } catch (err) {
-    await fs2.rm(tmpPath, { force: true }).catch(() => {
-    });
-    throw err;
+    await fs2.writeFile(tempPath, contents, "utf8");
+    await fs2.rename(tempPath, record.filePath);
+  } catch (error) {
+    await fs2.rm(tempPath, { force: true });
+    throw error;
   }
+}
+var ConcurrentUpdateError = class extends Error {
+  constructor(lockId) {
+    super(
+      `Lock "${lockId}" was modified by someone else while this update was being prepared, and the update was NOT applied. Re-read the lock and re-issue your change. Reporting this rather than overwriting is deliberate: a lost scope amendment leaves the amending agent believing its files are visible to peers when they are not \u2014 which is the exact failure this tool exists to prevent.`
+    );
+    this.name = "ConcurrentUpdateError";
+  }
+};
+async function mutateRecord(locksRoot, lockId, mutate) {
+  const ATTEMPTS = 8;
+  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+    const found = await findRecordPathById(locksRoot, lockId);
+    if (!found) throw new LockNotFoundError(lockId);
+    const release = await acquireFileLock(found);
+    if (!release) continue;
+    try {
+      const { record, raw } = await readRecordWithRaw(found);
+      const result = mutate(record);
+      const current = await fs2.readFile(found, "utf8").catch(() => null);
+      if (current !== raw) continue;
+      await writeRecord(record);
+      if (record.filePath !== found) await fs2.rm(found, { force: true });
+      return { record, result };
+    } finally {
+      await release();
+    }
+  }
+  throw new ConcurrentUpdateError(lockId);
+}
+var FILE_LOCK_STALE_MS = 3e4;
+async function acquireFileLock(filePath) {
+  const lockPath = `${filePath}.lock`;
+  try {
+    const handle = await fs2.open(lockPath, "wx");
+    await handle.close();
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    try {
+      const stat = await fs2.stat(lockPath);
+      if (Date.now() - stat.mtimeMs > FILE_LOCK_STALE_MS) {
+        await fs2.rm(lockPath, { force: true });
+      }
+    } catch {
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5 + Math.floor(Math.random() * 20)));
+    return null;
+  }
+  return async () => {
+    await fs2.rm(lockPath, { force: true });
+  };
+}
+async function findRecordPathById(locksRoot, lockId) {
+  for (const dir of [activeDir(locksRoot), doneDir(locksRoot)]) {
+    for (const filePath of await listMarkdownFiles(dir)) {
+      const record = await readRecord(filePath);
+      if (record.frontmatter.id === lockId) return filePath;
+    }
+  }
+  return null;
 }
 var lastReapFloor = null;
 var lastUnreadableLocks = [];
@@ -339,7 +629,7 @@ async function readAllRecords(locksRoot, status) {
   lastUnreadableLocks = unreadable;
   return records;
 }
-async function findRecordById(locksRoot, lockId) {
+async function findLockById(locksRoot, lockId) {
   for (const dir of [activeDir(locksRoot), doneDir(locksRoot)]) {
     const files = await listMarkdownFiles(dir);
     for (const filePath of files) {
@@ -367,6 +657,12 @@ async function createLock(locksRoot, params) {
   const now = formatTimestamp();
   const slug = slugify(params.title);
   const { filePath, id } = await uniqueFilePath(activeDir(locksRoot), now, slug);
+  const scope = normalizeScope(params.scope);
+  if (scope.length === 0) {
+    throw new EmptyScopeError(
+      "lock_create requires at least one non-empty glob pattern in scope (whitespace-only patterns are dropped, because a glob carrying stray whitespace matches nothing and would produce a lock that claims a file it can never be matched against)."
+    );
+  }
   const frontmatter = {
     id,
     agent_id: params.agent_id ?? null,
@@ -374,7 +670,7 @@ async function createLock(locksRoot, params) {
     status: "active",
     created: now,
     updated: now,
-    scope: params.scope,
+    scope,
     repository: params.repository ?? ""
   };
   const record = {
@@ -385,7 +681,7 @@ async function createLock(locksRoot, params) {
     notes: []
   };
   await writeRecord(record);
-  return { id, filePath };
+  return { id, filePath, scope, scopeCheck: formatScopeCheck(scope, params.dialect ?? "mcp", id) };
 }
 async function queryLocks(locksRoot, params) {
   const status = params.status ?? "active";
@@ -414,86 +710,117 @@ async function checkConflicts(locksRoot, scope, staleMinutesOverride) {
   const staleMinutes = resolveStaleMinutes(staleMinutesOverride);
   return conflicting.map((record) => toSummary(record, { staleMinutes }));
 }
+var EmptyUpdateError = class extends Error {
+  constructor(lockId) {
+    super(
+      `lock_update on "${lockId}" was given nothing to do. Pass task_text + done to check a task off, note to record something, scope/add_scope to amend the claim, or any combination. Refusing a no-op rather than bumping the timestamp silently: a call that only proves the agent is alive is lock_heartbeat, and saying so keeps the two distinguishable.`
+    );
+    this.name = "EmptyUpdateError";
+  }
+};
+var IncompleteTaskUpdateError = class extends Error {
+  constructor(lockId) {
+    super(
+      `lock_update on "${lockId}" received task_text without done (or done without task_text). Both are required together \u2014 which task, and which way to flip it. Guessing either one would silently record a state change nobody asked for.`
+    );
+    this.name = "IncompleteTaskUpdateError";
+  }
+};
 async function updateLock(locksRoot, params) {
-  const record = await findRecordById(locksRoot, params.lock_id);
-  if (!record) throw new LockNotFoundError(params.lock_id);
-  const task = record.tasks.find((t) => t.text === params.task_text);
-  if (!task) {
-    throw new TaskNotFoundError(
-      params.lock_id,
-      params.task_text,
-      record.tasks.map((t) => t.text)
+  const wantsTaskFlip = params.task_text !== void 0 || params.done !== void 0;
+  const wantsScopeAmendment = params.scope !== void 0 || params.add_scope !== void 0;
+  const wantsNote = params.note !== void 0 && params.note.trim() !== "";
+  if (!wantsTaskFlip && !wantsScopeAmendment && !wantsNote) {
+    throw new EmptyUpdateError(params.lock_id);
+  }
+  if (wantsTaskFlip && (params.task_text === void 0 || params.done === void 0)) {
+    throw new IncompleteTaskUpdateError(params.lock_id);
+  }
+  const { record, result } = await mutateRecord(locksRoot, params.lock_id, (record2) => {
+    const task = params.task_text === void 0 ? void 0 : record2.tasks.find((t) => t.text === params.task_text);
+    if (params.task_text !== void 0 && !task) {
+      throw new TaskNotFoundError(
+        params.lock_id,
+        params.task_text,
+        record2.tasks.map((t) => t.text)
+      );
+    }
+    const previousScope2 = record2.frontmatter.scope ?? [];
+    const amendment2 = applyScopeAmendment(previousScope2, params);
+    if (task) task.done = params.done;
+    if (params.note) {
+      record2.notes.push(params.note);
+    }
+    if (amendment2.changed) {
+      const now = formatTimestamp();
+      record2.frontmatter.scope_history = [
+        ...record2.frontmatter.scope_history ?? [],
+        { replaced_at: now, scope: previousScope2 }
+      ];
+      record2.frontmatter.scope = amendment2.next;
+      if (amendment2.removed.length > 0) {
+        record2.notes.push(
+          `Scope narrowed at ${now}: no longer claims ${amendment2.removed.map((g) => `\`${g}\``).join(", ")}. Those paths are now invisible to other agents' conflict checks.`
+        );
+      }
+    }
+    if (!record2.frontmatter.repository && params.repository) {
+      record2.frontmatter.repository = params.repository;
+    }
+    record2.frontmatter.updated = formatTimestamp();
+    return { amendment: amendment2, previousScope: previousScope2 };
+  });
+  const { amendment, previousScope } = result;
+  const scope = record.frontmatter.scope;
+  const warnings = [];
+  if (amendment.changed && record.frontmatter.status !== "active") {
+    warnings.push(
+      `This lock is already ${record.frontmatter.status}, and lock_check_conflict reads active locks only \u2014 so amending its scope changes nothing about what other agents can see.`
     );
   }
-  task.done = params.done;
-  if (params.note) {
-    record.notes.push(params.note);
+  if (amendment.removed.length > 0) {
+    warnings.push(
+      `This narrowed the claim: ${amendment.removed.map((g) => `\`${g}\``).join(", ")} are no longer covered, so any work you still have in flight there is now invisible to other agents' conflict checks.`
+    );
   }
-  record.frontmatter.updated = formatTimestamp();
-  await writeRecord(record);
-  return { id: record.frontmatter.id, percentComplete: computePercentComplete(record.tasks) };
+  return {
+    id: record.frontmatter.id,
+    percentComplete: computePercentComplete(record.tasks),
+    scope,
+    scopeChanged: amendment.changed,
+    ...amendment.changed ? { previousScope } : {},
+    ...amendment.removed.length > 0 ? { removedFromScope: amendment.removed } : {},
+    ...warnings.length > 0 ? { warnings } : {},
+    scopeCheck: formatScopeCheck(scope, params.dialect ?? "mcp", record.frontmatter.id)
+  };
 }
 async function finishLock(locksRoot, params) {
   await ensureDirs(locksRoot);
-  const activeFiles = await listMarkdownFiles(activeDir(locksRoot));
-  let record = null;
-  for (const filePath of activeFiles) {
-    const candidate = await readRecord(filePath);
-    if (candidate.frontmatter.id === params.lock_id) {
-      record = candidate;
-      break;
+  const { record } = await mutateRecord(locksRoot, params.lock_id, (record2) => {
+    if (record2.frontmatter.status !== "active") throw new LockNotActiveError(params.lock_id);
+    if (params.summary) record2.notes.push(params.summary);
+    const holder = record2.frontmatter.agent_id;
+    const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
+    if (foreign && !params.force) {
+      throw new LockNotOwnedError(params.lock_id, holder, params.agent_id);
     }
-  }
-  if (!record) {
-    const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
-    for (const filePath of doneFiles) {
-      const candidate = await readRecord(filePath);
-      if (candidate.frontmatter.id === params.lock_id) {
-        throw new LockNotActiveError(params.lock_id);
-      }
+    if (foreign) {
+      record2.notes.push(
+        `Force-finished by ${params.agent_id}, which is NOT the holder (${holder}). This note is the only record that the claim was ended by someone other than whoever made it.`
+      );
     }
-    throw new LockNotFoundError(params.lock_id);
-  }
-  if (params.summary) {
-    record.notes.push(params.summary);
-  }
-  const holder = record.frontmatter.agent_id;
-  const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
-  if (foreign && !params.force) {
-    throw new LockNotOwnedError(params.lock_id, holder, params.agent_id);
-  }
-  if (foreign) {
-    record.notes.push(
-      `Force-finished by ${params.agent_id}, which is NOT the holder (${holder}). This note is the only record that the claim was ended by someone other than whoever made it.`
-    );
-  }
-  record.frontmatter.status = "done";
-  record.frontmatter.updated = formatTimestamp();
-  const newFilePath = path2.join(doneDir(locksRoot), path2.basename(record.filePath));
-  const oldFilePath = record.filePath;
-  record.filePath = newFilePath;
-  await writeRecord(record);
-  await fs2.unlink(oldFilePath);
-  return { id: record.frontmatter.id, filePath: newFilePath };
+    record2.frontmatter.status = "done";
+    record2.frontmatter.updated = formatTimestamp();
+    record2.filePath = path2.join(doneDir(locksRoot), path2.basename(record2.filePath));
+  });
+  return { id: record.frontmatter.id, filePath: record.filePath };
 }
 async function heartbeatLock(locksRoot, params) {
-  const activeFiles = await listMarkdownFiles(activeDir(locksRoot));
-  for (const filePath of activeFiles) {
-    const record = await readRecord(filePath);
-    if (record.frontmatter.id === params.lock_id) {
-      record.frontmatter.updated = formatTimestamp();
-      await writeRecord(record);
-      return { id: record.frontmatter.id, updated: record.frontmatter.updated };
-    }
-  }
-  const doneFiles = await listMarkdownFiles(doneDir(locksRoot));
-  for (const filePath of doneFiles) {
-    const candidate = await readRecord(filePath);
-    if (candidate.frontmatter.id === params.lock_id) {
-      throw new LockNotActiveError(params.lock_id);
-    }
-  }
-  throw new LockNotFoundError(params.lock_id);
+  const { record } = await mutateRecord(locksRoot, params.lock_id, (record2) => {
+    if (record2.frontmatter.status !== "active") throw new LockNotActiveError(params.lock_id);
+    record2.frontmatter.updated = formatTimestamp();
+  });
+  return { id: record.frontmatter.id, updated: record.frontmatter.updated };
 }
 var LockNotStaleError = class extends Error {
   constructor(lockId, staleForSeconds, staleMinutes) {
@@ -532,31 +859,127 @@ async function reapStaleLocks(locksRoot, params = {}) {
     const summary = toSummary(record, { staleMinutes, now });
     reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
     if (params.dry_run) continue;
-    record.notes.push(
-      `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
-    );
-    record.frontmatter.status = "done";
-    record.frontmatter.updated = formatTimestamp();
-    const newFilePath = path2.join(doneDir(locksRoot), path2.basename(record.filePath));
-    const oldFilePath = record.filePath;
-    record.filePath = newFilePath;
     await ensureDirs(locksRoot);
-    await writeRecord(record);
-    await fs2.unlink(oldFilePath);
+    await mutateRecord(locksRoot, record.frontmatter.id, (fresh) => {
+      if (fresh.frontmatter.status !== "active") throw new LockNotActiveError(fresh.frontmatter.id);
+      fresh.notes.push(
+        `Auto-reaped: last touched ${fresh.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
+      );
+      fresh.frontmatter.status = "done";
+      fresh.frontmatter.updated = formatTimestamp();
+      fresh.filePath = path2.join(doneDir(locksRoot), path2.basename(fresh.filePath));
+    });
   }
   return reaped;
 }
 
+// src/lock/drift.ts
+async function checkScopeDrift(locksRoot, params) {
+  const record = await findLockById(locksRoot, params.lock_id);
+  if (!record) throw new LockNotFoundError(params.lock_id);
+  const cwd = params.cwd ?? process.cwd();
+  const claimedAt = parseTimestamp(record.frontmatter.created);
+  const [uncommitted, committed, inspectedWorktree, ignoredFilesNotExamined, worktreeCount] = await Promise.all([
+    listChangedFiles(cwd),
+    listCommittedFilesSince(cwd, claimedAt),
+    resolveRepoRoot(cwd),
+    countIgnoredFiles(cwd),
+    countWorktrees(cwd)
+  ]);
+  const changed = [.../* @__PURE__ */ new Set([...uncommitted, ...committed])].sort();
+  const scope = record.frontmatter.scope ?? [];
+  const outOfScope = [];
+  let inScopeCount = 0;
+  for (const file of changed) {
+    if (scopesOverlap([file], scope)) inScopeCount += 1;
+    else outOfScope.push(file);
+  }
+  const lockCreatedIn = record.frontmatter.repository ?? "";
+  const warnings = [];
+  if (worktreeCount > 1) {
+    warnings.push(
+      `This repository has ${worktreeCount} worktrees, and drift was computed against ${inspectedWorktree}. If you are editing a different one, the files below are not your files and a clean result here means nothing \u2014 agent-locks cannot tell which worktree a tool call came from, so pass base_dir to name yours explicitly.`
+    );
+  }
+  if (ignoredFilesNotExamined > 0) {
+    warnings.push(
+      `${ignoredFilesNotExamined} file(s) are ignored by git and were NOT examined. If your work includes any of them (a .env, a generated config, anything under an ignored build directory), this check cannot see it and cannot rule out drift in it.`
+    );
+  }
+  if (lockCreatedIn === "") {
+    warnings.push(
+      `This lock predates the \`repository\` frontmatter field, so agent-locks cannot confirm it was created in the working tree just inspected (${inspectedWorktree}). If it was not, the changed files below are not the ones its owner is editing.`
+    );
+  } else if (lockCreatedIn !== inspectedWorktree) {
+    warnings.push(
+      `This lock was created in ${lockCreatedIn}, but drift was computed against ${inspectedWorktree}. The changed files below are THIS working tree's, not the ones the lock's owner is editing \u2014 so a clean result here says nothing about whether their scope matches their work. Drift is only meaningful against your own lock, in your own worktree.`
+    );
+  }
+  if (record.frontmatter.status !== "active") {
+    warnings.push(
+      `This lock is already ${record.frontmatter.status}; amending the scope of finished work changes nothing about what other agents can see.`
+    );
+  }
+  if (changed.length === 0) {
+    warnings.push(
+      `Nothing was compared: this working tree has no uncommitted changes and no commits since the lock was created, so "no drift" here is not evidence the scope is right. If the work lives on commits made BEFORE ${record.frontmatter.created} (the moment this lock was claimed), compare the scope against \`git diff --name-only <base>...HEAD\` yourself.`
+    );
+  }
+  const vacuousPatterns = scope.filter((pattern) => staticPrefix(pattern) === "");
+  if (vacuousPatterns.length > 0) {
+    warnings.push(
+      `Scope pattern(s) ${vacuousPatterns.map((p) => `\`${p}\``).join(", ")} begin with a wildcard, so they match every path in the repository. Drift cannot fail against them \u2014 a "covered" result here is a property of the pattern, not evidence about your work. Narrow the scope to the paths you are really touching if you want this check to mean anything.`
+    );
+  }
+  const MAX_LISTED = 200;
+  const listed = outOfScope.slice(0, MAX_LISTED);
+  const truncated = outOfScope.length - listed.length;
+  if (truncated > 0) {
+    warnings.push(
+      `${truncated} further out-of-scope path(s) are not listed (the list is capped at ${MAX_LISTED}). outOfScopeCount carries the real total.`
+    );
+  }
+  const drifted = outOfScope.length > 0;
+  const outcome = changed.length === 0 ? "NOTHING_MEASURED" : drifted ? "DRIFTED" : "COVERED";
+  return {
+    lock_id: record.frontmatter.id,
+    title: record.title,
+    scope,
+    inspectedWorktree,
+    lockCreatedIn,
+    changedFileCount: changed.length,
+    uncommittedCount: uncommitted.length,
+    committedSinceClaimCount: committed.length,
+    ignoredFilesNotExamined,
+    inScopeCount,
+    outOfScope: listed,
+    outOfScopeCount: outOfScope.length,
+    outOfScopeTruncated: truncated,
+    outcome,
+    reliable: warnings.length === 0,
+    drifted,
+    warnings,
+    scopeCheck: formatScopeCheck(scope, params.dialect ?? "mcp", record.frontmatter.id)
+  };
+}
+
+// src/version.ts
+var VERSION = "0.2.0";
+
 // src/server.ts
 var SERVER_NAME = "agent-locks";
-var SERVER_VERSION = "0.1.0";
+var SERVER_VERSION = VERSION;
 var INSTRUCTIONS = `agent-locks: filesystem-based work-claiming locks shared across every git worktree of the current repository. No database \u2014 everything lives as markdown files under the repo's shared .git directory, so it is automatically invisible to git and never gets committed.
 
 Recommended workflow, in order:
 1. Before starting work on a set of files, call lock_query (default view, active locks only) to see what other agents are already doing, and call lock_check_conflict with the globs you're about to touch to see if anyone's active lock overlaps them. lock_check_conflict is purely informational \u2014 it never blocks you, it just gives you information to make your own judgment call with.
 2. If you decide to proceed, call lock_create to claim the work: give it a title, the glob patterns describing what you're touching, and a checklist of the tasks you plan to do.
 3. As you actually complete each task, call lock_update immediately \u2014 not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime. If you're doing a long stretch of work without a task boundary to check off, call lock_heartbeat periodically so your lock doesn't read as abandoned to anyone else watching.
-4. When the work is COMMITTED \u2014 not merely when the edits are done \u2014 call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
+4. Whenever the work grows past what you claimed, amend the scope in the same lock_update call: add_scope widens it (scope replaces it outright, which is how a lock that over-claimed gets narrowed). Do this when you notice, not at the end \u2014 lock_check_conflict matches the globs recorded RIGHT NOW, so until you amend, every file you have touched outside your scope is invisible to any other agent checking for a conflict, while your lock still reads to them as active and healthy.
+5. Before you finish, call lock_check_drift. It lists the changed files in your working tree that your scope does not cover, so you are not relying on having remembered step 4.
+6. When the work is COMMITTED \u2014 not merely when the edits are done \u2014 call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
+
+Why steps 4 and 5 are steps and not advice: scope going stale as the work grows is the failure mode most likely to bite you, and it is not a discipline problem. You declare scope at the moment you know LEAST about what you will touch, and work legitimately grows \u2014 a lock created for auth/** ends up spanning eight packages. Two sessions in sibling worktrees already came to independently rewrite the same files this way, each having run exactly the queries these instructions prescribe: the one that checked saw an active, healthy-looking lock whose globs did not mention any file it was about to edit. Amendments are recorded in the lock file with timestamps, never overwritten silently, and lock_create/lock_update echo the current scope back to you on every call so it stays in front of you rather than being written once and never seen again.
 
 Working in a different repository than the one you are rooted in: every tool accepts an optional base_dir \u2014 any path inside the target repository. Locks then resolve from THAT repository's shared .git rather than from the current working directory. Use it whenever you are about to write into another repo: a lock created where you happen to be standing, instead of where you are writing, is invisible to the one agent who needed to see it. A base_dir that is not inside a git repository is a hard error, never a silent fallback to the current directory.
 
@@ -579,7 +1002,7 @@ function createServer() {
     "lock_query",
     {
       title: "Query locks",
-      description: `Lists agent-locks work-claim locks for the current git repository (shared across all its worktrees). IMPORTANT: when \`status\` is omitted, this ONLY returns active locks \u2014 done/finished locks are excluded from the default view by design, so you see what is currently being worked on, not a full history. Pass status: "done" or status: "all" to include finished locks. Returns a compact summary per lock: {id, title, status, percentComplete, scope, agent_id, parent_agent_id, stale, staleForSeconds}. percentComplete is computed from the ratio of checked to total tasks on that lock (a lock with zero tasks reports 100). stale is true for an ACTIVE lock not touched in over stale_minutes (default ${DEFAULT_STALE_MINUTES}) \u2014 computed fresh on every call, never mutates anything; done locks are never stale.`,
+      description: `Lists agent-locks work-claim locks for the current git repository (shared across all its worktrees). IMPORTANT: when \`status\` is omitted, this ONLY returns active locks \u2014 done/finished locks are excluded from the default view by design, so you see what is currently being worked on, not a full history. Pass status: "done" or status: "all" to include finished locks. Returns a compact summary per lock: {id, title, status, percentComplete, scope, repository, agent_id, parent_agent_id, stale, staleForSeconds}, plus scope_history (the scopes this lock previously claimed, each with the timestamp it was retired) on any lock whose scope has been amended \u2014 that is what answers "was that file inside their claim at the moment I checked?". percentComplete is computed from the ratio of checked to total tasks on that lock (a lock with zero tasks reports 100). stale is true for an ACTIVE lock not touched in over stale_minutes (default ${DEFAULT_STALE_MINUTES}) \u2014 computed fresh on every call, never mutates anything; done locks are never stale.`,
       inputSchema: {
         status: z.enum(["active", "done", "all"]).optional().describe('Which locks to include. Defaults to "active" (done locks are excluded unless you explicitly ask for them).'),
         scope: z.union([z.string(), z.array(z.string())]).optional().describe(
@@ -654,10 +1077,12 @@ function createServer() {
     "lock_create",
     {
       title: "Create a lock",
-      description: 'Claims a piece of work by writing a new active lock file. Use this after you have decided to proceed (optionally having checked lock_query / lock_check_conflict first). tasks are created as a plain unchecked checklist; call lock_update as you complete each one. agent_id / parent_agent_id: pass your OWN id here only if you already know it from your own context (some orchestration harnesses hand a subagent an explicit id when dispatching it) \u2014 this server has no way to detect either value automatically (no MCP transport mechanism exposes a session/agent id to a stdio server subprocess). Omit them (or pass null) if you do not know them; they will be recorded as null, never fabricated. parent_agent_id specifically means "the id of whatever spawned you," if you are a subagent and happen to know it.',
+      description: `Claims a piece of work by writing a new active lock file. Use this after you have decided to proceed (optionally having checked lock_query / lock_check_conflict first). tasks are created as a plain unchecked checklist; call lock_update as you complete each one. agent_id / parent_agent_id: pass your OWN id here only if you already know it from your own context (some orchestration harnesses hand a subagent an explicit id when dispatching it) \u2014 this server has no way to detect either value automatically (no MCP transport mechanism exposes a session/agent id to a stdio server subprocess). Omit them (or pass null) if you do not know them; they will be recorded as null, never fabricated. parent_agent_id specifically means "the id of whatever spawned you," if you are a subagent and happen to know it. The result echoes back the scope it recorded, along with a prompt to keep re-deriving it: scope is not frozen at creation \u2014 amend it with lock_update's add_scope as the work grows, because lock_check_conflict matches whatever globs are recorded now, and any file outside them is invisible to every other agent looking for a conflict.`,
       inputSchema: {
         title: z.string().min(1).describe("Short human-readable title for this lock."),
-        scope: z.array(z.string()).min(1).describe("Glob patterns describing the files/paths this lock claims."),
+        scope: z.array(z.string()).min(1).describe(
+          "Glob patterns describing the files/paths this lock claims. Declare your best guess now and amend it later with lock_update \u2014 this is the moment you know least about what you will touch, and an unamended scope silently stops covering the files the work grows into."
+        ),
         tasks: z.array(z.string()).describe("Plain-text descriptions of the tasks you plan to do. All are created unchecked."),
         agent_id: z.string().nullable().optional().describe("Your own agent id, ONLY if you already know it from your context. Omit or pass null otherwise \u2014 never guess."),
         parent_agent_id: z.string().nullable().optional().describe("The id of whatever spawned you, ONLY if you already know it. Omit or pass null otherwise \u2014 never guess."),
@@ -685,23 +1110,65 @@ function createServer() {
     "lock_update",
     {
       title: "Update a lock",
-      description: "Flips one task on an existing lock to done or not-done, and optionally appends a note. Call this AS SOON as a task actually completes \u2014 not batched at the end of your work \u2014 so other agents watching lock_query see live progress. task_text must match an EXISTING task's text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock's actual task texts rather than silently doing nothing. Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).",
+      description: "Flips one task on an existing lock to done or not-done, amends the lock's scope, and/or appends a note \u2014 any combination, at least one required. Call this AS SOON as a task actually completes \u2014 not batched at the end of your work \u2014 so other agents watching lock_query see live progress. task_text must match an EXISTING task's text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock's actual task texts rather than silently doing nothing. task_text and done are required TOGETHER, and both are optional overall, so a scope amendment or a note does not have to flip a task to be recorded. AMENDING SCOPE: pass add_scope to widen the claim as the work grows (the common case \u2014 scope is declared when you know least about what you will touch), or scope to replace it outright, which is how a lock that over-claimed gets narrowed instead of left blocking others. The two are mutually exclusive. Amendments are appended to the lock file's scope_history with a timestamp rather than overwriting the old value silently, so a later reader can reconstruct what this lock claimed at the moment another agent checked it. The result ALWAYS echoes the lock's current scope, amended or not, along with a prompt to re-derive it against what you are really editing \u2014 because lock_check_conflict matches these globs, and any file outside them is invisible to every other agent looking for a conflict. Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).",
       inputSchema: {
         lock_id: z.string().describe("The id of the lock to update (as returned by lock_create or lock_query)."),
-        task_text: z.string().describe("The exact text of an existing task on this lock."),
-        done: z.boolean().describe("true to mark the task done, false to mark it not done."),
+        task_text: z.string().optional().describe("The exact text of an existing task on this lock. Required together with `done`; omit both if you are only amending scope or adding a note."),
+        done: z.boolean().optional().describe("true to mark the task done, false to mark it not done. Required together with `task_text`."),
+        add_scope: z.array(z.string()).optional().describe(
+          "Glob patterns to ADD to this lock's existing scope \u2014 the usual way to keep a claim honest as work grows beyond what you first declared. Adding a glob already claimed is a no-op and records no amendment. Mutually exclusive with `scope`."
+        ),
+        scope: z.array(z.string()).optional().describe(
+          "REPLACE this lock's scope with these glob patterns. Use to narrow a lock that over-claimed, rather than leaving it blocking work it is not really doing. Must contain at least one non-empty pattern \u2014 an empty scope would still read as an active claim in lock_query while matching nothing in lock_check_conflict. Mutually exclusive with `add_scope`."
+        ),
         note: z.string().optional().describe("Optional free-text note to append to the lock's Notes section."),
         base_dir: z.string().optional().describe(
           "Target a different repository by its working-tree path (or any path inside it). The lock is looked up in that repository's shared .git directory. Omit to use the current working directory."
         )
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      // destructiveHint: `scope` can REPLACE a whole claim, and a narrowing
+      // removes protection from files that may still be in flight — recoverable
+      // only by reading scope_history. A client using this hint to decide
+      // whether to confirm should be told that is possible.
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
     },
-    async ({ lock_id, task_text, done, note, base_dir }) => {
+    async ({ lock_id, task_text, done, note, scope, add_scope, base_dir }) => {
+      try {
+        const cwd = base_dir ?? process.cwd();
+        const [locksRoot, repoRoot] = await Promise.all([resolveLocksRoot(cwd), resolveRepoRoot(cwd)]);
+        const result = await updateLock(locksRoot, {
+          lock_id,
+          task_text,
+          done,
+          note,
+          scope,
+          add_scope,
+          repository: repoRoot
+        });
+        return textResult(JSON.stringify(result, null, 2));
+      } catch (error) {
+        return errorResult(error);
+      }
+    }
+  );
+  server.registerTool(
+    "lock_check_drift",
+    {
+      title: "Check a lock for scope drift",
+      description: 'Compares what a lock CLAIMS against what your working tree has actually changed, and lists every changed file the lock\'s scope does not cover. Run this before you finish, and any time the work has grown beyond what you first declared \u2014 scope is set at lock_create, the moment you know least about what you will touch, so drift is the normal outcome rather than a lapse. Changed files come from `git status` in the working tree you are calling from (staged, unstaged, and untracked alike, with renames counting both paths) PLUS every file touched by a commit made since the lock was claimed \u2014 committing as you go is how a branch normally grows, and `git status` alone cannot see it. Coverage is decided by the exact same glob matcher lock_check_conflict uses, so a file this reports as out of scope is precisely a file another agent\'s conflict check would NOT surface your lock for. Purely informational and read-only: it never amends anything. Fix what it reports with lock_update\'s add_scope. WHAT IT CANNOT SEE, so you do not read a clean result for more than it is worth: files git ignores (the count is reported, their drift is not knowable here); work committed BEFORE the lock was claimed; anything outside this working tree; and submodule contents. If nothing changed at all, nothing was compared \u2014 that is reported as outcome "NOTHING_MEASURED", which is NOT the same as "your scope is right". Prefer `outcome` over `drifted`: the boolean cannot tell "the scope covers the work" from "nothing was measured". Returns {lock_id, title, scope, inspectedWorktree, lockCreatedIn, changedFileCount, uncommittedCount, committedSinceClaimCount, ignoredFilesNotExamined, inScopeCount, outOfScope, outOfScopeCount, outOfScopeTruncated, outcome, drifted, warnings, scopeCheck}. READ THE WARNINGS: drift is only meaningful for your OWN lock in your OWN worktree, and running it against a lock created elsewhere compares that lock\'s scope to files its owner is not editing \u2014 a clean result there means nothing.',
+      inputSchema: {
+        lock_id: z.string().describe("The id of the lock to check (as returned by lock_create or lock_query)."),
+        base_dir: z.string().optional().describe(
+          "Target a different repository by its working-tree path (or any path inside it). Both the lock lookup AND the `git status` that supplies the changed files come from there instead of the current working directory."
+        )
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
+    },
+    async ({ lock_id, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
-        const result = await updateLock(locksRoot, { lock_id, task_text, done, note });
+        const result = await checkScopeDrift(locksRoot, { lock_id, cwd });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -802,10 +1269,12 @@ Usage:
   agent-locks list [options]            List locks. See "agent-locks list --help".
   agent-locks check <scope...>          Check whether any active lock overlaps the given glob(s). Informational only \u2014 exits 0 either way.
   agent-locks claim [options]           Create a new lock. See "agent-locks claim --help".
-  agent-locks update <lock-id> [options]  Mark a task done/undone on an existing lock. See "agent-locks update --help".
+  agent-locks update <lock-id> [options]  Mark a task done/undone, amend the scope, and/or add a note. See "agent-locks update --help".
+  agent-locks drift <lock-id> [options]   Show which of this working tree's changed files a lock's scope does NOT cover.
   agent-locks finish <lock-id> [--summary <text>] [--agent <id>] [--force]  Mark a lock done and archive it. Pass --agent so ownership can be checked; --force is required (and recorded) to end another session's claim.
   agent-locks heartbeat <lock-id>        Bump a lock's updated timestamp with no other change. See "Staleness detection" in the README.
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
+  agent-locks --version                 Print the version. Use it to tell which build a worktree is running.
   agent-locks --help                    Show this message.
 
 Every subcommand talks to the exact same lock store the MCP tools use \u2014 a human running "agent-locks status" and an agent calling lock_query see identical, live state.
@@ -836,13 +1305,55 @@ Options:
   --json                 Print raw JSON instead of a short confirmation line.`;
 var UPDATE_USAGE = `agent-locks update <lock-id> [options]
 
+Checks a task off, amends the lock's scope, and/or appends a note \u2014 any combination, at
+least one required.
+
+Amending scope is expected, not exceptional: you declare it at claim time, which is when
+you know least about what you will touch, and conflict checks match whatever globs are
+recorded now. Every file you touch outside them is invisible to any other agent looking
+for a conflict. Run "agent-locks drift <lock-id>" to see which of your changed files are
+currently uncovered.
+
 Options:
-  --task <text>          Required. Must match an existing task's text exactly.
-  --done                 Mark the task done (default if neither --done nor --undone given).
-  --undone               Mark the task not done.
+  --task <text>          Must match an existing task's text exactly. Optional \u2014 omit it if you
+                          are only amending scope or adding a note.
+  --done                 Mark the task done. Requires --task. Default when --task is given and
+                          neither --done nor --undone is.
+  --undone               Mark the task not done. Requires --task.
+  --add-scope <glob>     Add a glob to the lock's existing scope. Repeatable. The usual amendment.
+  --set-scope <glob>     Replace the lock's whole scope with these globs. Repeatable. Use to
+                          narrow a lock that over-claimed. Mutually exclusive with --add-scope.
   --note <text>           Append a free-text note to the lock.
   --base-dir <path>      Look up the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
+var DRIFT_USAGE = `agent-locks drift <lock-id> [options]
+
+Compares what the lock CLAIMS against what this working tree has actually changed, and
+lists every changed file the lock's scope does not cover. Changed files come from
+"git status" (staged, unstaged and untracked alike) PLUS every file touched by a commit
+made since the lock was claimed; coverage uses the same glob matcher the conflict check
+uses, so a file listed here is exactly a file another agent's conflict check would NOT
+surface this lock for.
+
+Read-only \u2014 it never amends anything. Fix what it reports with
+"agent-locks update <lock-id> --add-scope <glob>".
+
+WHAT THIS CANNOT SEE, so that a clean result is not read for more than it is worth:
+  - files git ignores (a .env, a generated config, an ignored build dir) \u2014 the count of
+    them is reported, but their names and their drift are not knowable here;
+  - work committed BEFORE the lock was claimed;
+  - anything outside this working tree, and the contents of submodules;
+  - and if nothing changed at all, nothing was compared \u2014 that is reported as
+    outcome: NOTHING_MEASURED, which is not the same as "your scope is right".
+
+Only meaningful for your own lock in your own worktree: run against a lock created
+elsewhere, it compares that lock's scope to files its owner is not editing, and a clean
+result means nothing. Read the warnings \u2014 they print above the verdict for a reason.
+
+Options:
+  --base-dir <path>      Look up the lock, and read the changed files, from a different
+                          repository (any path inside it).
+  --json                 Print raw JSON instead of a formatted report.`;
 var REAP_USAGE = `agent-locks reap [lock-id] [options]
 
 Reaps (finishes, same as "agent-locks finish") every currently-stale active lock, or a
@@ -864,6 +1375,39 @@ function printError(message) {
   console.error(message.startsWith(CLI_PREFIX) ? message : `${CLI_PREFIX}${message}`);
 }
 var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help", "--dry-run", "--force"]);
+var SUBCOMMAND_FLAGS = {
+  status: ["--base-dir", "--json"],
+  list: ["--status", "--scope", "--agent", "--text", "--stale-minutes", "--base-dir", "--json", "--help"],
+  check: ["--stale-minutes", "--base-dir", "--json", "--help"],
+  claim: ["--title", "--scope", "--task", "--agent", "--parent", "--base-dir", "--json", "--help"],
+  update: [
+    "--task",
+    "--done",
+    "--undone",
+    "--add-scope",
+    "--set-scope",
+    "--note",
+    "--base-dir",
+    "--json",
+    "--help"
+  ],
+  drift: ["--base-dir", "--json", "--help"],
+  finish: ["--summary", "--agent", "--force", "--base-dir", "--json", "--help"],
+  heartbeat: ["--base-dir", "--json", "--help"],
+  reap: ["--stale-minutes", "--dry-run", "--base-dir", "--json", "--help"]
+};
+function rejectUnknownFlags(command, parsed) {
+  const allowed = SUBCOMMAND_FLAGS[command];
+  if (!allowed) return;
+  const used = [...parsed.flags.keys(), ...parsed.boolFlags];
+  for (const flag of used) {
+    if (!allowed.includes(flag)) {
+      throw new CliUsageError(
+        `unknown flag ${flag} for "agent-locks ${command}". Accepted: ${allowed.join(", ")}. Refusing rather than ignoring it \u2014 a flag this build silently dropped would report success while doing nothing.`
+      );
+    }
+  }
+}
 function parseArgs(argv) {
   const positionals = [];
   const flags = /* @__PURE__ */ new Map();
@@ -1017,11 +1561,20 @@ async function cmdClaim(flags) {
     resolveLocksRoot(cwd),
     resolveRepoRoot(cwd)
   ]);
-  const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot });
+  const result = await createLock(locksRoot, {
+    title,
+    scope,
+    tasks,
+    agent_id,
+    parent_agent_id,
+    repository: repoRoot,
+    dialect: "cli"
+  });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
   } else {
     console.log(`Claimed "${title}" as lock ${result.id}`);
+    console.log(result.scopeCheck);
   }
 }
 async function cmdUpdate(flags) {
@@ -1032,20 +1585,96 @@ async function cmdUpdate(flags) {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError('agent-locks update requires a lock id as its first argument. See "agent-locks update --help".');
   const taskText = oneOf(flags.flags, "--task");
-  if (!taskText) throw new CliUsageError('agent-locks update requires --task. See "agent-locks update --help".');
   if (flags.boolFlags.has("--done") && flags.boolFlags.has("--undone")) {
     throw new CliUsageError("Pass at most one of --done / --undone.");
   }
-  const done = !flags.boolFlags.has("--undone");
+  if (!taskText && (flags.boolFlags.has("--done") || flags.boolFlags.has("--undone"))) {
+    throw new CliUsageError('--done / --undone name how to flip a task, so they require --task. See "agent-locks update --help".');
+  }
+  const addScope = allOf(flags.flags, "--add-scope");
+  const setScope = allOf(flags.flags, "--set-scope");
+  if (addScope.length > 0 && setScope.length > 0) {
+    throw new CliUsageError("Pass at most one of --add-scope (widen the claim) / --set-scope (replace it), not both.");
+  }
   const note = oneOf(flags.flags, "--note");
+  if (!taskText && addScope.length === 0 && setScope.length === 0 && note === void 0) {
+    throw new CliUsageError(
+      'agent-locks update needs something to do: --task (with --done/--undone), --add-scope, --set-scope, or --note. See "agent-locks update --help".'
+    );
+  }
+  const done = taskText === void 0 ? void 0 : !flags.boolFlags.has("--undone");
   const cwd = resolveBaseDir(flags);
-  const locksRoot = await resolveLocksRoot(cwd);
-  const result = await updateLock(locksRoot, { lock_id: lockId, task_text: taskText, done, note });
+  const [locksRoot, repoRoot] = await Promise.all([resolveLocksRoot(cwd), resolveRepoRoot(cwd)]);
+  const result = await updateLock(locksRoot, {
+    lock_id: lockId,
+    repository: repoRoot,
+    task_text: taskText,
+    done,
+    note,
+    add_scope: addScope.length > 0 ? addScope : void 0,
+    scope: setScope.length > 0 ? setScope : void 0,
+    dialect: "cli"
+  });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
-  } else {
+    return;
+  }
+  if (taskText !== void 0) {
     console.log(`Lock ${result.id}: "${taskText}" marked ${done ? "done" : "not done"} (${result.percentComplete}% complete overall).`);
   }
+  for (const warning of result.warnings ?? []) {
+    console.log(`warning: ${warning}`);
+  }
+  if (result.scopeChanged) {
+    console.log(`Lock ${result.id}: scope amended.`);
+    console.log(`  was: ${(result.previousScope ?? []).join(", ") || "(none)"}`);
+    console.log(`  now: ${result.scope.join(", ")}`);
+    if (result.removedFromScope?.length) {
+      console.log(`  NO LONGER CLAIMED: ${result.removedFromScope.join(", ")}`);
+    }
+  }
+  if (note !== void 0 && taskText === void 0 && !result.scopeChanged) {
+    console.log(`Lock ${result.id}: note recorded.`);
+  }
+  console.log(result.scopeCheck);
+}
+async function cmdDrift(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(DRIFT_USAGE);
+    return;
+  }
+  const lockId = flags.positionals[0];
+  if (!lockId) throw new CliUsageError('agent-locks drift requires a lock id as its first argument. See "agent-locks drift --help".');
+  const cwd = resolveBaseDir(flags);
+  const locksRoot = await resolveLocksRoot(cwd);
+  const result = await checkScopeDrift(locksRoot, { lock_id: lockId, cwd, dialect: "cli" });
+  if (flags.boolFlags.has("--json")) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(`Lock ${result.lock_id} \u2014 "${result.title}"`);
+  console.log(`claims: ${result.scope.join(", ") || "(none)"}`);
+  console.log(
+    `${result.changedFileCount} changed file(s) in ${result.inspectedWorktree} (${result.uncommittedCount} uncommitted, ${result.committedSinceClaimCount} committed since the claim); ${result.inScopeCount} covered by that scope.`
+  );
+  for (const warning of result.warnings) {
+    console.log(`warning: ${warning}`);
+  }
+  console.log(`outcome: ${result.outcome}`);
+  if (result.drifted) {
+    console.log(`
+files changed outside that scope (${result.outOfScopeCount}):`);
+    for (const file of result.outOfScope) console.log(`  ${file}`);
+    if (result.outOfScopeTruncated > 0) {
+      console.log(`  ... and ${result.outOfScopeTruncated} more (list capped)`);
+    }
+  } else if (result.outcome === "NOTHING_MEASURED") {
+    console.log("\nNo files were compared, so this says NOTHING about whether the scope is right.");
+  } else {
+    console.log("\nNo drift: every changed file is covered by the scope above.");
+  }
+  console.log(`
+${result.scopeCheck}`);
 }
 async function cmdFinish(flags) {
   const lockId = flags.positionals[0];
@@ -1109,35 +1738,47 @@ async function cmdReap(flags) {
 }
 async function runCli(argv) {
   const [command, ...rest] = argv;
+  const parsedFor = (name, args) => {
+    const parsed = parseArgs(args);
+    rejectUnknownFlags(name, parsed);
+    return parsed;
+  };
   if (command === void 0 || command === "--help" || command === "-h") {
     console.log(USAGE);
+    return 0;
+  }
+  if (command === "--version" || command === "-v") {
+    console.log(VERSION);
     return 0;
   }
   try {
     switch (command) {
       case "status":
-        await cmdStatus(parseArgs(rest));
+        await cmdStatus(parsedFor(command, rest));
         return 0;
       case "list":
-        await cmdList(parseArgs(rest));
+        await cmdList(parsedFor(command, rest));
         return 0;
       case "check":
-        await cmdCheck(parseArgs(rest));
+        await cmdCheck(parsedFor(command, rest));
         return 0;
       case "claim":
-        await cmdClaim(parseArgs(rest));
+        await cmdClaim(parsedFor(command, rest));
         return 0;
       case "update":
-        await cmdUpdate(parseArgs(rest));
+        await cmdUpdate(parsedFor(command, rest));
+        return 0;
+      case "drift":
+        await cmdDrift(parsedFor(command, rest));
         return 0;
       case "finish":
-        await cmdFinish(parseArgs(rest));
+        await cmdFinish(parsedFor(command, rest));
         return 0;
       case "heartbeat":
-        await cmdHeartbeat(parseArgs(rest));
+        await cmdHeartbeat(parsedFor(command, rest));
         return 0;
       case "reap":
-        await cmdReap(parseArgs(rest));
+        await cmdReap(parsedFor(command, rest));
         return 0;
       default:
         console.error(`agent-locks: unknown command "${command}".
@@ -1150,7 +1791,7 @@ async function runCli(argv) {
       printError(error.message);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError || error instanceof ScopeAmendmentError || error instanceof EmptyScopeError || error instanceof EmptyUpdateError || error instanceof IncompleteTaskUpdateError) {
       printError(error.message);
       return 1;
     }

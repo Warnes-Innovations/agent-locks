@@ -69,7 +69,13 @@ import { minimatch } from 'minimatch';
 
 const SPECIAL_CHARS = new Set(['*', '?', '[', ']', '{', '}', '(', ')', '!']);
 
-function staticPrefix(pattern: string): string {
+/**
+ * The literal (non-wildcard) leading portion of a pattern. Exported because
+ * drift detection needs to recognise a pattern whose prefix is EMPTY — such a
+ * pattern matches every path here, so a check against it cannot fail, and a
+ * result that could not have failed must say so rather than read as a pass.
+ */
+export function staticPrefix(pattern: string): string {
   let end = pattern.length;
   for (let i = 0; i < pattern.length; i++) {
     if (SPECIAL_CHARS.has(pattern[i])) {

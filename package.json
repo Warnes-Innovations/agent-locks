@@ -1,6 +1,6 @@
 {
   "name": "agent-locks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Filesystem-based, database-free work-claiming and coordination locks for AI coding agents (Claude Code and friends) working across multiple git worktrees of the same repository, exposed as an MCP stdio server.",
   "type": "module",
   "license": "MIT",
