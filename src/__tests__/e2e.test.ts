@@ -91,7 +91,7 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     expect(instructions).toContain('cannot detect your agent id');
   });
 
-  it('lists exactly the 9 documented tools — the roster cannot grow or shrink silently', async () => {
+  it('lists exactly the 8 documented tools — the roster cannot grow or shrink silently', async () => {
     // An exhaustive list, deliberately. Adding a tool must be a decision someone makes
     // in this file, not something that happens because a registerTool call was added
     // elsewhere: the MCP surface is what every agent on the machine can reach, and it
@@ -223,8 +223,8 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
       arguments: { lock_id: created.id, reason: 'was not actually done' },
     });
     expect(allowed.isError).toBeFalsy();
-    const reopened = toolResultJson(allowed) as { false_positive: boolean; previously_finished_by: string };
-    expect(reopened.false_positive).toBe(false);
+    const reopened = toolResultJson(allowed) as { verdict: string; previously_finished_by: string };
+    expect(reopened.verdict).toBe('not-a-reap');
     expect(reopened.previously_finished_by).toBe('holder');
   });
 

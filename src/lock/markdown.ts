@@ -108,9 +108,19 @@ function serializeBody(body: Body): string {
  * Without the bypass, two lock files whose raw text happens to be identical share
  * one frontmatter object — and store.ts mutates `record.frontmatter` in place
  * before writing. So a mutation to one lock silently appears on the other, and a
- * re-read returns the mutated object instead of what is actually on disk. Identical
- * text is not exotic: ids are second-resolution, so two locks created in the same
- * second with the same title and scope collide exactly.
+ * re-read returns the mutated object instead of what is actually on disk.
+ *
+ * WHEN THE TEXT ACTUALLY COLLIDES — stated precisely, because the first version of
+ * this comment got it wrong and a "do not simplify this away" note that cannot be
+ * reproduced is one a future editor deletes. Within a single repo the ids differ (a
+ * second lock in the same second gets a `-2` suffix), and across repos the
+ * `repository` field differs, so the ordinary case does NOT collide. It collides
+ * when `repository` is empty — the backward-compatibility path for locks written
+ * before that field existed, and anything constructing locks without it — and then
+ * only for the same second, title, scope and tasks.
+ *
+ * That is narrow, and it is still worth guarding: the failure is silent, it
+ * corrupts a claim rather than erroring, and the bypass costs one argument.
  *
  * Found 2026-09-04 by the scope-mutation tests, which reported a lock's scope as a
  * value that only ever existed in a different test's lock.

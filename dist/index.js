@@ -221,7 +221,7 @@ async function readEvents(locksRoot, options = {}) {
       continue;
     }
     const candidate = parsed;
-    if (typeof candidate !== "object" || candidate === null || candidate.event !== "reap" && candidate.event !== "reopen" || typeof candidate.lock_id !== "string") {
+    if (typeof candidate !== "object" || candidate === null || candidate.event !== "reap" && candidate.event !== "reopen" && candidate.event !== "touch" || typeof candidate.lock_id !== "string") {
       errors.push({ phase: "read", reason: `line ${i + 1}: not a recognised lock event` });
       continue;
     }
@@ -328,6 +328,14 @@ var DuplicateLockIdError = class extends Error {
       `Refusing to ${what} lock "${lockId}": ${destination} already exists. Moving onto it would destroy that lock \u2014 its scope, checklist, owner and progress \u2014 with no way to recover it. Two lock files share this id, which should be impossible; inspect the store by hand rather than letting a move pick a winner.`
     );
     this.name = "DuplicateLockIdError";
+  }
+};
+var ArchivedLockImmutableError = class extends Error {
+  constructor(lockId) {
+    super(
+      `Lock "${lockId}" is in the done archive and cannot be updated in place. The archive is the record of what was claimed, by whom, and how it ended; rewriting it silently changes that record with nothing to say so. If it genuinely needs to change, reopen it first \u2014 that transition is recorded.`
+    );
+    this.name = "ArchivedLockImmutableError";
   }
 };
 var LockNotActiveError = class extends Error {
@@ -450,6 +458,20 @@ async function withRecordLock(filePath, fn) {
     });
   }
 }
+async function recordTouch(locksRoot, record, previousUpdated, via) {
+  const idleMs = Date.now() - parseTimestamp(previousUpdated).getTime();
+  await appendEvent(locksRoot, {
+    event: "touch",
+    ts: record.frontmatter.updated,
+    lock_id: record.frontmatter.id,
+    repository: record.frontmatter.repository ?? "",
+    agent_id: record.frontmatter.agent_id,
+    idle_seconds: Math.max(0, Math.round(idleMs / 1e3)),
+    via,
+    tasks_total: record.tasks.length,
+    tasks_done: record.tasks.filter((t) => t.done).length
+  });
+}
 async function findRecordById(locksRoot, lockId) {
   for (const dir of [activeDir(locksRoot), doneDir(locksRoot)]) {
     const files = await listMarkdownFiles(dir);
@@ -570,6 +592,7 @@ var EmptyScopeError = class extends Error {
 async function updateLock(locksRoot, params) {
   const found = await findRecordById(locksRoot, params.lock_id);
   if (!found) throw new LockNotFoundError(params.lock_id);
+  if (found.frontmatter.status === "done") throw new ArchivedLockImmutableError(params.lock_id);
   return withRecordLock(found.filePath, async () => {
     let record;
     try {
@@ -577,6 +600,7 @@ async function updateLock(locksRoot, params) {
     } catch {
       throw new LockNotFoundError(params.lock_id);
     }
+    if (record.frontmatter.status === "done") throw new ArchivedLockImmutableError(params.lock_id);
     const holder = record.frontmatter.agent_id;
     const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
     if (foreign && !params.force) {
@@ -626,8 +650,10 @@ async function updateLock(locksRoot, params) {
     if (params.note) {
       record.notes.push(params.note);
     }
+    const previousUpdated = record.frontmatter.updated;
     record.frontmatter.updated = formatTimestamp();
     await writeRecord(record);
+    await recordTouch(locksRoot, record, previousUpdated, "update");
     return {
       id: record.frontmatter.id,
       percentComplete: computePercentComplete(record.tasks),
@@ -675,6 +701,7 @@ async function finishLock(locksRoot, params) {
     }
     record.frontmatter.status = "done";
     record.frontmatter.finished_by = foreign ? "force" : "holder";
+    const previousUpdated = record.frontmatter.updated;
     record.frontmatter.updated = formatTimestamp();
     const newFilePath = path3.join(doneDir(locksRoot), path3.basename(record.filePath));
     await assertDestinationFree(newFilePath, params.lock_id, "archive");
@@ -682,6 +709,7 @@ async function finishLock(locksRoot, params) {
     record.filePath = newFilePath;
     await writeRecord(record);
     await fs3.unlink(oldFilePath);
+    await recordTouch(locksRoot, record, previousUpdated, "finish");
     return { id: record.frontmatter.id, filePath: newFilePath };
   });
 }
@@ -692,8 +720,10 @@ async function heartbeatLock(locksRoot, params) {
     if (found.frontmatter.id === params.lock_id) {
       return withRecordLock(filePath, async () => {
         const record = await readRecord(filePath);
+        const previousUpdated = record.frontmatter.updated;
         record.frontmatter.updated = formatTimestamp();
         await writeRecord(record);
+        await recordTouch(locksRoot, record, previousUpdated, "heartbeat");
         return { id: record.frontmatter.id, updated: record.frontmatter.updated };
       });
     }
@@ -813,6 +843,8 @@ async function reopenLock(locksRoot, params) {
     record = await readRecord(doneFilePath);
     const finishedBy = record.frontmatter.finished_by ?? null;
     const wasReaped = finishedBy === "reap";
+    const reopenerIsHolder = params.agent_id != null && record.frontmatter.agent_id != null && agentMatches(record.frontmatter.agent_id, params.agent_id);
+    const verdict = finishedBy === null ? "unknown" : !wasReaped ? "not-a-reap" : reopenerIsHolder ? "false-positive" : "reaped-by-other";
     const reason = params.reason?.trim() ?? "";
     if (!wasReaped && reason === "") throw new ReopenReasonRequiredError(params.lock_id, finishedBy);
     const priorReap = wasReaped ? await lastReapEventFor(locksRoot, params.lock_id) : null;
@@ -836,14 +868,14 @@ async function reopenLock(locksRoot, params) {
       agent_id: params.agent_id ?? null,
       finished_by: finishedBy,
       reason: reason === "" ? null : reason,
-      false_positive: wasReaped,
+      verdict,
       idle_at_reap_seconds: priorReap?.idle_seconds ?? null
     });
     return {
       id: record.frontmatter.id,
       filePath: newFilePath,
       previously_finished_by: finishedBy,
-      false_positive: wasReaped
+      verdict
     };
   });
 }
@@ -862,7 +894,7 @@ Recommended workflow, in order:
 
 Working in a different repository than the one you are rooted in: every tool accepts an optional base_dir \u2014 any path inside the target repository. Locks then resolve from THAT repository's shared .git rather than from the current working directory. Use it whenever you are about to write into another repo: a lock created where you happen to be standing, instead of where you are writing, is invisible to the one agent who needed to see it. A base_dir that is not inside a git repository is a hard error, never a silent fallback to the current directory.
 
-Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) \u2014 true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict \u2014 nothing is ever cleaned up as a side effect of reading. If your OWN lock vanishes mid-work, it was reaped: call lock_reopen to get it back, rather than re-claiming. If you see someone else's stale lock blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it, so it can't be used as a workaround to force-finish someone else's live work. A supplied stale_minutes may only LENGTHEN the window (it is floored at the default), so a small value cannot be used to reap live locks.
+Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) \u2014 true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict \u2014 nothing is ever cleaned up as a side effect of reading. If your OWN lock vanishes mid-work, it was reaped: call lock_reopen to get it back, rather than re-claiming. If you see someone else's stale lock blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it. A supplied stale_minutes may only LENGTHEN the window \u2014 it is floored at the CONFIGURED default \u2014 so the parameter cannot be used to reap live locks. Note the floor is the configured default rather than a constant: AGENT_LOCKS_STALE_MINUTES sets it, and where that is set small, reap does finish live locks.
 
 Honesty note on agent identity: this server cannot detect your agent id or your parent agent's id automatically \u2014 no MCP transport mechanism exposes that. Pass agent_id/parent_agent_id to lock_create only if you already know them from your own context (e.g. an orchestration harness gave you an explicit id); otherwise omit them and they will be recorded as null. Do not guess or fabricate an id.`;
 function textResult(text) {
@@ -987,7 +1019,7 @@ function createServer() {
     "lock_update",
     {
       title: "Update a lock",
-      description: "Changes an existing lock: flips a task to done/not-done, appends a note, and/or CHANGES ITS SCOPE. Call this AS SOON as a task actually completes \u2014 not batched at the end of your work \u2014 so other agents watching lock_query see live progress. task_text must match an EXISTING task's text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock's actual task texts rather than silently doing nothing. SCOPE DRIFT IS THE NORMAL CASE: you claim what you expect to touch, then find the job reaches one more file. Use add_scope to EXTEND THE EXISTING CLAIM rather than creating a second lock \u2014 a second lock for one job splits the task checklist and leaves a window where the new paths are claimed by nobody. At least one of task_text, note, add_scope or remove_scope is required; an update that would change nothing is refused rather than silently bumping the timestamp (use lock_heartbeat for that). Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).",
+      description: "Changes an existing lock: flips a task to done/not-done, appends a note, and/or CHANGES ITS SCOPE. Call this AS SOON as a task actually completes \u2014 not batched at the end of your work \u2014 so other agents watching lock_query see live progress. task_text must match an EXISTING task's text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock's actual task texts rather than silently doing nothing. SCOPE DRIFT IS THE NORMAL CASE: you claim what you expect to touch, then find the job reaches one more file. Use add_scope to EXTEND THE EXISTING CLAIM rather than creating a second lock \u2014 a second lock for one job splits the task checklist and leaves a window where the new paths are claimed by nobody. At least one of task_text, note, add_scope or remove_scope is required; an update that would change nothing is refused rather than silently bumping the timestamp (use lock_heartbeat for that). ACTIVE locks only: the done archive is an audit record and is not rewritable in place. If an archived lock genuinely needs to change, lock_reopen it first.",
       inputSchema: {
         lock_id: z.string().describe("The id of the lock to update (as returned by lock_create or lock_query)."),
         agent_id: z.string().optional().describe(
@@ -1105,7 +1137,7 @@ function createServer() {
     "lock_reap",
     {
       title: "Reap stale lock(s)",
-      description: "Finishes (moves to the done archive, same mechanism as lock_finish) every ACTIVE lock currently computed as stale, or a single specific one if lock_id is given. This is an explicit, deliberate mutation \u2014 never a side effect of lock_query or lock_check_conflict reading state. Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (with how long) rather than finished by its owning agent, so the done archive stays honest. If lock_id is given but that lock is NOT actually stale, this errors rather than reaping it \u2014 reap cannot be used as a workaround to force-finish someone else's live work. A supplied stale_minutes may only LENGTHEN the window; it is floored at the default, so it cannot shorten the way to a live lock. Pass dry_run: true to see what WOULD be reaped without writing anything.",
+      description: "Finishes (moves to the done archive, same mechanism as lock_finish) every ACTIVE lock currently computed as stale, or a single specific one if lock_id is given. This is an explicit, deliberate mutation \u2014 never a side effect of lock_query or lock_check_conflict reading state. Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (with how long) rather than finished by its owning agent, so the done archive stays honest. If lock_id is given but that lock is NOT actually stale, this errors rather than reaping it. A supplied stale_minutes may only LENGTHEN the window; it is floored at the CONFIGURED default, so the parameter cannot shorten the way to a live lock. The floor is that configured default and not a constant, so AGENT_LOCKS_STALE_MINUTES set small DOES let reap finish live locks \u2014 the environment variable is the operator-level escape, the parameter is the part that is closed. Pass dry_run: true to see what WOULD be reaped without writing anything.",
       inputSchema: {
         lock_id: z.string().optional().describe("Reap only this lock id. Omit to reap every currently-stale active lock."),
         stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
@@ -1237,9 +1269,12 @@ var REAP_USAGE = `agent-locks reap [lock-id] [options]
 
 Reaps (finishes, same as "agent-locks finish") every currently-stale active lock, or a
 single one if lock-id is given. Refuses to reap a named lock-id that isn't actually
-stale \u2014 never a back door to force-finish someone else's live work.
-A supplied --stale-minutes may only LENGTHEN the window, never shorten it: it is
-floored at the configured default, so this cannot be used to reap live locks.
+stale, and a supplied --stale-minutes may only LENGTHEN the window: it is floored at
+the CONFIGURED default, so the flag cannot be used to reap live locks.
+
+The floor is the configured default, not a constant: AGENT_LOCKS_STALE_MINUTES sets it,
+and with that set small reap WILL finish live locks. That is the deliberate
+operator-level escape; the per-call flag is the part that is closed.
 
 Options:
   --stale-minutes <n>    Override the staleness threshold for this call only. Defaults
@@ -1247,6 +1282,48 @@ Options:
   --dry-run              Report what would be reaped without writing anything.
   --base-dir <path>      Reap locks in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
+var FINISH_USAGE = `agent-locks finish <lock-id> [options]
+
+Marks an active lock done and moves it into the done archive.
+
+Options:
+  --summary <text>       Closing summary appended to the lock's Notes before archiving.
+  --agent <id>           Your own agent id. Supply it so ownership can be checked:
+                          finishing a lock held by a DIFFERENT session is refused unless
+                          --force is given. Omit it and no check is possible.
+  --force                Deliberately end another session's claim. Recorded in the archive.
+  --base-dir <path>      Look up the lock in a different repository (any path inside it).
+  --json                 Print raw JSON instead of a short confirmation line.`;
+var HEARTBEAT_USAGE = `agent-locks heartbeat <lock-id> [options]
+
+Bumps ONLY the lock's updated timestamp, so it does not read as abandoned during a long
+stretch of work with no task boundary to check off. Completing a task already bumps it.
+Active locks only.
+
+Options:
+  --base-dir <path>      Look up the lock in a different repository (any path inside it).
+  --json                 Print raw JSON instead of a short confirmation line.`;
+var CHECK_USAGE = `agent-locks check <scope...> [options]
+
+Reports which active locks overlap the given glob(s). Informational only: it never
+blocks and exits 0 either way, so you make your own call about what to do.
+
+Uses the deliberately over-inclusive overlap heuristic, which errs toward reporting a
+conflict. That is right for a warning and WRONG for a gate \u2014 a gate needs exact
+coverage, not "might overlap".
+
+Options:
+  --stale-minutes <n>    Override the staleness threshold for this call only.
+  --base-dir <path>      Check locks in a different repository (any path inside it).
+  --json                 Print raw JSON instead of a formatted table.`;
+var STATUS_USAGE = `agent-locks status [options]
+
+Human-readable summary of the active locks in this repository.
+
+Options:
+  --stale-minutes <n>    Override the staleness threshold for this call only.
+  --base-dir <path>      Report on a different repository (any path inside it).
+  --json                 Print raw JSON instead of a formatted table.`;
 var CliUsageError = class extends Error {
 };
 var CLI_PREFIX = "agent-locks: ";
@@ -1340,6 +1417,10 @@ function resolveBaseDir(flags) {
   return raw ?? process.cwd();
 }
 async function cmdStatus(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(STATUS_USAGE);
+    return;
+  }
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {});
@@ -1378,6 +1459,10 @@ async function cmdList(flags) {
   }
 }
 async function cmdCheck(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(CHECK_USAGE);
+    return;
+  }
   const scope = flags.positionals;
   if (scope.length === 0) {
     throw new CliUsageError('agent-locks check requires at least one scope glob, e.g. "agent-locks check src/auth/**".');
@@ -1490,12 +1575,25 @@ async function cmdReopen(flags) {
     return;
   }
   console.log(`Lock ${result.id} reopened and returned to active.`);
-  if (result.false_positive) {
-    console.log(
-      `  This lock had been AUTO-REAPED, so the reap was a false positive: the holder was still working. Recorded in the event log as evidence the staleness threshold is too short.`
-    );
-  } else {
-    console.log(`  Previously finished by: ${result.previously_finished_by ?? "an unrecorded path"}.`);
+  switch (result.verdict) {
+    case "false-positive":
+      console.log(
+        `  This lock had been AUTO-REAPED and you are its holder, so the reap was a false positive. Recorded in the event log as evidence the staleness threshold is too short.`
+      );
+      break;
+    case "reaped-by-other":
+      console.log(
+        `  This lock had been auto-reaped, but you are not the holder on record, so this is NOT counted as evidence about the staleness threshold.`
+      );
+      break;
+    case "not-a-reap":
+      console.log(`  Previously finished by: ${result.previously_finished_by}. Not a reap, so it says nothing about the threshold.`);
+      break;
+    case "unknown":
+      console.log(
+        `  This lock predates finish-provenance, so how it ended is not recoverable and it is scored as unknown rather than guessed either way.`
+      );
+      break;
   }
 }
 async function cmdEvents(flags) {
@@ -1504,8 +1602,8 @@ async function cmdEvents(flags) {
     return;
   }
   const type = oneOf(flags.flags, "--type");
-  if (type !== void 0 && type !== "reap" && type !== "reopen") {
-    throw new CliUsageError(`--type must be one of reap, reopen (got "${type}").`);
+  if (type !== void 0 && type !== "reap" && type !== "reopen" && type !== "touch") {
+    throw new CliUsageError(`--type must be one of reap, reopen, touch (got "${type}").`);
   }
   const limitRaw = oneOf(flags.flags, "--limit");
   let limit;
@@ -1513,16 +1611,18 @@ async function cmdEvents(flags) {
     limit = Number(limitRaw);
     if (!Number.isInteger(limit) || limit <= 0) throw new CliUsageError(`--limit must be a positive integer (got "${limitRaw}").`);
   }
+  const lockFilter = oneOf(flags.flags, "--lock");
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
-  const events = await readEvents(locksRoot, { type, lock_id: oneOf(flags.flags, "--lock"), limit });
+  const events = await readEvents(locksRoot, { type, lock_id: lockFilter, limit });
+  const all = type === void 0 && limit === void 0 && lockFilter === void 0 ? events : await readEvents(locksRoot, {});
   warnEventLog();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(events, null, 2));
     return;
   }
   if (events.length === 0) {
-    console.log("No lock events recorded. Nothing has been reaped or reopened in this repository.");
+    console.log("No matching lock events recorded.");
     return;
   }
   for (const event of events) {
@@ -1531,23 +1631,43 @@ async function cmdEvents(flags) {
         `${event.ts}  REAP    ${event.lock_id}
     idle ${event.idle_seconds}s at a ${event.threshold_minutes}m threshold; ${event.tasks_done}/${event.tasks_total} tasks done; holder ${event.agent_id ?? "(none recorded)"}`
       );
+    } else if (event.event === "touch") {
+      console.log(
+        `${event.ts}  TOUCH   ${event.lock_id}
+    alive after ${event.idle_seconds}s idle (via ${event.via}); ${event.tasks_done}/${event.tasks_total} tasks done`
+      );
     } else {
       console.log(
         `${event.ts}  REOPEN  ${event.lock_id}
-    ${event.false_positive ? "FALSE POSITIVE \u2014 reaped while alive" : `from a ${event.finished_by ?? "unrecorded"} finish`}` + (event.idle_at_reap_seconds === null ? "" : `; had been idle ${event.idle_at_reap_seconds}s when reaped`) + (event.reason === null ? "" : `; reason: ${event.reason}`)
+    ${event.verdict}` + (event.idle_at_reap_seconds === null ? "" : `; had been idle ${event.idle_at_reap_seconds}s when reaped`) + (event.reason === null ? "" : `; reason: ${event.reason}`)
       );
     }
   }
-  const falsePositives = events.filter((e) => e.event === "reopen" && e.false_positive).length;
-  const reaps = events.filter((e) => e.event === "reap").length;
-  if (reaps > 0) {
+  const reaps = all.filter((e) => e.event === "reap").length;
+  const falsePositives = all.filter((e) => e.event === "reopen" && e.verdict === "false-positive").length;
+  const liveIntervals = all.filter((e) => e.event === "touch").map((e) => e.idle_seconds);
+  console.log("");
+  if (liveIntervals.length > 0) {
+    const sorted = [...liveIntervals].sort((a, b) => a - b);
+    const pct = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
     console.log(
-      `
-${reaps} reap(s), ${falsePositives} later reopened as false positive(s). Tune the threshold above the TAIL of the idle intervals that turned out to be alive, not their median.`
+      `Live inter-touch intervals (n=${sorted.length}): median ${pct(0.5)}s, p95 ${pct(0.95)}s, max ${sorted[sorted.length - 1]}s.`
     );
+    console.log(
+      `  The threshold must sit above the TAIL of this distribution, not its median \u2014 a threshold at the median reaps half of all live locks.`
+    );
+  } else {
+    console.log("No live inter-touch intervals recorded yet, so the threshold cannot be argued DOWN from this log.");
   }
+  console.log(
+    `${reaps} reap(s); ${falsePositives} later reopened by their holder, which is a LOWER BOUND on wrong reaps \u2014 a holder who never noticed, or who re-claimed instead of reopening, leaves no record at all.`
+  );
 }
 async function cmdFinish(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(FINISH_USAGE);
+    return;
+  }
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError("agent-locks finish requires a lock id as its first argument.");
   const summary = oneOf(flags.flags, "--summary");
@@ -1563,6 +1683,10 @@ async function cmdFinish(flags) {
   }
 }
 async function cmdHeartbeat(flags) {
+  if (flags.boolFlags.has("--help")) {
+    console.log(HEARTBEAT_USAGE);
+    return;
+  }
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError("agent-locks heartbeat requires a lock id as its first argument.");
   const cwd = resolveBaseDir(flags);
@@ -1586,6 +1710,7 @@ async function cmdReap(flags) {
   const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
   warnUnreadable();
+  warnEventLog();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));
     return;
@@ -1656,7 +1781,7 @@ async function runCli(argv) {
       printError(error.message);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError || error instanceof LockNotDoneError || error instanceof NoOpUpdateError || error instanceof ScopeNotHeldError || error instanceof EmptyScopeError || error instanceof ReopenReasonRequiredError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError || error instanceof LockNotDoneError || error instanceof ArchivedLockImmutableError || error instanceof NoOpUpdateError || error instanceof ScopeNotHeldError || error instanceof EmptyScopeError || error instanceof ReopenReasonRequiredError) {
       printError(error.message);
       return 1;
     }

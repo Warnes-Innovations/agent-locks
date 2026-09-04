@@ -528,13 +528,15 @@ describe('runCli update --add-scope / --remove-scope (transition 5)', () => {
 describe('runCli reopen / events (transition 9 and its instrument)', () => {
   it('reopen returns a reaped lock to active and SAYS the reap was a false positive', async () => {
     const { logs } = captureConsole();
-    await runCliIn(repo, ['claim', '--title', 'Long quiet job', '--scope', 'src/a/**']);
+    await runCliIn(repo, ['claim', '--title', 'Long quiet job', '--scope', 'src/a/**', '--agent', 'Red [bd9522]']);
     const lockId = logs[logs.length - 1].split(' ').pop() as string;
 
     await sleepPastStaleThreshold();
     await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
 
     logs.length = 0;
+    // The holder reopening its OWN reaped lock is the only case that scores as
+    // evidence about the threshold — so the identity has to be supplied on both ends.
     const code = await runCliIn(repo, ['reopen', lockId, '--agent', 'Red [bd9522]']);
     expect(code).toBe(0);
     const out = logs.join('\n');
@@ -564,26 +566,43 @@ describe('runCli reopen / events (transition 9 and its instrument)', () => {
 
   it('events prints the reap/reopen history and the tuning instruction', async () => {
     const { logs } = captureConsole();
-    await runCliIn(repo, ['claim', '--title', 'Quiet job', '--scope', 'src/a/**']);
+    await runCliIn(repo, ['claim', '--title', 'Quiet job', '--scope', 'src/a/**', '--agent', 'Red [bd9522]']);
     const lockId = logs[logs.length - 1].split(' ').pop() as string;
 
     logs.length = 0;
     await runCliIn(repo, ['events']);
-    expect(logs.join('\n')).toContain('No lock events recorded');
+    expect(logs.join('\n')).toContain('No matching lock events recorded');
 
     await sleepPastStaleThreshold();
     await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
-    await runCliIn(repo, ['reopen', lockId]);
+    await runCliIn(repo, ['reopen', lockId, '--agent', 'Red [bd9522]']);
 
     logs.length = 0;
     await runCliIn(repo, ['events']);
     const out = logs.join('\n');
     expect(out).toContain('REAP');
     expect(out).toContain('REOPEN');
-    expect(out).toContain('FALSE POSITIVE');
-    // Tune on the TAIL, not the median — the instruction travels with the data.
-    expect(out).toMatch(/1 reap\(s\), 1 later reopened as false positive/);
-    expect(out).toContain('TAIL');
+    expect(out).toContain('false-positive');
+    expect(out).toMatch(/1 reap\(s\); 1 later reopened by their holder/);
+    // The tally must name itself a LOWER BOUND: a holder who never noticed, or who
+    // re-claimed instead of reopening, leaves no record at all.
+    expect(out).toContain('LOWER BOUND');
+    // With no touch events yet, the log must SAY it cannot argue the threshold down,
+    // rather than printing a distribution it does not have.
+    expect(out).toContain('cannot be argued DOWN');
+
+    // Once a live lock is touched, the distribution appears and carries the
+    // tune-on-the-tail instruction with it.
+    logs.length = 0;
+    await runCliIn(repo, ['claim', '--title', 'Live one', '--scope', 'src/z/**', '--task', 'tz', '--agent', 'Red [bd9522]']);
+    const liveId = logs[logs.length - 1].split(' ').pop() as string;
+    await runCliIn(repo, ['heartbeat', liveId]);
+    logs.length = 0;
+    await runCliIn(repo, ['events']);
+    const out2 = logs.join('\n');
+    expect(out2).toContain('TOUCH');
+    expect(out2).toMatch(/Live inter-touch intervals \(n=\d+\)/);
+    expect(out2).toContain('TAIL');
   });
 
   it('warns when the event log is corrupt, so empty and broken are distinguishable', async () => {
@@ -597,5 +616,35 @@ describe('runCli reopen / events (transition 9 and its instrument)', () => {
     expect(code).toBe(0);
     expect(errors.join('\n')).toContain('problem(s) with the event log');
     expect(errors.join('\n')).toContain('does NOT mean nothing happened');
+  });
+});
+
+describe('CLI surface roster', () => {
+  // The exhaustive counterpart to the MCP roster test. Without it, `finish --help`,
+  // `check --help` and `heartbeat --help` printed a usage ERROR and exited 1 — help
+  // that fails is worse than absent help, because it reads as "you used it wrong".
+  const SUBCOMMANDS = [
+    'status', 'list', 'check', 'claim', 'update',
+    'finish', 'heartbeat', 'reap', 'reopen', 'events',
+  ];
+
+  it('every subcommand prints its own help and exits 0 for --help', async () => {
+    for (const cmd of SUBCOMMANDS) {
+      const { logs, errors } = captureConsole();
+      const code = await runCliIn(repo, [cmd, '--help']);
+      expect(code, `${cmd} --help exited ${code}`).toBe(0);
+      expect(logs.join('\n'), `${cmd} --help printed no usage`).toContain(`agent-locks ${cmd}`);
+      expect(errors.join('\n'), `${cmd} --help wrote to stderr`).toBe('');
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('the top-level usage lists every subcommand', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['--help']);
+    const usage = logs.join('\n');
+    for (const cmd of SUBCOMMANDS) {
+      expect(usage, `${cmd} is missing from the top-level usage`).toContain(`agent-locks ${cmd}`);
+    }
   });
 });

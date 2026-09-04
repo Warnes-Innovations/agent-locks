@@ -40,6 +40,7 @@ import {
   LockNotOwnedError,
   LockNotStaleError,
   LockNotDoneError,
+  ArchivedLockImmutableError,
   NoOpUpdateError,
   ScopeNotHeldError,
   EmptyScopeError,
@@ -161,9 +162,12 @@ const REAP_USAGE = `agent-locks reap [lock-id] [options]
 
 Reaps (finishes, same as "agent-locks finish") every currently-stale active lock, or a
 single one if lock-id is given. Refuses to reap a named lock-id that isn't actually
-stale — never a back door to force-finish someone else's live work.
-A supplied --stale-minutes may only LENGTHEN the window, never shorten it: it is
-floored at the configured default, so this cannot be used to reap live locks.
+stale, and a supplied --stale-minutes may only LENGTHEN the window: it is floored at
+the CONFIGURED default, so the flag cannot be used to reap live locks.
+
+The floor is the configured default, not a constant: AGENT_LOCKS_STALE_MINUTES sets it,
+and with that set small reap WILL finish live locks. That is the deliberate
+operator-level escape; the per-call flag is the part that is closed.
 
 Options:
   --stale-minutes <n>    Override the staleness threshold for this call only. Defaults
@@ -171,6 +175,53 @@ Options:
   --dry-run              Report what would be reaped without writing anything.
   --base-dir <path>      Reap locks in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
+
+
+const FINISH_USAGE = `agent-locks finish <lock-id> [options]
+
+Marks an active lock done and moves it into the done archive.
+
+Options:
+  --summary <text>       Closing summary appended to the lock's Notes before archiving.
+  --agent <id>           Your own agent id. Supply it so ownership can be checked:
+                          finishing a lock held by a DIFFERENT session is refused unless
+                          --force is given. Omit it and no check is possible.
+  --force                Deliberately end another session's claim. Recorded in the archive.
+  --base-dir <path>      Look up the lock in a different repository (any path inside it).
+  --json                 Print raw JSON instead of a short confirmation line.`;
+
+const HEARTBEAT_USAGE = `agent-locks heartbeat <lock-id> [options]
+
+Bumps ONLY the lock's updated timestamp, so it does not read as abandoned during a long
+stretch of work with no task boundary to check off. Completing a task already bumps it.
+Active locks only.
+
+Options:
+  --base-dir <path>      Look up the lock in a different repository (any path inside it).
+  --json                 Print raw JSON instead of a short confirmation line.`;
+
+const CHECK_USAGE = `agent-locks check <scope...> [options]
+
+Reports which active locks overlap the given glob(s). Informational only: it never
+blocks and exits 0 either way, so you make your own call about what to do.
+
+Uses the deliberately over-inclusive overlap heuristic, which errs toward reporting a
+conflict. That is right for a warning and WRONG for a gate — a gate needs exact
+coverage, not "might overlap".
+
+Options:
+  --stale-minutes <n>    Override the staleness threshold for this call only.
+  --base-dir <path>      Check locks in a different repository (any path inside it).
+  --json                 Print raw JSON instead of a formatted table.`;
+
+const STATUS_USAGE = `agent-locks status [options]
+
+Human-readable summary of the active locks in this repository.
+
+Options:
+  --stale-minutes <n>    Override the staleness threshold for this call only.
+  --base-dir <path>      Report on a different repository (any path inside it).
+  --json                 Print raw JSON instead of a formatted table.`;
 
 class CliUsageError extends Error {}
 
@@ -322,6 +373,10 @@ function resolveBaseDir(flags: ParsedFlags): string {
 }
 
 async function cmdStatus(flags: ParsedFlags): Promise<void> {
+  if (flags.boolFlags.has('--help')) {
+    console.log(STATUS_USAGE);
+    return;
+  }
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {});
@@ -363,6 +418,10 @@ async function cmdList(flags: ParsedFlags): Promise<void> {
 }
 
 async function cmdCheck(flags: ParsedFlags): Promise<void> {
+  if (flags.boolFlags.has('--help')) {
+    console.log(CHECK_USAGE);
+    return;
+  }
   const scope = flags.positionals;
   if (scope.length === 0) {
     throw new CliUsageError('agent-locks check requires at least one scope glob, e.g. "agent-locks check src/auth/**".');
@@ -486,15 +545,31 @@ async function cmdReopen(flags: ParsedFlags): Promise<void> {
     return;
   }
   console.log(`Lock ${result.id} reopened and returned to active.`);
-  if (result.false_positive) {
-    // Say it out loud. This is the one signal that says the staleness threshold is
-    // wrong, and a signal recorded only in a log nobody opens is a signal nobody acts on.
-    console.log(
-      `  This lock had been AUTO-REAPED, so the reap was a false positive: the holder was still working. ` +
-        `Recorded in the event log as evidence the staleness threshold is too short.`,
-    );
-  } else {
-    console.log(`  Previously finished by: ${result.previously_finished_by ?? 'an unrecorded path'}.`);
+  // Say what this reopen does and does NOT establish. Only the holder returning for a
+  // reaped lock is evidence about the threshold; the other three cases were previously
+  // all announced as "the holder was still working", which was sometimes simply false.
+  switch (result.verdict) {
+    case 'false-positive':
+      console.log(
+        `  This lock had been AUTO-REAPED and you are its holder, so the reap was a false positive. ` +
+          `Recorded in the event log as evidence the staleness threshold is too short.`,
+      );
+      break;
+    case 'reaped-by-other':
+      console.log(
+        `  This lock had been auto-reaped, but you are not the holder on record, so this is NOT counted ` +
+          `as evidence about the staleness threshold.`,
+      );
+      break;
+    case 'not-a-reap':
+      console.log(`  Previously finished by: ${result.previously_finished_by}. Not a reap, so it says nothing about the threshold.`);
+      break;
+    case 'unknown':
+      console.log(
+        `  This lock predates finish-provenance, so how it ended is not recoverable and it is scored as unknown ` +
+          `rather than guessed either way.`,
+      );
+      break;
   }
 }
 
@@ -504,8 +579,8 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
     return;
   }
   const type = oneOf(flags.flags, '--type');
-  if (type !== undefined && type !== 'reap' && type !== 'reopen') {
-    throw new CliUsageError(`--type must be one of reap, reopen (got "${type}").`);
+  if (type !== undefined && type !== 'reap' && type !== 'reopen' && type !== 'touch') {
+    throw new CliUsageError(`--type must be one of reap, reopen, touch (got "${type}").`);
   }
   const limitRaw = oneOf(flags.flags, '--limit');
   let limit: number | undefined;
@@ -513,10 +588,18 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
     limit = Number(limitRaw);
     if (!Number.isInteger(limit) || limit <= 0) throw new CliUsageError(`--limit must be a positive integer (got "${limitRaw}").`);
   }
+  const lockFilter = oneOf(flags.flags, '--lock');
 
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
-  const events = await readEvents(locksRoot, { type, lock_id: oneOf(flags.flags, '--lock'), limit });
+  const events = await readEvents(locksRoot, { type, lock_id: lockFilter, limit });
+  // The SUMMARY is always computed over the unfiltered log. Computing it from the
+  // displayed rows made `events --type reap` report "0 later reopened as false
+  // positive" beside the instruction to tune from that number — a filter silently
+  // producing a zero that reads as a measurement.
+  const all = type === undefined && limit === undefined && lockFilter === undefined
+    ? events
+    : await readEvents(locksRoot, {});
   warnEventLog();
 
   if (flags.boolFlags.has('--json')) {
@@ -524,7 +607,7 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
     return;
   }
   if (events.length === 0) {
-    console.log('No lock events recorded. Nothing has been reaped or reopened in this repository.');
+    console.log('No matching lock events recorded.');
     return;
   }
   for (const event of events) {
@@ -534,26 +617,50 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
           `    idle ${event.idle_seconds}s at a ${event.threshold_minutes}m threshold; ` +
           `${event.tasks_done}/${event.tasks_total} tasks done; holder ${event.agent_id ?? '(none recorded)'}`,
       );
+    } else if (event.event === 'touch') {
+      console.log(
+        `${event.ts}  TOUCH   ${event.lock_id}\n` +
+          `    alive after ${event.idle_seconds}s idle (via ${event.via}); ` +
+          `${event.tasks_done}/${event.tasks_total} tasks done`,
+      );
     } else {
       console.log(
         `${event.ts}  REOPEN  ${event.lock_id}\n` +
-          `    ${event.false_positive ? 'FALSE POSITIVE — reaped while alive' : `from a ${event.finished_by ?? 'unrecorded'} finish`}` +
+          `    ${event.verdict}` +
           (event.idle_at_reap_seconds === null ? '' : `; had been idle ${event.idle_at_reap_seconds}s when reaped`) +
           (event.reason === null ? '' : `; reason: ${event.reason}`),
       );
     }
   }
-  const falsePositives = events.filter((e) => e.event === 'reopen' && e.false_positive).length;
-  const reaps = events.filter((e) => e.event === 'reap').length;
-  if (reaps > 0) {
+  // Every number below is computed over the WHOLE log, never the filtered view.
+  const reaps = all.filter((e) => e.event === 'reap').length;
+  const falsePositives = all.filter((e) => e.event === 'reopen' && e.verdict === 'false-positive').length;
+  const liveIntervals = all.filter((e) => e.event === 'touch').map((e) => (e as { idle_seconds: number }).idle_seconds);
+
+  console.log('');
+  if (liveIntervals.length > 0) {
+    const sorted = [...liveIntervals].sort((a, b) => a - b);
+    const pct = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
     console.log(
-      `\n${reaps} reap(s), ${falsePositives} later reopened as false positive(s). ` +
-        `Tune the threshold above the TAIL of the idle intervals that turned out to be alive, not their median.`,
+      `Live inter-touch intervals (n=${sorted.length}): median ${pct(0.5)}s, p95 ${pct(0.95)}s, max ${sorted[sorted.length - 1]}s.`,
     );
+    console.log(
+      `  The threshold must sit above the TAIL of this distribution, not its median — a threshold at the median reaps half of all live locks.`,
+    );
+  } else {
+    console.log('No live inter-touch intervals recorded yet, so the threshold cannot be argued DOWN from this log.');
   }
+  console.log(
+    `${reaps} reap(s); ${falsePositives} later reopened by their holder, which is a LOWER BOUND on wrong reaps — ` +
+      `a holder who never noticed, or who re-claimed instead of reopening, leaves no record at all.`,
+  );
 }
 
 async function cmdFinish(flags: ParsedFlags): Promise<void> {
+  if (flags.boolFlags.has('--help')) {
+    console.log(FINISH_USAGE);
+    return;
+  }
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError('agent-locks finish requires a lock id as its first argument.');
   const summary = oneOf(flags.flags, '--summary');
@@ -575,6 +682,10 @@ async function cmdFinish(flags: ParsedFlags): Promise<void> {
 }
 
 async function cmdHeartbeat(flags: ParsedFlags): Promise<void> {
+  if (flags.boolFlags.has('--help')) {
+    console.log(HEARTBEAT_USAGE);
+    return;
+  }
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError('agent-locks heartbeat requires a lock id as its first argument.');
 
@@ -602,6 +713,9 @@ async function cmdReap(flags: ParsedFlags): Promise<void> {
   const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
   warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
+  // ...and the event log, which this command WRITES. A failed append here is
+  // otherwise invisible: reap exits 0 and `events` then asserts nothing was reaped.
+  warnEventLog();
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));
@@ -697,6 +811,7 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof LockNotOwnedError ||
       error instanceof LockNotStaleError ||
       error instanceof LockNotDoneError ||
+      error instanceof ArchivedLockImmutableError ||
       error instanceof NoOpUpdateError ||
       error instanceof ScopeNotHeldError ||
       error instanceof EmptyScopeError ||

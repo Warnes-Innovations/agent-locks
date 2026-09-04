@@ -90,7 +90,7 @@ Three properties worth stating explicitly, each of them tested (`src/__tests__/c
 
 Every lock is stamped with the repository it governs (`repository` in the frontmatter, and in every summary `lock_query` returns), so an agent reading a lock never has to infer that from the scope glob.
 
-`base_dir` is available on all 7 MCP tools and, as `--base-dir`, on every CLI subcommand except `serve`.
+`base_dir` is available on all 8 MCP tools and, as `--base-dir`, on every CLI subcommand except `serve`.
 
 ## File format
 
@@ -104,6 +104,8 @@ created: 2026-07-17T18-45-12
 updated: 2026-07-17T18-45-12
 scope:
   - backend/src/hindsight/**
+repository: /Users/you/src/your-repo
+finished_by: null
 ---
 
 # Add hindsight route tests
@@ -114,6 +116,18 @@ scope:
 ## Notes
 - Started after checking for conflicts with the oauth-cleanup lock
 ```
+
+Two fields are easy to miss and both are load-bearing:
+
+- **`repository`** — the repo root as of lock creation, so a summary says which repo a
+  lock governs without inferring it from a glob. Empty string on locks written before it
+  existed.
+- **`finished_by`** — how the lock reached `done`: `holder`, `force` (someone else ended
+  the claim deliberately) or `reap` (nobody was heard from). `null` while active, and
+  **also `null` on any lock written before the field existed** — so a reader must treat
+  `null` as *not recorded*, never as *deliberate*. `lock_reopen` reads it to decide
+  whether a reason is required, and scores a pre-provenance lock as `unknown` rather than
+  guessing.
 
 Parsed and serialized by `src/lock/markdown.ts` using [`gray-matter`](https://github.com/jonschlinkert/gray-matter) for the frontmatter/body split, plus a small hand-written parser/serializer for the specific body shape (title heading, checklist, Notes section) that this project owns entirely — calling agents never write raw markdown; they pass structured tool arguments and this module is the only place that turns them into (or back out of) the file format.
 
@@ -152,6 +166,7 @@ States: `(nonexistent)` → `active` → `done` → `(compacted)`
 | 6 | active → done | `lock_finish` | supported |
 | 7 | active → done (stale) | `lock_reap` | supported |
 | 8 | done → compacted | — | **not built yet** — retention/compaction of the done archive |
+| 8a | done → done | — | **deliberately absent** — the archive is an audit record; `lock_update` refuses it |
 | 9 | done → active (**reopen**) | `lock_reopen` | supported |
 
 ### Transitions that are deliberately ABSENT
@@ -163,10 +178,18 @@ adding them would undo a decision rather than finish an implementation:
   made or not at all. A tool-supported way to assign ownership afterwards would make a
   misattribution *durable* — and misattribution is not hypothetical here; two sessions
   made one by hand within a single day. Asserted by a test, not just by this paragraph.
-- **Force-finishing a non-stale lock via `lock_reap`.** `lock_reap` refuses a named lock
-  that is not stale, and its plural form is floored so a small `stale_minutes` cannot
-  reach live locks. `lock_finish` with `force` is the one deliberate, recorded path for
-  ending someone else's claim; a second route would re-open what that closed.
+- **Rewriting an archived lock.** `lock_update` refuses a done lock. The archive records
+  what was claimed, by whom, and how it ended; editing it in place changes that record
+  with nothing to say so. `lock_reopen` is the recorded way to make one changeable again.
+  (This inverts an earlier deliberate behaviour, in which `update` found a lock by id in
+  either directory and rewrote it silently.)
+- **Force-finishing a non-stale lock via `lock_reap`'s per-call flag.** `lock_reap`
+  refuses a named lock that is not stale, and its plural form floors `stale_minutes` at
+  the configured default so the FLAG cannot reach live locks. `lock_finish` with `force`
+  is the one deliberate, recorded path for ending someone else's claim.
+  **This does not extend to `AGENT_LOCKS_STALE_MINUTES`,** which sets that floor: with it
+  set small, reap does finish live locks. The environment variable is the operator-level
+  escape; the flag is closed.
 
 ### Why 5 and 9 exist
 
@@ -228,11 +251,11 @@ nothing had been reaped. Do not cite "sessions run for hours" as evidence the de
 wrong — that conflates session duration with the gap between touches, which is what the
 threshold actually measures. Collect the events first.
 
-## The 9 MCP tools
+## The 8 MCP tools
 
-All nine are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
+All eight are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
 
-All nine also accept an optional `base_dir` to operate on a different repository — omitted from the examples below for brevity; see [Claiming work in a *different* repository](#claiming-work-in-a-different-repository-base_dir).
+All eight also accept an optional `base_dir` to operate on a different repository — omitted from the examples below for brevity; see [Claiming work in a *different* repository](#claiming-work-in-a-different-repository-base_dir).
 
 ### `lock_query`
 
@@ -312,7 +335,9 @@ Bumps **only** a lock's `updated` timestamp — no task, note or scope change (f
 { "name": "lock_reap", "arguments": { "dry_run": true } }
 ```
 
-Finishes (same mechanism as `lock_finish`) every currently-stale active lock, or a single specific one if `lock_id` is given. **Explicit and deliberate — never a side effect of `lock_query`/`lock_check_conflict` reading state.** Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (and for how long), so the done archive stays honest about "the owning agent finished this" vs. "nobody was heard from and this got cleaned up." If `lock_id` is given but that lock is **not** actually stale, this errors (`LockNotStaleError`) rather than reaping it — `lock_reap` cannot be used as a back door to force-finish someone else's live work. **A caller-supplied `stale_minutes` may only LENGTHEN the window, never shorten it** (floored at the configured default). Without that floor the plural form *was* exactly the back door this sentence denies: `reap --stale-minutes 0.01` finished every active lock in a repo, and even the named form could be pushed past its own refusal. Fixed and regression-tested 2026-09-03. `dry_run: true` reports what would be reaped without writing anything.
+Finishes (same mechanism as `lock_finish`) every currently-stale active lock, or a single specific one if `lock_id` is given. **Explicit and deliberate — never a side effect of `lock_query`/`lock_check_conflict` reading state.** Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (and for how long), so the done archive stays honest about "the owning agent finished this" vs. "nobody was heard from and this got cleaned up." If `lock_id` is given but that lock is **not** actually stale, this errors (`LockNotStaleError`) rather than reaping it — `lock_reap` cannot be used as a back door to force-finish someone else's live work. **A caller-supplied `stale_minutes` may only LENGTHEN the window, never shorten it** — it is floored at the configured default. Without that floor the plural form *was* exactly the back door this sentence denies: `reap --stale-minutes 0.01` finished every active lock in a repo, and even the named form could be pushed past its own refusal. Fixed and regression-tested 2026-09-03.
+
+**But read "configured default" literally: the floor is `AGENT_LOCKS_STALE_MINUTES`, not a constant.** With that variable set small, `reap` finishes live locks — verified, a one-second-old lock. So the guarantee covers the per-call FLAG only. This is a deliberate operator-level escape rather than an oversight, but it is worth being plain about who "the operator" is: an MCP server inherits its parent session's environment, so on this machine that party and "any session running here" are the same one. `dry_run: true` reports what would be reaped without writing anything.
 
 ### `lock_reopen`
 
@@ -329,7 +354,7 @@ Reopening a reaped lock also records a **labelled false positive** in the event 
 
 ## CLI usage
 
-The exact same lock store the 7 MCP tools above talk to is also reachable from a plain terminal or a shell script — useful for a human checking coordination state directly, or for any agent harness that can run a command but doesn't (yet) speak MCP.
+The exact same lock store the 8 MCP tools above talk to is also reachable from a plain terminal or a shell script — useful for a human checking coordination state directly, or for any agent harness that can run a command but doesn't (yet) speak MCP.
 
 `index.js` dispatches on `argv`: called with **no arguments** (or the explicit `serve` alias) it starts the MCP stdio server exactly as before — every existing MCP client config keeps working unchanged. Called with any other first argument, it runs as a CLI and exits with a real exit code (0 on success, 1 on a usage error or a store error like a missing lock id) instead of hanging waiting for JSON-RPC on stdin.
 
@@ -426,6 +451,22 @@ There's no exact, general algorithm for "do these two glob patterns ever match a
    - `packages/foo/**` vs `packages/bar/**` → no overlap (correct: different packages).
    - A pattern whose first character is itself a wildcard (`*.ts`, `**` + `/*.test.ts`) has an *empty* prefix, which trivially prefixes everything — so such patterns are conservatively reported as overlapping with anything in scope. Intentional over-inclusion, not a bug.
 3. Fallback: if the prefixes disagree, also check (via `minimatch`) whether either pattern, treated as a literal path string, is matched by the other pattern's glob. This specifically matters for extglob syntax (`+(foo|bar)`, `@(foo|bar)`, `!(foo|bar)`) — e.g. `src/+(foo|bar)/**`'s naive static prefix is `"src/+"` (only the `(` is treated as a wildcard-start, not the `+` before it), which does **not** raw-string-prefix `"src/foo/util.ts"`, so the prefix stage alone would wrongly say "no overlap"; the real `minimatch` check in the fallback catches it.
+
+### Two predicates, and using the wrong one is a security bug
+
+`scopesOverlap` (this heuristic) answers *"might these claims touch the same thing?"* and
+is deliberately biased toward saying yes. That is right for a WARNING — a false positive
+costs a glance, a false negative costs a collision.
+
+It is exactly wrong for a GATE. A lock scoped `*.md` "overlaps" `src/main.ts` under the
+heuristic, so a single broad lock would satisfy a coverage check for every file in the
+repo. Anything deciding *"is this path actually claimed?"* must use **`scopeCovers`**
+(`src/lock/globOverlap.ts`), which answers the narrower question *"does this pattern
+definitely cover this exact path?"* and returns `false` for any glob construct it cannot
+prove — because for a gate, "cannot prove covered" has to mean "not covered".
+
+Neither is exposed over MCP or the CLI today; a gate built on this store must call
+`scopeCovers` directly.
 
 ### Known, documented gap
 

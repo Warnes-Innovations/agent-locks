@@ -167,13 +167,13 @@ describe('finish provenance', () => {
 
 describe('transition 9 — reopen', () => {
   it('returns a reaped lock to active with no reason required, keeping its checklist', async () => {
-    const id = await claim();
+    const id = await claim({ agent_id: 'Red [bd9522]' });
     await updateLock(locksRoot, { lock_id: id, task_text: 'first', done: true });
     await backdate(id, 90);
     await reapStaleLocks(locksRoot, {});
 
     const result = await reopenLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]' });
-    expect(result.false_positive).toBe(true);
+    expect(result.verdict).toBe('false-positive');
     expect(result.previously_finished_by).toBe('reap');
 
     // The point of reopen over re-claiming: the checklist survives.
@@ -196,7 +196,7 @@ describe('transition 9 — reopen', () => {
     const id = await claim();
     await finishLock(locksRoot, { lock_id: id });
     const result = await reopenLock(locksRoot, { lock_id: id, reason: 'the work was not actually done' });
-    expect(result.false_positive).toBe(false);
+    expect(result.verdict).toBe('not-a-reap');
     expect(result.previously_finished_by).toBe('holder');
     const raw = await fs.readFile(result.filePath, 'utf8');
     expect(raw).toContain('the work was not actually done');
@@ -238,7 +238,7 @@ describe('the event log — the instrument behind any future threshold change', 
   });
 
   it('a reopen after a reap is recorded as a LABELLED false positive, with the reap interval joined in', async () => {
-    const id = await claim();
+    const id = await claim({ agent_id: 'Red [bd9522]' });
     await backdate(id, 90);
     await reapStaleLocks(locksRoot, {});
     const [reap] = await readEvents(locksRoot, { type: 'reap' });
@@ -248,11 +248,36 @@ describe('the event log — the instrument behind any future threshold change', 
 
     const [reopen] = await readEvents(locksRoot, { type: 'reopen' });
     if (reopen.event !== 'reopen') throw new Error('expected a reopen event');
-    expect(reopen.false_positive).toBe(true);
+    expect(reopen.verdict).toBe('false-positive');
     expect(reopen.finished_by).toBe('reap');
     // Self-contained: a later analysis never has to re-join the log to get the
     // interval that produced the wrong reap.
     expect(reopen.idle_at_reap_seconds).toBe(reap.idle_seconds);
+  });
+
+  it('a stranger reopening a reaped lock is NOT scored as evidence about the threshold', async () => {
+    // The boolean scored this `true`, so an unrelated session reviving a genuinely
+    // abandoned lock was recorded as proof the threshold was too short.
+    const id = await claim({ agent_id: 'Red [bd9522]' });
+    await backdate(id, 90);
+    await reapStaleLocks(locksRoot, {});
+
+    const result = await reopenLock(locksRoot, { lock_id: id, agent_id: 'Blue [a1b2]' });
+    expect(result.verdict).toBe('reaped-by-other');
+  });
+
+  it('a lock with no recorded provenance is scored unknown, never guessed', async () => {
+    // Every lock written before finish-provenance existed reads back as null. Scoring
+    // those as "not a false positive" biases the measurement toward "60 minutes is
+    // fine" — the exact conclusion the log exists to test.
+    const id = await claim();
+    await finishLock(locksRoot, { lock_id: id });
+    const doneFile = path.join(locksRoot, 'done', `${id}.md`);
+    const raw = await fs.readFile(doneFile, 'utf8');
+    await fs.writeFile(doneFile, raw.replace(/^finished_by: .*$/m, ''), 'utf8');
+
+    const result = await reopenLock(locksRoot, { lock_id: id, reason: 'legacy revival' });
+    expect(result.verdict).toBe('unknown');
   });
 
   it('a reopen of a DELIBERATE finish is not a false positive', async () => {
@@ -261,7 +286,7 @@ describe('the event log — the instrument behind any future threshold change', 
     await reopenLock(locksRoot, { lock_id: id, reason: 'resumed' });
     const [reopen] = await readEvents(locksRoot, { type: 'reopen' });
     if (reopen.event !== 'reopen') throw new Error('expected a reopen event');
-    expect(reopen.false_positive).toBe(false);
+    expect(reopen.verdict).toBe('not-a-reap');
     expect(reopen.idle_at_reap_seconds).toBeNull();
   });
 
@@ -323,7 +348,7 @@ describe('the event log — the instrument behind any future threshold change', 
       agent_id: null,
       finished_by: 'reap',
       reason: null,
-      false_positive: true,
+      verdict: 'false-positive',
       idle_at_reap_seconds: 1,
     });
     expect(await readEvents(locksRoot, { type: 'reap' })).toHaveLength(1);

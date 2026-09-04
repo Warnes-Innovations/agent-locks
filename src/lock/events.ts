@@ -72,11 +72,15 @@ export interface ReapEvent extends EventBase {
 /**
  * A done lock was returned to active.
  *
- * `false_positive` is the measurement this whole log exists for. A reopen of a
- * lock that REAP finished is direct, labelled evidence that the threshold was too
- * short for that session — with the exact interval attached via
- * `idle_at_reap_seconds`. No separate telemetry is needed for the error we care
- * most about, because the recovery path doubles as the instrument.
+ * `verdict` is the measurement this record exists for. A reopen by the HOLDER of a
+ * lock that REAP finished is direct evidence the threshold was too short for that
+ * session, with the interval attached via `idle_at_reap_seconds`. The recovery path
+ * doubles as the instrument, so no separate telemetry has to be kept alive.
+ *
+ * Read it with the false-negative rate in mind, which this log cannot measure: a
+ * holder who never notices the lock vanished, or who re-claims instead of reopening,
+ * produces no record at all. So the false-positive count is a LOWER BOUND on wrong
+ * reaps, never an estimate of them.
  */
 export interface ReopenEvent extends EventBase {
   event: 'reopen';
@@ -84,12 +88,48 @@ export interface ReopenEvent extends EventBase {
   /** How the lock had been finished: 'reap' | 'holder' | 'force' | null if unknown (legacy). */
   finished_by: string | null;
   reason: string | null;
-  false_positive: boolean;
+  /**
+   * What this reopen says about the staleness threshold. NOT a boolean, because at
+   * least four distinct situations were collapsing into `true`/`false` and only one
+   * of them is evidence about the threshold:
+   *
+   * - `false-positive`   the holder came back for a lock REAP took. This, and only
+   *                      this, is evidence the threshold was too short.
+   * - `reaped-by-other`  a reaped lock reopened by somebody who is not the holder.
+   *                      Says nothing about whether the reap was wrong.
+   * - `not-a-reap`       revived from a deliberate finish. Not about the threshold.
+   * - `unknown`          the lock predates provenance, so how it ended is not
+   *                      recoverable. Must NOT be silently scored as either, which
+   *                      is what a boolean forced — and it defaulted to the benign
+   *                      reading, biasing the measurement toward "60 minutes is fine".
+   */
+  verdict: 'false-positive' | 'reaped-by-other' | 'not-a-reap' | 'unknown';
   /** Joined from this log's own most recent reap event for this lock; null if none. */
   idle_at_reap_seconds: number | null;
 }
 
-export type LockEvent = ReapEvent | ReopenEvent;
+/**
+ * A lock was touched while ALIVE — the observation the threshold actually needs.
+ *
+ * WHY THIS EXISTS, and why the log was useless without it. Reap events carry
+ * `idle_seconds >= threshold` BY CONSTRUCTION, so a log of reaps alone contains no
+ * observation of an interval below the threshold. It can argue the threshold up and
+ * never down, which means it cannot settle a question stated as "unvalidated in both
+ * directions". The distribution that matters is the gap between touches on locks that
+ * turned out to be alive, and this is the only place it is recorded.
+ */
+export interface TouchEvent extends EventBase {
+  event: 'touch';
+  agent_id: string | null;
+  /** Seconds since this lock's PREVIOUS touch. The datum the threshold is about. */
+  idle_seconds: number;
+  /** Which operation bumped it: a task/scope/note update, a bare heartbeat, or the closing finish. */
+  via: 'update' | 'heartbeat' | 'finish';
+  tasks_total: number;
+  tasks_done: number;
+}
+
+export type LockEvent = ReapEvent | ReopenEvent | TouchEvent;
 
 /** A log line that could not be parsed. Reported, never silently dropped. */
 export interface EventLogError {
@@ -101,10 +141,16 @@ export interface EventLogError {
 /**
  * Errors from the most recent event-log operation.
  *
- * Consumed by the CLI's warn banner and reported over MCP. That wiring is not
- * decoration: a previous version of this codebase recorded unreadable LOCKS into a
- * module variable with zero consumers, so the condition was detected and then
- * discarded. Anything added here must be surfaced somewhere a caller sees.
+ * Consumed by the CLI's warn banner (`warnEventLog`) on every command that reads OR
+ * writes the log. That wiring is not decoration: a previous version of this codebase
+ * recorded unreadable LOCKS into a module variable with zero consumers, so the
+ * condition was detected and then discarded. Anything added here must be surfaced
+ * somewhere a caller sees.
+ *
+ * NOT yet surfaced over MCP — an earlier version of this comment claimed it was, and
+ * `server.ts` did not so much as import this module. State the gap rather than the
+ * intention: an agent calling lock_reap over MCP currently cannot tell a logged reap
+ * from an unlogged one.
  */
 export let lastEventLogErrors: EventLogError[] = [];
 
@@ -115,10 +161,15 @@ export function eventsPath(locksRoot: string): string {
 /**
  * Appends one event. Never throws — see invariant 2 above.
  *
- * Uses a single `appendFile` call with the line built up front. POSIX guarantees
- * an O_APPEND write below PIPE_BUF is atomic with respect to other appenders, so
- * concurrent sessions cannot interleave halves of a line. Events are small by
- * construction; keep them that way rather than adding a lock file here.
+ * Uses a single `appendFile` call with the line built up front, which opens with
+ * O_APPEND so each write is positioned atomically at the current end of file.
+ *
+ * DO NOT restate the old justification here: it claimed POSIX guarantees atomicity
+ * below PIPE_BUF, which is 512 on macOS while a real reap event measures ~520 bytes —
+ * so the cited guarantee did not even cover this log's own records. Interleaving was
+ * measured clean at 12 concurrent writers up to 64 KiB, but by the filesystem's
+ * behaviour rather than by the standard invoked. A reader must tolerate a torn line
+ * regardless, which `readEvents` does: it skips and reports one.
  */
 export async function appendEvent(locksRoot: string, event: LockEvent): Promise<void> {
   try {
@@ -178,7 +229,7 @@ export async function readEvents(locksRoot: string, options: ReadEventsOptions =
     if (
       typeof candidate !== 'object' ||
       candidate === null ||
-      (candidate.event !== 'reap' && candidate.event !== 'reopen') ||
+      (candidate.event !== 'reap' && candidate.event !== 'reopen' && candidate.event !== 'touch') ||
       typeof candidate.lock_id !== 'string'
     ) {
       errors.push({ phase: 'read', reason: `line ${i + 1}: not a recognised lock event` });

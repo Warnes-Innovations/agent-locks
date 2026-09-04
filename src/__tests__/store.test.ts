@@ -11,6 +11,7 @@ import {
   lastReapFloor,
   lastUnreadableLocks,
   LockNotOwnedError,
+  ArchivedLockImmutableError,
   LockNotStaleError,
   queryLocks,
   reapStaleLocks,
@@ -207,11 +208,26 @@ describe('updateLock', () => {
     );
   });
 
-  it('can update a lock that has already been finished (found regardless of active/done directory)', async () => {
-    const { id } = await createLock(locksRoot, { title: 'finished then noted', scope: ['a/**'], tasks: ['t1'] });
+  it('REFUSES to update a lock that has already been finished', async () => {
+    // This inverts a previously deliberate behaviour. `update` used to find a lock by
+    // id in either directory and rewrite an archived one in place — silently altering
+    // the record of what was claimed and how it ended, with nothing in the event log
+    // to say so. The archive is an audit record; `reopen` is the recorded way to make
+    // an archived lock changeable again.
+    const { id } = await createLock(locksRoot, {
+      title: 'Finished then noted',
+      scope: ['a/**'],
+      tasks: ['task one'],
+      repository: TEST_REPO,
+    });
     await finishLock(locksRoot, { lock_id: id });
-    const result = await updateLock(locksRoot, { lock_id: id, task_text: 't1', done: true });
-    expect(result.percentComplete).toBe(100);
+
+    await expect(
+      updateLock(locksRoot, { lock_id: id, task_text: 'task one', done: true }),
+    ).rejects.toThrow(ArchivedLockImmutableError);
+    await expect(updateLock(locksRoot, { lock_id: id, note: 'after the fact' })).rejects.toThrow(
+      ArchivedLockImmutableError,
+    );
   });
 });
 

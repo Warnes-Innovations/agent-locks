@@ -12,6 +12,7 @@ import { formatTimestamp, parseTimestamp, slugify } from '../timestamp.js';
 import { parseLockFile, serializeLockFile } from './markdown.js';
 import { scopesOverlap } from './globOverlap.js';
 import { appendEvent, lastReapEventFor } from './events.js';
+import type { TouchEvent } from './events.js';
 import { computePercentComplete, toSummary, DEFAULT_STALE_MINUTES } from './types.js';
 import type { LockFrontmatter, LockRecord, LockSummary, LockTask } from './types.js';
 
@@ -144,6 +145,17 @@ export class DuplicateLockIdError extends Error {
         `should be impossible; inspect the store by hand rather than letting a move pick a winner.`,
     );
     this.name = 'DuplicateLockIdError';
+  }
+}
+
+export class ArchivedLockImmutableError extends Error {
+  constructor(lockId: string) {
+    super(
+      `Lock "${lockId}" is in the done archive and cannot be updated in place. The archive is the record of what was ` +
+        `claimed, by whom, and how it ended; rewriting it silently changes that record with nothing to say so. ` +
+        `If it genuinely needs to change, reopen it first — that transition is recorded.`,
+    );
+    this.name = 'ArchivedLockImmutableError';
   }
 }
 
@@ -369,6 +381,35 @@ async function withRecordLock<T>(filePath: string, fn: () => Promise<T>): Promis
   } finally {
     await fs.rm(lockPath, { force: true }).catch(() => {});
   }
+}
+
+/**
+ * Records that a live lock was touched, with the gap since its PREVIOUS touch.
+ *
+ * This is the observation the staleness threshold is actually about. Reap events
+ * carry an interval that exceeded the threshold by construction, so without these the
+ * log can only ever argue the threshold UP — it holds no observation of a live lock
+ * going quiet for less than the threshold. Call this with the PRE-mutation `updated`
+ * stamp, before it is overwritten.
+ */
+async function recordTouch(
+  locksRoot: string,
+  record: LockRecord,
+  previousUpdated: string,
+  via: TouchEvent['via'],
+): Promise<void> {
+  const idleMs = Date.now() - parseTimestamp(previousUpdated).getTime();
+  await appendEvent(locksRoot, {
+    event: 'touch',
+    ts: record.frontmatter.updated,
+    lock_id: record.frontmatter.id,
+    repository: record.frontmatter.repository ?? '',
+    agent_id: record.frontmatter.agent_id,
+    idle_seconds: Math.max(0, Math.round(idleMs / 1000)),
+    via,
+    tasks_total: record.tasks.length,
+    tasks_done: record.tasks.filter((t) => t.done).length,
+  });
 }
 
 /** Finds a lock by id, searching active first, then done. Returns null if not found in either. */
@@ -615,6 +656,13 @@ export async function updateLock(locksRoot: string, params: UpdateLockParams): P
   // Serialize, then RE-READ inside the lock. Re-reading is the half that matters: a
   // record fetched before acquiring the lock is exactly the stale starting state that
   // makes concurrent updates erase each other.
+  // The done archive is an AUDIT RECORD and is not rewritable in place. Before this,
+  // `update` found a lock by id in either directory and happily rewrote an archived
+  // one's scope, tasks and notes — silently altering the record of what was claimed
+  // and by whom, with nothing in the event log to say so. `heartbeat` already refused
+  // done locks for a weaker reason. Reopen it if it genuinely needs to change.
+  if (found.frontmatter.status === 'done') throw new ArchivedLockImmutableError(params.lock_id);
+
   return withRecordLock(found.filePath, async () => {
   let record: LockRecord;
   try {
@@ -623,6 +671,7 @@ export async function updateLock(locksRoot: string, params: UpdateLockParams): P
     // Finished or reaped by someone else between the lookup and the lock.
     throw new LockNotFoundError(params.lock_id);
   }
+  if (record.frontmatter.status === 'done') throw new ArchivedLockImmutableError(params.lock_id);
 
   // OWNERSHIP. `remove_scope` can SHRINK a claim, which frees a path for everyone
   // else while the lock still reads as actively held — strictly worse than ending
@@ -701,8 +750,10 @@ export async function updateLock(locksRoot: string, params: UpdateLockParams): P
     record.notes.push(params.note);
   }
 
+  const previousUpdated = record.frontmatter.updated;
   record.frontmatter.updated = formatTimestamp();
   await writeRecord(record);
+  await recordTouch(locksRoot, record, previousUpdated, 'update');
 
   return {
     id: record.frontmatter.id,
@@ -799,6 +850,7 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
   // identity was known", which is the honest reading — an unattributed finish is not
   // evidence of a takeover.
   record.frontmatter.finished_by = foreign ? 'force' : 'holder';
+  const previousUpdated = record.frontmatter.updated;
   record.frontmatter.updated = formatTimestamp();
 
   const newFilePath = path.join(doneDir(locksRoot), path.basename(record.filePath));
@@ -808,6 +860,9 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
 
   await writeRecord(record);
   await fs.unlink(oldFilePath);
+  // The last live interval of a lock that was NEVER reaped — the right-hand end of
+  // the distribution a threshold has to sit above.
+  await recordTouch(locksRoot, record, previousUpdated, 'finish');
 
   return { id: record.frontmatter.id, filePath: newFilePath };
   });
@@ -845,8 +900,10 @@ export async function heartbeatLock(locksRoot: string, params: HeartbeatLockPara
       // it read before a concurrent update, discarding that update entirely.
       return withRecordLock(filePath, async () => {
         const record = await readRecord(filePath);
+        const previousUpdated = record.frontmatter.updated;
         record.frontmatter.updated = formatTimestamp();
         await writeRecord(record);
+        await recordTouch(locksRoot, record, previousUpdated, 'heartbeat');
         return { id: record.frontmatter.id, updated: record.frontmatter.updated };
       });
     }
@@ -1015,10 +1072,10 @@ export interface ReopenLockResult {
   /** How the lock had been finished before this reopen — the provenance that gated it. */
   previously_finished_by: 'holder' | 'force' | 'reap' | null;
   /**
-   * True when this reopen is direct evidence the staleness threshold was too short:
-   * a lock reap took from a session that was, demonstrably, still there.
+   * What this reopen says about the staleness threshold. Only 'false-positive' is
+   * evidence it was too short — see ReopenEvent.verdict for why a boolean was wrong.
    */
-  false_positive: boolean;
+  verdict: 'false-positive' | 'reaped-by-other' | 'not-a-reap' | 'unknown';
 }
 
 export class LockNotDoneError extends Error {
@@ -1089,6 +1146,22 @@ export async function reopenLock(locksRoot: string, params: ReopenLockParams): P
 
   const finishedBy = record.frontmatter.finished_by ?? null;
   const wasReaped = finishedBy === 'reap';
+  // Only the HOLDER coming back for a reaped lock says anything about the threshold.
+  // A stranger reviving someone's abandoned claim is not evidence the reap was wrong,
+  // and a lock that predates provenance cannot be scored at all — scoring it anyway
+  // is what biased the measurement toward "the threshold is fine".
+  const reopenerIsHolder =
+    params.agent_id != null &&
+    record.frontmatter.agent_id != null &&
+    agentMatches(record.frontmatter.agent_id, params.agent_id);
+  const verdict: ReopenLockResult['verdict'] =
+    finishedBy === null
+      ? 'unknown'
+      : !wasReaped
+        ? 'not-a-reap'
+        : reopenerIsHolder
+          ? 'false-positive'
+          : 'reaped-by-other';
   const reason = params.reason?.trim() ?? '';
   if (!wasReaped && reason === '') throw new ReopenReasonRequiredError(params.lock_id, finishedBy);
 
@@ -1126,7 +1199,7 @@ export async function reopenLock(locksRoot: string, params: ReopenLockParams): P
     agent_id: params.agent_id ?? null,
     finished_by: finishedBy,
     reason: reason === '' ? null : reason,
-    false_positive: wasReaped,
+    verdict,
     idle_at_reap_seconds: priorReap?.idle_seconds ?? null,
   });
 
@@ -1134,7 +1207,7 @@ export async function reopenLock(locksRoot: string, params: ReopenLockParams): P
     id: record.frontmatter.id,
     filePath: newFilePath,
     previously_finished_by: finishedBy,
-    false_positive: wasReaped,
+    verdict,
   };
   });
 }
