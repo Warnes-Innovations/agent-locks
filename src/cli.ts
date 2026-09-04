@@ -25,6 +25,8 @@
  */
 import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
 import {
+  lastReapFloor,
+  lastUnreadableLocks,
   createLock,
   queryLocks,
   checkConflicts,
@@ -35,6 +37,7 @@ import {
   LockNotFoundError,
   TaskNotFoundError,
   LockNotActiveError,
+  LockNotOwnedError,
   LockNotStaleError,
 } from './lock/store.js';
 import type { LockSummary } from './lock/types.js';
@@ -49,7 +52,7 @@ Usage:
   agent-locks check <scope...>          Check whether any active lock overlaps the given glob(s). Informational only — exits 0 either way.
   agent-locks claim [options]           Create a new lock. See "agent-locks claim --help".
   agent-locks update <lock-id> [options]  Mark a task done/undone on an existing lock. See "agent-locks update --help".
-  agent-locks finish <lock-id> [--summary <text>]  Mark a lock done and archive it.
+  agent-locks finish <lock-id> [--summary <text>] [--agent <id>] [--force]  Mark a lock done and archive it. Pass --agent so ownership can be checked; --force is required (and recorded) to end another session's claim.
   agent-locks heartbeat <lock-id>        Bump a lock's updated timestamp with no other change. See "Staleness detection" in the README.
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks --help                    Show this message.
@@ -98,6 +101,8 @@ const REAP_USAGE = `agent-locks reap [lock-id] [options]
 Reaps (finishes, same as "agent-locks finish") every currently-stale active lock, or a
 single one if lock-id is given. Refuses to reap a named lock-id that isn't actually
 stale — never a back door to force-finish someone else's live work.
+A supplied --stale-minutes may only LENGTHEN the window, never shorten it: it is
+floored at the configured default, so this cannot be used to reap live locks.
 
 Options:
   --stale-minutes <n>    Override the staleness threshold for this call only. Defaults
@@ -130,7 +135,10 @@ interface ParsedFlags {
   boolFlags: Set<string>;
 }
 
-const BOOLEAN_FLAGS = new Set(['--json', '--done', '--undone', '--help', '--dry-run']);
+const BOOLEAN_FLAGS = new Set(['--json', '--done', '--undone', '--help', '--dry-run', '--force']);
+// --force must be declared here or the parser treats it as value-taking and errors
+// with "Flag --force requires a value" — which reads as a usage mistake rather than
+// a missing registration, so the escape hatch appears broken rather than absent.
 
 function parseArgs(argv: string[]): ParsedFlags {
   const positionals: string[] = [];
@@ -168,6 +176,31 @@ function oneOf(flags: ParsedFlags['flags'], name: string): string | undefined {
 
 function allOf(flags: ParsedFlags['flags'], name: string): string[] {
   return flags.get(name) ?? [];
+}
+
+
+/**
+ * Print any lock the store could not read.
+ *
+ * WITHOUT THIS the corrupt-lock fix is worse than the bug it replaced: a truncated
+ * lock used to CRASH (loud, wrong, but visible); after the fix it is skipped, so the
+ * store reports "(no locks)" with exit 0 and a real claim is invisible. Recording the
+ * condition in `lastUnreadableLocks` is worth nothing until something prints it.
+ *
+ * CALL IT FROM EVERY READ COMMAND, not from the table renderer. An earlier version
+ * lived inside formatLockTable, so `--json` — the form a hook or script uses — skipped
+ * it entirely and reported a corrupt lock as no lock. Placement, not presence, was the
+ * defect. Verified by running each surface.
+ */
+function warnUnreadable(): void {
+  if (lastUnreadableLocks.length === 0) return;
+  console.error(
+    `WARNING: ${lastUnreadableLocks.length} lock file(s) could not be read and are NOT ` +
+      `included below. A claim you cannot see is a claim you will collide with.`,
+  );
+  for (const bad of lastUnreadableLocks) {
+    console.error(`  ${bad.filePath}: ${bad.reason}`);
+  }
 }
 
 function formatStaleForSeconds(seconds: number): string {
@@ -213,6 +246,7 @@ async function cmdStatus(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {});
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
   console.log(`agent-locks: ${locks.length} active lock(s) in ${locksRoot}\n`);
   console.log(formatLockTable(locks));
 }
@@ -240,6 +274,7 @@ async function cmdList(flags: ParsedFlags): Promise<void> {
     text,
     stale_minutes,
   });
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(locks, null, 2));
@@ -257,6 +292,7 @@ async function cmdCheck(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const conflicts = await checkConflicts(locksRoot, scope, stale_minutes);
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(conflicts, null, 2));
     return;
@@ -326,10 +362,15 @@ async function cmdFinish(flags: ParsedFlags): Promise<void> {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError('agent-locks finish requires a lock id as its first argument.');
   const summary = oneOf(flags.flags, '--summary');
+  // Pass identity THROUGH. Store-level ownership enforcement is inert if the surface
+  // never supplies who is calling — the enforcement existed and the CLI still archived
+  // another session's lock, exit 0. Verified by running it.
+  const agent_id = oneOf(flags.flags, '--agent');
+  const force = flags.boolFlags.has('--force');
 
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
-  const result = await finishLock(locksRoot, { lock_id: lockId, summary });
+  const result = await finishLock(locksRoot, { lock_id: lockId, summary, agent_id, force });
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(result, null, 2));
@@ -365,13 +406,30 @@ async function cmdReap(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
+  warnUnreadable(); // EVERY read surface, not the renderer — --json bypassed it (Y1)
 
   if (flags.boolFlags.has('--json')) {
-    console.log(JSON.stringify(reaped, null, 2));
+    console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));
     return;
   }
+  // Report the floor whether or not anything was reaped. An earlier version mentioned
+  // it only in the zero-reaped branch, so "asked for 1, used 60, reaped 2" said nothing
+  // about the threshold that actually ran.
+  if (lastReapFloor) {
+    console.log(
+      `Note: a per-call threshold may only LENGTHEN the reaping window. You asked for ` +
+        `${lastReapFloor.requested} minute(s); ${lastReapFloor.applied} minute(s) was used. ` +
+        `Lower AGENT_LOCKS_STALE_MINUTES to reap more aggressively — a visible, global choice.`,
+    );
+  }
   if (reaped.length === 0) {
-    console.log('No stale locks to reap.');
+    console.log(
+      lastReapFloor
+        ? `No locks reaped at the ${lastReapFloor.applied}-minute threshold that was used. ` +
+            `Locks stale by your requested ${lastReapFloor.requested} minute(s) but not by that ` +
+            `one were left alone.`
+        : 'No stale locks to reap.',
+    );
     return;
   }
   const verb = dry_run ? 'Would reap' : 'Reaped';
@@ -435,6 +493,7 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof LockNotFoundError ||
       error instanceof TaskNotFoundError ||
       error instanceof LockNotActiveError ||
+      error instanceof LockNotOwnedError ||
       error instanceof LockNotStaleError
     ) {
       printError(error.message);

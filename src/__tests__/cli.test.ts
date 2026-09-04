@@ -36,10 +36,16 @@ afterEach(async () => {
 /** Runs runCli with process.cwd() pointed at `repo` for the duration of the call, restoring it after. */
 async function runCliIn(repoDir: string, argv: string[]): Promise<number> {
   const originalCwd = process.cwd();
+  const originalStale = process.env.AGENT_LOCKS_STALE_MINUTES;
   process.chdir(repoDir);
+  // See e2e.test.ts: --stale-minutes may only LENGTHEN, so these tests lower the
+  // configured default instead of shortening per call.
+  process.env.AGENT_LOCKS_STALE_MINUTES = '0.03';
   try {
     return await runCli(argv);
   } finally {
+    if (originalStale === undefined) delete process.env.AGENT_LOCKS_STALE_MINUTES;
+    else process.env.AGENT_LOCKS_STALE_MINUTES = originalStale;
     process.chdir(originalCwd);
   }
 }
@@ -364,5 +370,116 @@ describe('CLI dispatch via the actual compiled binary', () => {
     const distPath = path.resolve(import.meta.dirname, '../../dist/index.js');
     const { stdout } = await execFileAsync('node', [distPath, 'status'], { cwd: repo });
     expect(stdout).toContain('0 active lock');
+  });
+});
+
+describe('a corrupt lock is surfaced on EVERY read surface (Y2 regression)', () => {
+  /**
+   * These tests assert the POINTER, not the mechanism.
+   *
+   * The round-4 fix recorded unreadable locks in `lastUnreadableLocks` and wired a
+   * warning into the human table renderer. Five tests were added and all five asserted
+   * the STORE-LEVEL recording, which already worked — so deleting every call site and
+   * the whole MCP payload left the suite fully green. The wiring, which was the actual
+   * fix, was untested. That is the failure this project keeps repeating: a control
+   * built and nothing pointing at it, including nothing in the tests.
+   *
+   * Each test below fails if its call site is removed.
+   */
+  async function corruptTheOnlyLock(): Promise<void> {
+    const locksDir = path.join(repo, '.git', 'agents-locks');
+    for (const name of await fs.readdir(locksDir)) {
+      if (name.endsWith('.md')) await fs.writeFile(path.join(locksDir, name), '', 'utf8');
+    }
+  }
+
+  it('warns on `list --json` — the form a hook or script uses', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { logs, errors } = captureConsole();
+
+    await runCliIn(repo, ['list', '--json', '--status', 'active']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+    // And the payload itself is still the empty array, which is exactly why the
+    // warning has to exist: the data cannot express "I could not tell you".
+    expect(logs.join('\n')).toContain('[]');
+  });
+
+  it('warns on `check` — the call made before writing, where silence is worst', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { errors } = captureConsole();
+
+    await runCliIn(repo, ['check', 'src/main.ts']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+  });
+
+  it('warns on `status`', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { errors } = captureConsole();
+
+    await runCliIn(repo, ['status']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+  });
+
+  it('warns on `reap`', async () => {
+    await runCliIn(repo, ['claim', '--title', 'real work', '--scope', 'src/**']);
+    await corruptTheOnlyLock();
+    const { errors } = captureConsole();
+
+    await runCliIn(repo, ['reap', '--dry-run']);
+
+    expect(errors.join('\n')).toMatch(/could not be read/i);
+  });
+});
+
+describe('finish enforces ownership FROM THE CLI, not just in the store (pointer test)', () => {
+  /**
+   * The store-level refusal was implemented and passing its own tests while the CLI
+   * still archived another session's lock, exit 0 — because cmdFinish never passed
+   * `--agent` through. That is the same last-hop failure as Y2: the mechanism worked,
+   * nothing called it, and only store-level tests existed. These assert the SURFACE.
+   */
+  it('refuses to finish another session\'s lock', async () => {
+    await runCliIn(repo, ['claim', '--title', 'held by Blue', '--scope', 'a/**', '--agent', 'Blue [aa1111]']);
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['list', '--json']);
+    const id = (JSON.parse(logs.join('\n')) as Array<{ id: string }>)[0]!.id;
+
+    const { errors } = captureConsole();
+    const code = await runCliIn(repo, ['finish', id, '--agent', 'Red [bd9522]']);
+
+    expect(code).not.toBe(0);
+    expect(errors.join('\n')).toMatch(/held by Blue \[aa1111\]|not by Red/i);
+  });
+
+  it('allows it with --force, and records the fact', async () => {
+    await runCliIn(repo, ['claim', '--title', 'held by Blue', '--scope', 'a/**', '--agent', 'Blue [aa1111]']);
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['list', '--json']);
+    const id = (JSON.parse(logs.join('\n')) as Array<{ id: string }>)[0]!.id;
+
+    captureConsole();
+    const code = await runCliIn(repo, ['finish', id, '--agent', 'Red [bd9522]', '--force']);
+    expect(code).toBe(0);
+
+    const doneDir = path.join(repo, '.git', 'agents-locks', 'done');
+    const files = await fs.readdir(doneDir);
+    const text = await fs.readFile(path.join(doneDir, files[0]!), 'utf8');
+    expect(text).toContain('is NOT the holder');
+  });
+
+  it('still finishes an unowned lock without --agent, as before', async () => {
+    await runCliIn(repo, ['claim', '--title', 'legacy', '--scope', 'a/**']);
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['list', '--json']);
+    const id = (JSON.parse(logs.join('\n')) as Array<{ id: string }>)[0]!.id;
+
+    captureConsole();
+    expect(await runCliIn(repo, ['finish', id])).toBe(0);
   });
 });

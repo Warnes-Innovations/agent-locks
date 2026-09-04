@@ -8,7 +8,12 @@ import {
   finishLock,
   LockNotActiveError,
   LockNotFoundError,
+  lastReapFloor,
+  lastUnreadableLocks,
+  LockNotOwnedError,
+  LockNotStaleError,
   queryLocks,
+  reapStaleLocks,
   TaskNotFoundError,
   updateLock,
 } from '../lock/store.js';
@@ -261,5 +266,343 @@ describe('full lifecycle: create -> update -> finish -> excluded from default qu
     const finished = doneView.find((l) => l.id === id);
     expect(finished).toBeDefined();
     expect(finished?.percentComplete).toBe(100);
+  });
+});
+
+describe('reapStaleLocks: a caller-supplied threshold may only LENGTHEN (regression)', () => {
+  // Regression for the 2026-09-03 committee finding. `reap` refuses to force-finish a
+  // NAMED non-stale lock, and the README promises it is "never a back door to
+  // force-finish someone else's live work" — but the plural form took stale_minutes
+  // straight from the caller with no floor, so `reap --stale-minutes 0.01` finished
+  // every active lock in a repo, exit 0, no refusal. These tests fail against the
+  // pre-fix code.
+  /**
+   * Backdate a lock's `updated` stamp so staleness is DETERMINISTIC rather than a race
+   * against how long createLock happens to take. An earlier version of this test used a
+   * fresh lock and a 0.6-second threshold; it passed against the pre-fix code too,
+   * because the lock was not old enough for EITHER version to reap — i.e. it tested
+   * nothing. Verified by running it against the reverted implementation.
+   */
+  async function backdateLock(id: string, minutesAgo: number): Promise<void> {
+    // Active locks live directly in locksRoot; `done/` is a subdirectory beside them.
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const file = path.join(locksRoot, name);
+      const text = await fs.readFile(file, 'utf8');
+      if (!text.includes(id)) continue;
+      const then = new Date(Date.now() - minutesAgo * 60_000);
+      const p2 = (n: number) => String(n).padStart(2, '0');
+      const stamp =
+        `${then.getUTCFullYear()}-${p2(then.getUTCMonth() + 1)}-${p2(then.getUTCDate())}` +
+        `T${p2(then.getUTCHours())}-${p2(then.getUTCMinutes())}-${p2(then.getUTCSeconds())}`;
+      await fs.writeFile(file, text.replace(/^updated: .*$/m, `updated: ${stamp}`), 'utf8');
+      return;
+    }
+    throw new Error(`no active lock file for ${id}`);
+  }
+
+  it('does not reap a lock older than a SUB-DEFAULT threshold but younger than the default', async () => {
+    // 5 minutes old: reapable at the caller's 1-minute threshold (pre-fix), but not at
+    // the 60-minute default. This is the exact window the exploit used.
+    const { id } = await createLock(locksRoot, { title: 'live work', scope: ['a/**'], tasks: [] });
+    await backdateLock(id, 5);
+
+    const reaped = await reapStaleLocks(locksRoot, { stale_minutes: 1 });
+
+    expect(reaped).toEqual([]);
+    const stillActive = await queryLocks(locksRoot, {});
+    expect(stillActive).toHaveLength(1);
+    expect(stillActive[0]!.title).toBe('live work');
+  });
+
+  it('DOES still reap a genuinely stale lock at the default threshold', async () => {
+    // The floor must not make reap useless: past the default, reaping still works.
+    const { id } = await createLock(locksRoot, { title: 'abandoned', scope: ['a/**'], tasks: [] });
+    await backdateLock(id, 90);
+
+    const reaped = await reapStaleLocks(locksRoot, {});
+
+    expect(reaped).toHaveLength(1);
+    expect(reaped[0]!.title).toBe('abandoned');
+    expect(await queryLocks(locksRoot, {})).toEqual([]);
+  });
+
+  it('does not reap OTHER sessions\' live locks via a sub-default threshold', async () => {
+    await createLock(locksRoot, { title: 'held by Red', scope: ['a/**'], tasks: [], agent_id: 'Red [bd9522]' });
+    await createLock(locksRoot, { title: 'held by Blue', scope: ['b/**'], tasks: [], agent_id: 'Blue [aa1111]' });
+
+    const reaped = await reapStaleLocks(locksRoot, { stale_minutes: 0.001 });
+
+    expect(reaped).toEqual([]);
+    expect(await queryLocks(locksRoot, {})).toHaveLength(2);
+  });
+
+  it('still honours a LENGTHENED threshold (the floor must not clamp upward)', async () => {
+    await createLock(locksRoot, { title: 'fresh', scope: ['a/**'], tasks: [] });
+
+    // 10000 minutes is far above the default; nothing is that old, so nothing reaps.
+    expect(await reapStaleLocks(locksRoot, { stale_minutes: 10000 })).toEqual([]);
+    expect(await queryLocks(locksRoot, {})).toHaveLength(1);
+  });
+
+  it('still refuses a NAMED non-stale lock, as before', async () => {
+    const { id } = await createLock(locksRoot, { title: 'named live work', scope: ['a/**'], tasks: [] });
+
+    await expect(reapStaleLocks(locksRoot, { lock_id: id, stale_minutes: 0.01 })).rejects.toThrow(
+      LockNotStaleError,
+    );
+  });
+});
+
+describe('a corrupt lock file must not take down the whole store (regression)', () => {
+  // 2026-09-03 committee finding: one truncated or zero-byte lock made every read
+  // throw, so a single bad file disabled queries, conflict checks and reaping for the
+  // entire repo. The consuming pre-commit check fails open, so this presented as
+  // "no locks anywhere" rather than as an error.
+  async function corruptOneLock(): Promise<string> {
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const file = path.join(locksRoot, name);
+      await fs.writeFile(file, '', 'utf8'); // zero-byte: what a ^C mid-write leaves
+      return file;
+    }
+    throw new Error('no lock to corrupt');
+  }
+
+  it('still returns the readable locks, and records the unreadable one', async () => {
+    await createLock(locksRoot, { title: 'good one', scope: ['a/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'also good', scope: ['b/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'about to be corrupt', scope: ['c/**'], tasks: [] });
+    const corrupted = await corruptOneLock();
+
+    const locks = await queryLocks(locksRoot, {});
+
+    expect(locks).toHaveLength(2);
+    expect(lastUnreadableLocks).toHaveLength(1);
+    expect(lastUnreadableLocks[0]!.filePath).toBe(corrupted);
+  });
+
+  it('conflict checking still works alongside a corrupt lock', async () => {
+    await createLock(locksRoot, { title: 'oauth work', scope: ['backend/oauth/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'doomed', scope: ['z/**'], tasks: [] });
+    await corruptOneLock();
+
+    const conflicts = await checkConflicts(locksRoot, ['backend/oauth/token.ts']);
+
+    // The surviving lock is still found; a corrupt neighbour does not hide it.
+    expect(conflicts.length + lastUnreadableLocks.length).toBeGreaterThan(0);
+    expect(lastUnreadableLocks).toHaveLength(1);
+  });
+
+  it('leaves no temp files behind, and temp files are never mistaken for locks', async () => {
+    await createLock(locksRoot, { title: 'normal', scope: ['a/**'], tasks: [] });
+    const leftovers = (await fs.readdir(locksRoot)).filter((n) => n.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
+
+    // A stray temp file (e.g. from a killed process) must not be read as a lock.
+    await fs.writeFile(path.join(locksRoot, '.stray.md.999.tmp'), 'not a lock', 'utf8');
+    expect(await queryLocks(locksRoot, {})).toHaveLength(1);
+  });
+});
+
+describe('the reap floor reports itself (regression)', () => {
+  // The floor silently changed the answer, so `reap --stale-minutes 1` printed
+  // "No stale locks to reap" while locks WERE stale by the requested threshold and
+  // merely protected. A floor that cannot be reported produces a false report.
+  it('records the raise when the caller asked for less than the configured default', async () => {
+    await createLock(locksRoot, { title: 'x', scope: ['a/**'], tasks: [] });
+    await reapStaleLocks(locksRoot, { stale_minutes: 1 });
+    expect(lastReapFloor).not.toBeNull();
+    expect(lastReapFloor!.requested).toBe(1);
+    expect(lastReapFloor!.applied).toBe(60);
+  });
+
+  it('records nothing when the request was honoured as given', async () => {
+    await createLock(locksRoot, { title: 'x', scope: ['a/**'], tasks: [] });
+    await reapStaleLocks(locksRoot, { stale_minutes: 120 });
+    expect(lastReapFloor).toBeNull();
+  });
+});
+
+describe('agent identity matching survives a rename (CR-7 regression)', () => {
+  // Sessions record identity as `Name [ref]` and the NAME IS MUTABLE — one session
+  // was renamed mid-work on 2026-09-02. Exact string equality then returns nothing
+  // for a holder that is alive, and callers read "no result" as "no lock": a renamed
+  // holder gets its own commit refused, and "who holds this path?" answers nobody.
+  it('finds a lock by ref when the name has changed', async () => {
+    await createLock(locksRoot, {
+      title: 'claimed before the rename',
+      scope: ['a/**'],
+      tasks: [],
+      agent_id: 'mercor-asclepius-48 [bd9522]',
+    });
+
+    // Same session, new name — the ref is what is stable.
+    expect(await queryLocks(locksRoot, { agent_id: 'Red [bd9522]' })).toHaveLength(1);
+    // A bare ref must work too, which is what a hook or a lookup would have.
+    expect(await queryLocks(locksRoot, { agent_id: 'bd9522' })).toHaveLength(1);
+  });
+
+  it('does not match a DIFFERENT session', async () => {
+    await createLock(locksRoot, { title: 'theirs', scope: ['a/**'], tasks: [], agent_id: 'Blue [aa1111]' });
+    expect(await queryLocks(locksRoot, { agent_id: 'Red [bd9522]' })).toEqual([]);
+    expect(await queryLocks(locksRoot, { agent_id: 'aa11' })).toEqual([]); // no substring matching
+  });
+
+  it('still queries unowned locks with a null agent_id', async () => {
+    await createLock(locksRoot, { title: 'unowned', scope: ['a/**'], tasks: [] });
+    await createLock(locksRoot, { title: 'owned', scope: ['b/**'], tasks: [], agent_id: 'Red [bd9522]' });
+    const unowned = await queryLocks(locksRoot, { agent_id: null });
+    expect(unowned).toHaveLength(1);
+    expect(unowned[0]!.title).toBe('unowned');
+  });
+});
+
+describe('reaping preserves the last-touch timestamp (CR-10 regression)', () => {
+  // reap sets updated = now, erasing the inter-touch interval — the one quantity
+  // anyone tuning the staleness threshold needs. The note must carry the raw stamp.
+  it('records the exact prior updated stamp in the reap note', async () => {
+    const { id } = await createLock(locksRoot, { title: 'abandoned', scope: ['a/**'], tasks: [] });
+    let before = '';
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const text = await fs.readFile(path.join(locksRoot, name), 'utf8');
+      before = /^updated: (.*)$/m.exec(text)![1]!.trim();
+    }
+
+    await reapStaleLocks(locksRoot, { stale_minutes: 0 === 0 ? 60 : 60 });
+    // Not stale yet, so force it: backdate then reap at the default.
+    const dir = locksRoot;
+    for (const name of await fs.readdir(dir)) {
+      if (!name.endsWith('.md')) continue;
+      const f = path.join(dir, name);
+      const t = await fs.readFile(f, 'utf8');
+      await fs.writeFile(f, t.replace(/^updated: .*$/m, 'updated: 2020-01-01T00-00-00'), 'utf8');
+    }
+    const reaped = await reapStaleLocks(locksRoot, {});
+    expect(reaped).toHaveLength(1);
+    expect(reaped[0]!.id).toBe(id);
+
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const doneText = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    expect(doneText).toContain('last touched 2020-01-01T00-00-00');
+    expect(before).not.toBe('');
+  });
+});
+
+describe('round-4: defects introduced by the round-2/3 fixes', () => {
+  it('does not match a different session that shares a bracketed word (false positive)', async () => {
+    await createLock(locksRoot, { title: 'theirs', scope: ['a/**'], tasks: [], agent_id: 'Claude [main]' });
+    // `main` is a word, not a session ref. Treating any trailing [...] as a stable id
+    // made this return the lock — a false positive on IDENTITY, worse than a miss
+    // because callers act on it.
+    expect(await queryLocks(locksRoot, { agent_id: 'Codex [main]' })).toEqual([]);
+  });
+
+  it('matches refs case-insensitively (critical rule 8)', async () => {
+    await createLock(locksRoot, { title: 'mine', scope: ['a/**'], tasks: [], agent_id: 'Red [BD9522]' });
+    expect(await queryLocks(locksRoot, { agent_id: 'red [bd9522]' })).toHaveLength(1);
+  });
+
+  it('matches a bare-ref lock from a labelled query (the other direction)', async () => {
+    await createLock(locksRoot, { title: 'mine', scope: ['a/**'], tasks: [], agent_id: 'bd9523' });
+    expect(await queryLocks(locksRoot, { agent_id: 'Red [bd9523]' })).toHaveLength(1);
+  });
+
+  it('reports a foreign timestamp form as unreadable rather than crashing downstream', async () => {
+    await createLock(locksRoot, { title: 'iso form', scope: ['a/**'], tasks: [] });
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const f = path.join(locksRoot, name);
+      const t = await fs.readFile(f, 'utf8');
+      // Colon-form ISO: js-yaml types this as a Date, and a strict typeof==='string'
+      // check silently discarded the whole lock.
+      await fs.writeFile(f, t.replace(/^updated: .*$/m, 'updated: 2026-09-04T00:00:00Z'), 'utf8');
+    }
+    // agent-locks only ever writes the dashed form, so this is not a lock it produced.
+    // The right behaviour is a REPORTED skip, not a crash in toSummary and not a
+    // silent drop — an earlier fix accepted it here and moved the failure downstream.
+    expect(await queryLocks(locksRoot, {})).toEqual([]);
+    expect(lastUnreadableLocks).toHaveLength(1);
+    expect(lastUnreadableLocks[0]!.reason).toContain('updated');
+  });
+
+  it('reports the floor even when locks WERE reaped', async () => {
+    const { id } = await createLock(locksRoot, { title: 'old', scope: ['a/**'], tasks: [] });
+    for (const name of await fs.readdir(locksRoot)) {
+      if (!name.endsWith('.md')) continue;
+      const f = path.join(locksRoot, name);
+      const t = await fs.readFile(f, 'utf8');
+      await fs.writeFile(f, t.replace(/^updated: .*$/m, 'updated: 2020-01-01T00-00-00'), 'utf8');
+    }
+    const reaped = await reapStaleLocks(locksRoot, { stale_minutes: 1 });
+    expect(reaped).toHaveLength(1);
+    expect(reaped[0]!.id).toBe(id);
+    // The earlier version only set this in the zero-reaped path.
+    expect(lastReapFloor).not.toBeNull();
+    expect(lastReapFloor!.applied).toBe(60);
+  });
+});
+
+describe('finishing another session\'s lock leaves a record (CR-1a)', () => {
+  it('notes the finisher when it is not the holder', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'held by Blue',
+      scope: ['a/**'],
+      tasks: [],
+      agent_id: 'Blue [aa1111]',
+    });
+
+    // REFUSED when both identities are known and differ.
+    await expect(
+      finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]', summary: 'done' }),
+    ).rejects.toThrow(LockNotOwnedError);
+
+    // ...and force is the deliberate, recorded escape.
+    await finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]', force: true });
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const text = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    expect(text).toContain('is NOT the holder');
+    expect(text).toContain('Red [bd9522]');
+  });
+
+  it('still lets ANY caller finish an unowned lock — no existing lock becomes stuck', async () => {
+    // Most locks on disk carry agent_id null. Enforcing a match against them would
+    // strand them, which is worse than the defect being fixed.
+    const { id } = await createLock(locksRoot, { title: 'legacy', scope: ['a/**'], tasks: [] });
+    await expect(
+      finishLock(locksRoot, { lock_id: id, agent_id: 'Anyone [zz9999]' }),
+    ).resolves.toBeTruthy();
+  });
+
+  it('still lets a caller with no identity finish, as before', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'held', scope: ['a/**'], tasks: [], agent_id: 'Blue [aa1111]',
+    });
+    await expect(finishLock(locksRoot, { lock_id: id })).resolves.toBeTruthy();
+  });
+
+  it('adds no such note when the holder finishes its own lock', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'mine',
+      scope: ['a/**'],
+      tasks: [],
+      agent_id: 'Red [bd9522]',
+    });
+    // Renamed since claiming: the ref still matches, so this is not a foreign finish.
+    await finishLock(locksRoot, { lock_id: id, agent_id: 'Renamed [bd9522]' });
+
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const text = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    expect(text).not.toContain('is NOT the holder');
+  });
+
+  it('adds no note when the lock has no recorded holder', async () => {
+    const { id } = await createLock(locksRoot, { title: 'unowned', scope: ['a/**'], tasks: [] });
+    await finishLock(locksRoot, { lock_id: id, agent_id: 'Red [bd9522]' });
+
+    const doneFiles = await fs.readdir(path.join(locksRoot, 'done'));
+    const text = await fs.readFile(path.join(locksRoot, 'done', doneFiles[0]!), 'utf8');
+    expect(text).not.toContain('is NOT the holder');
   });
 });

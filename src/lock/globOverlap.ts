@@ -100,6 +100,11 @@ export function patternsOverlap(a: string, b: string): boolean {
 }
 
 /** True if any pattern in `a` overlaps any pattern in `b`. */
+/**
+ * WARNING heuristic — see the module header. For "does this lock actually cover this
+ * staged path?" use `scopeCovers` instead: this function is deliberately biased toward
+ * false positives, which inverts into over-permissiveness the moment it is used to gate.
+ */
 export function scopesOverlap(a: string[], b: string[]): boolean {
   for (const patternA of a) {
     for (const patternB of b) {
@@ -107,4 +112,72 @@ export function scopesOverlap(a: string[], b: string[]): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Does this lock's scope ACTUALLY COVER this concrete file path?
+ *
+ * ============================================================================
+ * DO NOT REPLACE CALLS TO THIS WITH `scopesOverlap`. THEY ARE NOT INTERCHANGEABLE
+ * AND THEIR SAFE-FAILURE DIRECTIONS ARE OPPOSITE.
+ * ============================================================================
+ *
+ * `scopesOverlap` is a WARNING heuristic, deliberately biased toward false
+ * positives: "you might be colliding" is cheap to over-report, and a missed
+ * conflict is the expensive error. That bias is correct for `lock_check_conflict`.
+ *
+ * Inverted for GATING, the same bias becomes over-PERMISSIVE. A gate asks "is this
+ * staged path actually claimed?", so a false positive means work passes that nothing
+ * covers. Demonstrated during committee review: a single lock scoped `*.md` reports
+ * overlap against `src/main.ts` — an empty static prefix prefixes everything — so one
+ * broad lock would satisfy a pre-commit check for every file in the repo.
+ *
+ * This function answers the gating question exactly, against a real path, with no
+ * deliberate looseness. It matches a subset of glob syntax on purpose: `**` (any
+ * number of segments, including none), `*` (within one segment), and `?`. A pattern
+ * using anything outside that subset returns FALSE rather than guessing — for a gate,
+ * "I cannot prove this is covered" must mean "not covered".
+ */
+export function scopeCovers(scopePatterns: string[], filePath: string): boolean {
+  const target = filePath.replace(/^\.\//, '').replace(/^\/+/, '');
+  return scopePatterns.some((pattern) => patternCoversPath(pattern, target));
+}
+
+/** Single-pattern half of `scopeCovers`. Exported for direct testing. */
+export function patternCoversPath(pattern: string, filePath: string): boolean {
+  const pat = pattern.trim().replace(/^\.\//, '').replace(/^\/+/, '');
+  if (pat === '') return false;
+  // Anything outside the supported subset is UNPROVABLE, so it does not cover.
+  // Erring the other way would let an unparsed pattern gate everything.
+  if (/[[\]{}()!+@]/.test(pat)) return false;
+  if (pat === filePath) return true;
+
+  // Build an anchored regex. `**` spans separators; `*` and `?` do not.
+  let rx = '';
+  for (let i = 0; i < pat.length; i += 1) {
+    const ch = pat[i]!;
+    if (ch === '*') {
+      if (pat[i + 1] === '*') {
+        // `**/` may match zero segments, so the separator is optional.
+        if (pat[i + 2] === '/') {
+          rx += '(?:.*/)?';
+          i += 2;
+        } else {
+          rx += '.*';
+          i += 1;
+        }
+      } else {
+        rx += '[^/]*';
+      }
+      continue;
+    }
+    if (ch === '?') {
+      rx += '[^/]';
+      continue;
+    }
+    rx += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  // A directory-style scope (`src/foo/`) covers everything beneath it.
+  if (pat.endsWith('/')) rx += '.*';
+  return new RegExp(`^${rx}$`).test(filePath);
 }

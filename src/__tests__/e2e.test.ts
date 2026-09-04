@@ -51,6 +51,11 @@ beforeEach(async () => {
     args: [DIST_ENTRY],
     cwd: repo,
     stderr: 'pipe',
+    // A per-call stale_minutes may only LENGTHEN the reaping window (see
+    // reapStaleLocks). These tests deliberately reap sub-minute-old locks, so they
+    // lower the CONFIGURED DEFAULT — an explicit operator-level choice — rather than
+    // relying on a per-call flag to shorten it, which is the hole that was closed.
+    env: { ...process.env, AGENT_LOCKS_STALE_MINUTES: '0.03' },
   });
   client = new Client({ name: 'agent-locks-e2e-test-client', version: '0.0.0' });
   await client.connect(transport);
@@ -64,7 +69,19 @@ afterEach(async () => {
 function toolResultJson(result: Awaited<ReturnType<Client['callTool']>>): unknown {
   const first = (result.content as Array<{ type: string; text?: string }>)[0];
   expect(first?.type).toBe('text');
-  return JSON.parse(first.text as string);
+  const parsed = JSON.parse(first.text as string);
+  // lock_query / lock_check_conflict / lock_reap return a STABLE envelope carrying the
+  // payload plus out-of-band condition reporting (unreadable locks, the reap floor).
+  // The envelope is asserted explicitly in its own test; unwrapping here keeps every
+  // other assertion about the thing under test rather than about the wrapper.
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    for (const key of ['locks', 'conflicts', 'reaped']) {
+      if (Array.isArray((parsed as Record<string, unknown>)[key])) {
+        return (parsed as Record<string, unknown>)[key];
+      }
+    }
+  }
+  return parsed;
 }
 
 describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
@@ -217,5 +234,46 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     expect(result.isError).toBe(true);
     const first = (result.content as Array<{ type: string; text?: string }>)[0];
     expect(first.text).toContain('no task with the exact text');
+  });
+});
+
+describe('the MCP response envelope is stable (Y3 regression)', () => {
+  // An earlier version returned a bare array normally and an object ONLY when a lock
+  // was unreadable. A consumer would test the happy path, ship, and break in exactly
+  // the failure case the field exists to report. The shape must not depend on whether
+  // anything is wrong — asserted here explicitly, because every other test unwraps it.
+  it('lock_query returns locks + unreadable_locks even when nothing is wrong', async () => {
+    await client.callTool({
+      name: 'lock_create',
+      arguments: { title: 'healthy', scope: ['a/**'], tasks: [] },
+    });
+    const raw = await client.callTool({ name: 'lock_query', arguments: {} });
+    const parsed = JSON.parse(
+      ((raw.content as Array<{ text?: string }>)[0].text as string),
+    ) as Record<string, unknown>;
+
+    expect(Array.isArray(parsed)).toBe(false);
+    expect(Array.isArray(parsed.locks)).toBe(true);
+    expect(parsed.unreadable_locks).toEqual([]);
+    expect(parsed.warning).toBeUndefined();
+  });
+
+  it('lock_reap reports the floor that actually ran, on the agent-facing surface', async () => {
+    await client.callTool({
+      name: 'lock_create',
+      arguments: { title: 'fresh', scope: ['b/**'], tasks: [] },
+    });
+    // Ask for a threshold below the configured default: it may only LENGTHEN.
+    const raw = await client.callTool({
+      name: 'lock_reap',
+      arguments: { stale_minutes: 0.001, dry_run: true },
+    });
+    const parsed = JSON.parse(
+      ((raw.content as Array<{ text?: string }>)[0].text as string),
+    ) as Record<string, unknown>;
+
+    expect(Array.isArray(parsed.reaped)).toBe(true);
+    // The CLI reported this and the MCP path did not — the surface agents actually use.
+    expect(parsed.floor).not.toBeNull();
   });
 });

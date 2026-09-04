@@ -172,6 +172,20 @@ describe('heartbeatLock', () => {
 });
 
 describe('reapStaleLocks', () => {
+  // A per-call stale_minutes may only LENGTHEN the reaping window (see reapStaleLocks).
+  // These tests reap sub-minute-old locks, so they lower the CONFIGURED DEFAULT — an
+  // explicit operator-level choice — rather than shortening per call, which is the hole
+  // closed on 2026-09-03.
+  let savedStale: string | undefined;
+  beforeEach(() => {
+    savedStale = process.env.AGENT_LOCKS_STALE_MINUTES;
+    process.env.AGENT_LOCKS_STALE_MINUTES = '0.03';
+  });
+  afterEach(() => {
+    if (savedStale === undefined) delete process.env.AGENT_LOCKS_STALE_MINUTES;
+    else process.env.AGENT_LOCKS_STALE_MINUTES = savedStale;
+  });
+
   it('reaps every currently-stale active lock when no lock_id is given, leaving fresh ones alone', async () => {
     const staleOne = await createLock(locksRoot, { title: 'Stale one', scope: ['a/**'], tasks: [] });
     const staleTwo = await createLock(locksRoot, { title: 'Stale two', scope: ['b/**'], tasks: [] });

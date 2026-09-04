@@ -37,6 +37,71 @@ export function resolveStaleMinutes(override?: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_MINUTES;
 }
 
+
+/**
+ * Does a stored agent_id match the one being queried?
+ *
+ * Exact string equality is WRONG here, and the failure is silent. Sessions record
+ * their identity as `Name [ref]`, and the NAME IS MUTABLE — a session renamed
+ * mid-work leaves locks under its old label, so an exact match returns nothing for
+ * a holder that is alive and working. That is not a missing result: callers read it
+ * as "no lock", which is how a renamed holder gets its own commit refused, and how
+ * "who holds this path?" answers nobody.
+ *
+ * So: match on the REF when both sides carry one (the ref is stable), accept a bare
+ * ref against a full label, and fall back to exact equality otherwise. Deliberately
+ * NOT a substring match — that would make one agent's query match another whose name
+ * merely contains it.
+ */
+export function agentMatches(stored: string | null, query: string | null): boolean {
+  // A null query is a real query: "locks nobody claimed ownership of". Most existing
+  // locks have agent_id null, so this is the common case, not an edge one.
+  if (query === null) return stored === null;
+  if (stored === null) return false;
+  if (stored.trim().toLowerCase() === query.trim().toLowerCase()) return true;
+
+  // A SESSION REF, not "whatever is in the last brackets".
+  //
+  // TWO WRONG VERSIONS PRECEDED THIS, in opposite directions — worth recording, because
+  // the middle is narrow:
+  //  1. Any trailing [...] counted, so `--agent 'Codex [main]'` matched `Claude [main]`.
+  //  2. Requiring hex `[0-9a-f]{4,}` rejected legitimate refs — `[w7x2k9]`, `[48]`,
+  //     `[a1b2-c3d4]` all stopped matching. That alphabet was invented here and appears
+  //     in no document; constraining an identifier format we do not own is how a
+  //     matcher silently stops finding real holders.
+  //
+  // So: ref-shaped token AND at least one digit. The digit is the discriminator that
+  // both previous attempts lacked — every real session ref carries one (bd9522, w7x2k9,
+  // 48, a1b2-c3d4) and the bracketed WORDS that caused the false positives do not
+  // (main, beef). It admits refs the hex rule wrongly rejected without admitting words.
+  //
+  // KNOWN LIMIT, stated rather than hidden: an all-letter ref would be rejected and
+  // fall back to exact matching, and two sessions genuinely sharing a ref would still
+  // match each other. Neither is solvable in a matcher — identity here is self-asserted
+  // and documented as unverified, so this narrows accidents, not impersonation.
+  const SESSION_REF = /^(?=.*\d)[A-Za-z0-9_-]{2,}$/;
+  const refOf = (v: string): string | null => {
+    const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
+    if (!m) {
+      const bare = v.trim();
+      return SESSION_REF.test(bare) ? bare : null;
+    }
+    const inner = m[1]!.trim();
+    return SESSION_REF.test(inner) ? inner : null;
+  };
+
+  const storedRef = refOf(stored);
+  const queryRef = refOf(query);
+  // Case-insensitive per critical rule 8: record verbatim, compare without case.
+  // Matching on the REF and not the name is the whole point — names are mutable.
+  // Symmetric, so a bare ref finds a labelled lock AND a labelled query finds a
+  // bare-ref lock; an earlier version only handled one direction.
+  if (storedRef !== null && queryRef !== null) {
+    return storedRef.toLowerCase() === queryRef.toLowerCase();
+  }
+  return false;
+}
+
 export class LockNotFoundError extends Error {
   constructor(lockId: string) {
     super(`No lock found with id "${lockId}".`);
@@ -53,6 +118,20 @@ export class TaskNotFoundError extends Error {
         }. task_text must match an existing task exactly (this tool does not do fuzzy/partial matching).`,
     );
     this.name = 'TaskNotFoundError';
+  }
+}
+
+export class LockNotOwnedError extends Error {
+  constructor(lockId: string, holder: string, caller: string) {
+    super(
+      `Lock "${lockId}" is held by ${holder}, not by ${caller}. Refusing to finish another ` +
+        `session's live claim — that is the failure this system exists to prevent, and ` +
+        `finishing it silently is how uncommitted work loses its only marker. ` +
+        `Coordinate with the holder first. If you genuinely must end their claim: ` +
+        `--force on the CLI, or force:true via MCP. Either is allowed, and either is ` +
+        `recorded in the archive.`,
+    );
+    this.name = 'LockNotOwnedError';
   }
 }
 
@@ -92,11 +171,57 @@ async function readRecord(filePath: string): Promise<LockRecord> {
   return { ...parsed, filePath };
 }
 
+/**
+ * Writes a lock ATOMICALLY: full contents to a temp file in the same directory,
+ * then rename over the target. Rename is atomic within a filesystem, so a reader
+ * sees either the old file or the new one — never a half-written one.
+ *
+ * WHY THIS IS NOT A PLAIN writeFile (do not "simplify" it back):
+ * a partial write leaves a lock whose frontmatter will not parse, and one
+ * unparseable lock used to throw for the WHOLE store — so every query, conflict
+ * check and reap in that repo failed. An ordinary Ctrl-C during a write was
+ * enough to reach that state, and the pre-commit check that consumes this store
+ * fails open, which turned it into silent repo-wide non-enforcement rather than
+ * a visible error. Found by committee review 2026-09-03.
+ *
+ * The temp file lives in the SAME directory as the target because rename() is
+ * only atomic within one filesystem; via os.tmpdir() it can cross a mount and
+ * silently degrade to a copy.
+ */
 async function writeRecord(record: LockRecord): Promise<void> {
   const contents = serializeLockFile(record);
-  await fs.mkdir(path.dirname(record.filePath), { recursive: true });
-  await fs.writeFile(record.filePath, contents, 'utf8');
+  const dir = path.dirname(record.filePath);
+  await fs.mkdir(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.${path.basename(record.filePath)}.${process.pid}.tmp`);
+  try {
+    await fs.writeFile(tmpPath, contents, 'utf8');
+    await fs.rename(tmpPath, record.filePath);
+  } catch (err) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
 }
+
+/**
+ * Set by reapStaleLocks when the configured floor RAISED the caller's requested
+ * threshold, so a caller can report what actually ran rather than what was asked for.
+ * null when the request was honoured as given.
+ */
+export let lastReapFloor: { requested: number; applied: number } | null = null;
+
+/** A lock file that could not be read or parsed. Reported, never silently skipped. */
+export interface UnreadableLock {
+  filePath: string;
+  reason: string;
+}
+
+/**
+ * Lock files that failed to parse on the most recent readAllRecords call.
+ * Callers that report status (CLI `status`, MCP lock_query) should surface these:
+ * a lock nobody can read is a claim nobody can see, and silently dropping it
+ * would make an unreadable store indistinguishable from an empty one.
+ */
+export let lastUnreadableLocks: UnreadableLock[] = [];
 
 async function readAllRecords(locksRoot: string, status: 'active' | 'done' | 'all'): Promise<LockRecord[]> {
   const dirs: string[] = [];
@@ -104,7 +229,55 @@ async function readAllRecords(locksRoot: string, status: 'active' | 'done' | 'al
   if (status === 'done' || status === 'all') dirs.push(doneDir(locksRoot));
 
   const files = (await Promise.all(dirs.map(listMarkdownFiles))).flat();
-  return Promise.all(files.map(readRecord));
+
+  // One corrupt lock must not take down the whole store. Before this, a single
+  // truncated or zero-byte file made every read throw, and the consuming check
+  // fails open — so the failure presented as "no locks anywhere" rather than as
+  // an error. Skip the unreadable one, keep the rest, and RECORD it so the
+  // condition is reportable instead of silent.
+  const records: LockRecord[] = [];
+  const unreadable: UnreadableLock[] = [];
+  for (const filePath of files) {
+    try {
+      const record = await readRecord(filePath);
+      // readRecord does NOT throw on a truncated or empty file — it returns a record
+      // whose frontmatter fields are undefined, and the failure then surfaces far away
+      // (parseTimestamp on a `stale` computation, or scopesOverlap iterating a missing
+      // scope array). Verified by running it against a zero-byte lock. So VALIDATE
+      // here; catching around the read alone never fires.
+      const fm = record.frontmatter as Partial<LockRecord['frontmatter']> | undefined;
+      const missing: string[] = [];
+      if (!fm) missing.push('frontmatter');
+      else {
+        // Validate EXACTLY what the downstream parser requires, not something looser.
+        // An earlier attempt accepted a Date-typed value (js-yaml types colon-form
+        // ISO-8601 that way) on the theory that it was "well-formed enough" — but
+        // parseTimestamp then threw in toSummary, so the fix only MOVED the failure
+        // from a reported skip to an uncaught crash. Verified by running it.
+        //
+        // agent-locks only ever writes the dashed form, so a colon-form stamp is not a
+        // lock this tool produced. Rejecting it here is correct — and it is no longer
+        // silent, because unreadable locks are now reported (see warnUnreadable in the
+        // CLI and unreadable_locks in lock_query).
+        const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/;
+        const isStamp = (v: unknown): boolean => typeof v === 'string' && STAMP.test(v.trim());
+        if (typeof fm.id !== 'string') missing.push('id');
+        if (!isStamp(fm.created)) missing.push('created');
+        if (!isStamp(fm.updated)) missing.push('updated');
+        if (fm.status !== 'active' && fm.status !== 'done') missing.push('status');
+        if (!Array.isArray(fm.scope)) missing.push('scope');
+      }
+      if (missing.length > 0) {
+        unreadable.push({ filePath, reason: `malformed lock: missing or invalid ${missing.join(', ')}` });
+        continue;
+      }
+      records.push(record);
+    } catch (err) {
+      unreadable.push({ filePath, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  lastUnreadableLocks = unreadable;
+  return records;
 }
 
 /** Finds a lock by id, searching active first, then done. Returns null if not found in either. */
@@ -197,7 +370,7 @@ export async function queryLocks(locksRoot: string, params: QueryLocksParams): P
   const textFilter = params.text?.trim().toLowerCase();
 
   const filtered = records.filter((record) => {
-    if (params.agent_id !== undefined && record.frontmatter.agent_id !== params.agent_id) {
+    if (params.agent_id !== undefined && !agentMatches(record.frontmatter.agent_id, params.agent_id)) {
       return false;
     }
     if (scopeFilter && !scopesOverlap(scopeFilter, record.frontmatter.scope)) {
@@ -266,6 +439,17 @@ export async function updateLock(locksRoot: string, params: UpdateLockParams): P
 export interface FinishLockParams {
   lock_id: string;
   summary?: string;
+  /**
+   * The identity of whoever is finishing this lock, if known. Optional, because most
+   * existing locks carry no agent_id and requiring a match would make them
+   * unfinishable — a fix worse than the defect.
+   */
+  agent_id?: string | null;
+  /**
+   * Deliberately finish a lock held by someone else. Required when both identities are
+   * known and differ; the reason is recorded in the archive.
+   */
+  force?: boolean;
 }
 
 export interface FinishLockResult {
@@ -300,6 +484,39 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
 
   if (params.summary) {
     record.notes.push(params.summary);
+  }
+
+  // finishLock enforces NEITHER staleness NOR ownership: any caller can finish any
+  // lock, including another session's live one, with no flag. `reap` refuses that for
+  // a named non-stale lock, so the guarantee people remember ("never a back door to
+  // force-finish someone else's live work") does not hold here at all.
+  //
+  // Enforcement is NOT the fix: most locks carry agent_id null, so requiring a match
+  // would make them unfinishable. What is fixable now is the SILENCE — a lock finished
+  // by someone else is currently indistinguishable from one finished by its holder, so
+  // the done archive cannot answer "who ended this claim?" and the audit that depends
+  // on it inherits the gap.
+  // OWNERSHIP, enforced exactly as far as the data allows and no further.
+  //
+  // Refuse only when BOTH identities are known and differ. That closes the accidental
+  // path — the failure actually observed — without making any existing lock
+  // unfinishable: most carry agent_id null, and a caller that supplies no identity is
+  // unchanged. Enforcing more would strand real locks, which is worse than the defect.
+  //
+  // `force` is deliberate, recorded, and not hidden: a caller who must end someone
+  // else's claim can, and the archive says so afterwards. A refusal nobody can get past
+  // becomes a refusal everyone routes around.
+  const holder = record.frontmatter.agent_id;
+  const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
+  if (foreign && !params.force) {
+    throw new LockNotOwnedError(params.lock_id, holder, params.agent_id!);
+  }
+  if (foreign) {
+    record.notes.push(
+      `Force-finished by ${params.agent_id}, which is NOT the holder (${holder}). ` +
+        `This note is the only record that the claim was ended by someone other than ` +
+        `whoever made it.`,
+    );
   }
   record.frontmatter.status = 'done';
   record.frontmatter.updated = formatTimestamp();
@@ -390,7 +607,28 @@ export class LockNotStaleError extends Error {
  * "nobody was heard from and this got cleaned up automatically."
  */
 export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksParams = {}): Promise<ReapedLock[]> {
-  const staleMinutes = resolveStaleMinutes(params.stale_minutes);
+  // A caller-supplied threshold may only LENGTHEN the reaping window, never shorten it.
+  //
+  // WHY THIS FLOOR EXISTS — do not remove it to "respect the caller's flag".
+  // The singular form (lock_id given) refuses a non-stale lock via LockNotStaleError,
+  // and the README promises reap is "never a back door to force-finish someone else's
+  // live work". That promise held for the singular form ONLY. The plural form took this
+  // threshold straight from the caller with no lower bound, so
+  // `reap --stale-minutes 0.01` finished every active lock in a repo — exit 0, no
+  // confirmation, no refusal. Demonstrated against this binary on 2026-09-03, against
+  // locks held by other sessions.
+  //
+  // The floor is applied HERE rather than in resolveStaleMinutes deliberately: read
+  // paths (lock_query, lock_check_conflict) may legitimately ask "what would look stale
+  // at 5 minutes?", which is informational and harmless. Only the destructive path
+  // needs the bound.
+  const requested = resolveStaleMinutes(params.stale_minutes);
+  const floor = resolveStaleMinutes(undefined);
+  const staleMinutes = Math.max(requested, floor);
+  // Record it. A floor that silently changes the answer produces a FALSE report:
+  // "No stale locks to reap" when locks are stale by the threshold the caller asked
+  // for and were merely protected. Callers must be able to say what actually ran.
+  lastReapFloor = staleMinutes === requested ? null : { requested, applied: staleMinutes };
   const now = new Date();
   const activeRecords = await readAllRecords(locksRoot, 'active');
 
@@ -421,9 +659,14 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
     reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
     if (params.dry_run) continue;
 
+    // Record the EXACT prior last-touch stamp before overwriting it below.
+    // `updated` is set to now on reap, which erases the inter-touch interval — the
+    // one quantity anyone tuning the staleness threshold needs. A minute-rounded
+    // English sentence is not a recoverable datum, so keep the raw timestamp.
     record.notes.push(
-      `Auto-reaped: no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s) ` +
-        `(threshold: ${staleMinutes} minute(s)).`,
+      `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), ` +
+        `no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), ` +
+        `threshold ${staleMinutes} minute(s).`,
     );
     record.frontmatter.status = 'done';
     record.frontmatter.updated = formatTimestamp();

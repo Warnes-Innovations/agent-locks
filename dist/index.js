@@ -216,6 +216,27 @@ function resolveStaleMinutes(override) {
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_MINUTES;
 }
+function agentMatches(stored, query) {
+  if (query === null) return stored === null;
+  if (stored === null) return false;
+  if (stored.trim().toLowerCase() === query.trim().toLowerCase()) return true;
+  const SESSION_REF = /^(?=.*\d)[A-Za-z0-9_-]{2,}$/;
+  const refOf = (v) => {
+    const m = /\[([^\]]+)\]\s*$/.exec(v.trim());
+    if (!m) {
+      const bare = v.trim();
+      return SESSION_REF.test(bare) ? bare : null;
+    }
+    const inner = m[1].trim();
+    return SESSION_REF.test(inner) ? inner : null;
+  };
+  const storedRef = refOf(stored);
+  const queryRef = refOf(query);
+  if (storedRef !== null && queryRef !== null) {
+    return storedRef.toLowerCase() === queryRef.toLowerCase();
+  }
+  return false;
+}
 var LockNotFoundError = class extends Error {
   constructor(lockId) {
     super(`No lock found with id "${lockId}".`);
@@ -228,6 +249,14 @@ var TaskNotFoundError = class extends Error {
       `Lock "${lockId}" has no task with the exact text "${taskText}". Available tasks on this lock: ${availableTasks.length > 0 ? availableTasks.map((t) => `"${t}"`).join(", ") : "(none)"}. task_text must match an existing task exactly (this tool does not do fuzzy/partial matching).`
     );
     this.name = "TaskNotFoundError";
+  }
+};
+var LockNotOwnedError = class extends Error {
+  constructor(lockId, holder, caller) {
+    super(
+      `Lock "${lockId}" is held by ${holder}, not by ${caller}. Refusing to finish another session's live claim \u2014 that is the failure this system exists to prevent, and finishing it silently is how uncommitted work loses its only marker. Coordinate with the holder first. If you genuinely must end their claim: --force on the CLI, or force:true via MCP. Either is allowed, and either is recorded in the archive.`
+    );
+    this.name = "LockNotOwnedError";
   }
 };
 var LockNotActiveError = class extends Error {
@@ -262,15 +291,53 @@ async function readRecord(filePath) {
 }
 async function writeRecord(record) {
   const contents = serializeLockFile(record);
-  await fs2.mkdir(path2.dirname(record.filePath), { recursive: true });
-  await fs2.writeFile(record.filePath, contents, "utf8");
+  const dir = path2.dirname(record.filePath);
+  await fs2.mkdir(dir, { recursive: true });
+  const tmpPath = path2.join(dir, `.${path2.basename(record.filePath)}.${process.pid}.tmp`);
+  try {
+    await fs2.writeFile(tmpPath, contents, "utf8");
+    await fs2.rename(tmpPath, record.filePath);
+  } catch (err) {
+    await fs2.rm(tmpPath, { force: true }).catch(() => {
+    });
+    throw err;
+  }
 }
+var lastReapFloor = null;
+var lastUnreadableLocks = [];
 async function readAllRecords(locksRoot, status) {
   const dirs = [];
   if (status === "active" || status === "all") dirs.push(activeDir(locksRoot));
   if (status === "done" || status === "all") dirs.push(doneDir(locksRoot));
   const files = (await Promise.all(dirs.map(listMarkdownFiles))).flat();
-  return Promise.all(files.map(readRecord));
+  const records = [];
+  const unreadable = [];
+  for (const filePath of files) {
+    try {
+      const record = await readRecord(filePath);
+      const fm = record.frontmatter;
+      const missing = [];
+      if (!fm) missing.push("frontmatter");
+      else {
+        const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/;
+        const isStamp = (v) => typeof v === "string" && STAMP.test(v.trim());
+        if (typeof fm.id !== "string") missing.push("id");
+        if (!isStamp(fm.created)) missing.push("created");
+        if (!isStamp(fm.updated)) missing.push("updated");
+        if (fm.status !== "active" && fm.status !== "done") missing.push("status");
+        if (!Array.isArray(fm.scope)) missing.push("scope");
+      }
+      if (missing.length > 0) {
+        unreadable.push({ filePath, reason: `malformed lock: missing or invalid ${missing.join(", ")}` });
+        continue;
+      }
+      records.push(record);
+    } catch (err) {
+      unreadable.push({ filePath, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  lastUnreadableLocks = unreadable;
+  return records;
 }
 async function findRecordById(locksRoot, lockId) {
   for (const dir of [activeDir(locksRoot), doneDir(locksRoot)]) {
@@ -326,7 +393,7 @@ async function queryLocks(locksRoot, params) {
   const scopeFilter = params.scope === void 0 ? void 0 : [].concat(params.scope);
   const textFilter = params.text?.trim().toLowerCase();
   const filtered = records.filter((record) => {
-    if (params.agent_id !== void 0 && record.frontmatter.agent_id !== params.agent_id) {
+    if (params.agent_id !== void 0 && !agentMatches(record.frontmatter.agent_id, params.agent_id)) {
       return false;
     }
     if (scopeFilter && !scopesOverlap(scopeFilter, record.frontmatter.scope)) {
@@ -390,6 +457,16 @@ async function finishLock(locksRoot, params) {
   if (params.summary) {
     record.notes.push(params.summary);
   }
+  const holder = record.frontmatter.agent_id;
+  const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
+  if (foreign && !params.force) {
+    throw new LockNotOwnedError(params.lock_id, holder, params.agent_id);
+  }
+  if (foreign) {
+    record.notes.push(
+      `Force-finished by ${params.agent_id}, which is NOT the holder (${holder}). This note is the only record that the claim was ended by someone other than whoever made it.`
+    );
+  }
   record.frontmatter.status = "done";
   record.frontmatter.updated = formatTimestamp();
   const newFilePath = path2.join(doneDir(locksRoot), path2.basename(record.filePath));
@@ -427,7 +504,10 @@ var LockNotStaleError = class extends Error {
   }
 };
 async function reapStaleLocks(locksRoot, params = {}) {
-  const staleMinutes = resolveStaleMinutes(params.stale_minutes);
+  const requested = resolveStaleMinutes(params.stale_minutes);
+  const floor = resolveStaleMinutes(void 0);
+  const staleMinutes = Math.max(requested, floor);
+  lastReapFloor = staleMinutes === requested ? null : { requested, applied: staleMinutes };
   const now = /* @__PURE__ */ new Date();
   const activeRecords = await readAllRecords(locksRoot, "active");
   const candidates = activeRecords.filter((record) => {
@@ -453,7 +533,7 @@ async function reapStaleLocks(locksRoot, params = {}) {
     reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
     if (params.dry_run) continue;
     record.notes.push(
-      `Auto-reaped: no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s) (threshold: ${staleMinutes} minute(s)).`
+      `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
     );
     record.frontmatter.status = "done";
     record.frontmatter.updated = formatTimestamp();
@@ -476,11 +556,11 @@ Recommended workflow, in order:
 1. Before starting work on a set of files, call lock_query (default view, active locks only) to see what other agents are already doing, and call lock_check_conflict with the globs you're about to touch to see if anyone's active lock overlaps them. lock_check_conflict is purely informational \u2014 it never blocks you, it just gives you information to make your own judgment call with.
 2. If you decide to proceed, call lock_create to claim the work: give it a title, the glob patterns describing what you're touching, and a checklist of the tasks you plan to do.
 3. As you actually complete each task, call lock_update immediately \u2014 not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime. If you're doing a long stretch of work without a task boundary to check off, call lock_heartbeat periodically so your lock doesn't read as abandoned to anyone else watching.
-4. When the work is done, call lock_finish with a short summary. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
+4. When the work is COMMITTED \u2014 not merely when the edits are done \u2014 call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
 
 Working in a different repository than the one you are rooted in: every tool accepts an optional base_dir \u2014 any path inside the target repository. Locks then resolve from THAT repository's shared .git rather than from the current working directory. Use it whenever you are about to write into another repo: a lock created where you happen to be standing, instead of where you are writing, is invisible to the one agent who needed to see it. A base_dir that is not inside a git repository is a hard error, never a silent fallback to the current directory.
 
-Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) \u2014 true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict \u2014 nothing is ever cleaned up as a side effect of reading. If you see a stale lock that's blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it, so it can't be used as a workaround to force-finish someone else's live work.
+Staleness: every lock returned by lock_query / lock_check_conflict carries a computed \`stale\` flag (and \`staleForSeconds\`) \u2014 true when an ACTIVE lock hasn't been touched (create, lock_update, or lock_heartbeat) in over ${DEFAULT_STALE_MINUTES} minutes (configurable via the AGENT_LOCKS_STALE_MINUTES environment variable, or per-call). This is informational, exactly like lock_check_conflict \u2014 nothing is ever cleaned up as a side effect of reading. If you see a stale lock that's blocking your own work, call lock_reap on it explicitly; it will refuse (with a clear error) if the lock turns out not to actually be stale by the time you call it, so it can't be used as a workaround to force-finish someone else's live work. A supplied stale_minutes may only LENGTHEN the window (it is floored at the default), so a small value cannot be used to reap live locks.
 
 Honesty note on agent identity: this server cannot detect your agent id or your parent agent's id automatically \u2014 no MCP transport mechanism exposes that. Pass agent_id/parent_agent_id to lock_create only if you already know them from your own context (e.g. an orchestration harness gave you an explicit id); otherwise omit them and they will be recorded as null. Do not guess or fabricate an id.`;
 function textResult(text) {
@@ -519,7 +599,17 @@ function createServer() {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
-        return textResult(JSON.stringify(results, null, 2));
+        return textResult(
+          JSON.stringify(
+            {
+              locks: results,
+              unreadable_locks: lastUnreadableLocks,
+              ...lastUnreadableLocks.length > 0 ? { warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included in "locks". A claim you cannot see is a claim you will collide with.` } : {}
+            },
+            null,
+            2
+          )
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -544,7 +634,17 @@ function createServer() {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await checkConflicts(locksRoot, scope, stale_minutes);
-        return textResult(JSON.stringify(results, null, 2));
+        return textResult(
+          JSON.stringify(
+            {
+              conflicts: results,
+              unreadable_locks: lastUnreadableLocks,
+              ...lastUnreadableLocks.length > 0 ? { warning: `${lastUnreadableLocks.length} lock file(s) could not be read, so this is NOT a complete conflict check.` } : {}
+            },
+            null,
+            2
+          )
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -616,17 +716,23 @@ function createServer() {
       inputSchema: {
         lock_id: z.string().describe("The id of the active lock to finish."),
         summary: z.string().optional().describe("Optional closing summary appended to the Notes section before the lock is archived."),
+        agent_id: z.string().optional().describe(
+          "Your own agent id. Supply it so ownership can be checked: finishing a lock held by a DIFFERENT session is refused unless force is set. Omit it and no check is possible."
+        ),
+        force: z.boolean().optional().describe(
+          "Deliberately finish a lock held by someone else. Required when both identities are known and differ; the fact is recorded in the archived lock."
+        ),
         base_dir: z.string().optional().describe(
           "Target a different repository by its working-tree path (or any path inside it). The lock is looked up in that repository's shared .git directory. Omit to use the current working directory."
         )
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
     },
-    async ({ lock_id, summary, base_dir }) => {
+    async ({ lock_id, summary, agent_id, force, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
-        const result = await finishLock(locksRoot, { lock_id, summary });
+        const result = await finishLock(locksRoot, { lock_id, summary, agent_id, force });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -661,7 +767,7 @@ function createServer() {
     "lock_reap",
     {
       title: "Reap stale lock(s)",
-      description: "Finishes (moves to the done archive, same mechanism as lock_finish) every ACTIVE lock currently computed as stale, or a single specific one if lock_id is given. This is an explicit, deliberate mutation \u2014 never a side effect of lock_query or lock_check_conflict reading state. Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (with how long) rather than finished by its owning agent, so the done archive stays honest. If lock_id is given but that lock is NOT actually stale, this errors rather than reaping it \u2014 reap cannot be used as a workaround to force-finish someone else's live work. Pass dry_run: true to see what WOULD be reaped without writing anything.",
+      description: "Finishes (moves to the done archive, same mechanism as lock_finish) every ACTIVE lock currently computed as stale, or a single specific one if lock_id is given. This is an explicit, deliberate mutation \u2014 never a side effect of lock_query or lock_check_conflict reading state. Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (with how long) rather than finished by its owning agent, so the done archive stays honest. If lock_id is given but that lock is NOT actually stale, this errors rather than reaping it \u2014 reap cannot be used as a workaround to force-finish someone else's live work. A supplied stale_minutes may only LENGTHEN the window; it is floored at the default, so it cannot shorten the way to a live lock. Pass dry_run: true to see what WOULD be reaped without writing anything.",
       inputSchema: {
         lock_id: z.string().optional().describe("Reap only this lock id. Omit to reap every currently-stale active lock."),
         stale_minutes: z.number().positive().optional().describe(`Override the staleness threshold (minutes) for this call only. Defaults to AGENT_LOCKS_STALE_MINUTES or ${DEFAULT_STALE_MINUTES}.`),
@@ -677,7 +783,7 @@ function createServer() {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const result = await reapStaleLocks(locksRoot, { lock_id, stale_minutes, dry_run });
-        return textResult(JSON.stringify(result, null, 2));
+        return textResult(JSON.stringify({ reaped: result, floor: lastReapFloor }, null, 2));
       } catch (error) {
         return errorResult(error);
       }
@@ -697,7 +803,7 @@ Usage:
   agent-locks check <scope...>          Check whether any active lock overlaps the given glob(s). Informational only \u2014 exits 0 either way.
   agent-locks claim [options]           Create a new lock. See "agent-locks claim --help".
   agent-locks update <lock-id> [options]  Mark a task done/undone on an existing lock. See "agent-locks update --help".
-  agent-locks finish <lock-id> [--summary <text>]  Mark a lock done and archive it.
+  agent-locks finish <lock-id> [--summary <text>] [--agent <id>] [--force]  Mark a lock done and archive it. Pass --agent so ownership can be checked; --force is required (and recorded) to end another session's claim.
   agent-locks heartbeat <lock-id>        Bump a lock's updated timestamp with no other change. See "Staleness detection" in the README.
   agent-locks reap [lock-id] [options]  Finish stale lock(s). See "agent-locks reap --help".
   agent-locks --help                    Show this message.
@@ -742,6 +848,8 @@ var REAP_USAGE = `agent-locks reap [lock-id] [options]
 Reaps (finishes, same as "agent-locks finish") every currently-stale active lock, or a
 single one if lock-id is given. Refuses to reap a named lock-id that isn't actually
 stale \u2014 never a back door to force-finish someone else's live work.
+A supplied --stale-minutes may only LENGTHEN the window, never shorten it: it is
+floored at the configured default, so this cannot be used to reap live locks.
 
 Options:
   --stale-minutes <n>    Override the staleness threshold for this call only. Defaults
@@ -755,7 +863,7 @@ var CLI_PREFIX = "agent-locks: ";
 function printError(message) {
   console.error(message.startsWith(CLI_PREFIX) ? message : `${CLI_PREFIX}${message}`);
 }
-var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help", "--dry-run"]);
+var BOOLEAN_FLAGS = /* @__PURE__ */ new Set(["--json", "--done", "--undone", "--help", "--dry-run", "--force"]);
 function parseArgs(argv) {
   const positionals = [];
   const flags = /* @__PURE__ */ new Map();
@@ -788,6 +896,15 @@ function oneOf(flags, name) {
 }
 function allOf(flags, name) {
   return flags.get(name) ?? [];
+}
+function warnUnreadable() {
+  if (lastUnreadableLocks.length === 0) return;
+  console.error(
+    `WARNING: ${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included below. A claim you cannot see is a claim you will collide with.`
+  );
+  for (const bad of lastUnreadableLocks) {
+    console.error(`  ${bad.filePath}: ${bad.reason}`);
+  }
 }
 function formatStaleForSeconds(seconds) {
   if (seconds < 60) return `${seconds}s`;
@@ -827,6 +944,7 @@ async function cmdStatus(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const locks = await queryLocks(locksRoot, {});
+  warnUnreadable();
   console.log(`agent-locks: ${locks.length} active lock(s) in ${locksRoot}
 `);
   console.log(formatLockTable(locks));
@@ -853,6 +971,7 @@ async function cmdList(flags) {
     text,
     stale_minutes
   });
+  warnUnreadable();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(locks, null, 2));
   } else {
@@ -868,6 +987,7 @@ async function cmdCheck(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const conflicts = await checkConflicts(locksRoot, scope, stale_minutes);
+  warnUnreadable();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(conflicts, null, 2));
     return;
@@ -931,9 +1051,11 @@ async function cmdFinish(flags) {
   const lockId = flags.positionals[0];
   if (!lockId) throw new CliUsageError("agent-locks finish requires a lock id as its first argument.");
   const summary = oneOf(flags.flags, "--summary");
+  const agent_id = oneOf(flags.flags, "--agent");
+  const force = flags.boolFlags.has("--force");
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
-  const result = await finishLock(locksRoot, { lock_id: lockId, summary });
+  const result = await finishLock(locksRoot, { lock_id: lockId, summary, agent_id, force });
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
   } else {
@@ -963,12 +1085,20 @@ async function cmdReap(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const reaped = await reapStaleLocks(locksRoot, { lock_id: lockId, stale_minutes, dry_run });
+  warnUnreadable();
   if (flags.boolFlags.has("--json")) {
-    console.log(JSON.stringify(reaped, null, 2));
+    console.log(JSON.stringify({ reaped, floor: lastReapFloor }, null, 2));
     return;
   }
+  if (lastReapFloor) {
+    console.log(
+      `Note: a per-call threshold may only LENGTHEN the reaping window. You asked for ${lastReapFloor.requested} minute(s); ${lastReapFloor.applied} minute(s) was used. Lower AGENT_LOCKS_STALE_MINUTES to reap more aggressively \u2014 a visible, global choice.`
+    );
+  }
   if (reaped.length === 0) {
-    console.log("No stale locks to reap.");
+    console.log(
+      lastReapFloor ? `No locks reaped at the ${lastReapFloor.applied}-minute threshold that was used. Locks stale by your requested ${lastReapFloor.requested} minute(s) but not by that one were left alone.` : "No stale locks to reap."
+    );
     return;
   }
   const verb = dry_run ? "Would reap" : "Reaped";
@@ -1020,7 +1150,7 @@ async function runCli(argv) {
       printError(error.message);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotStaleError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError) {
       printError(error.message);
       return 1;
     }
