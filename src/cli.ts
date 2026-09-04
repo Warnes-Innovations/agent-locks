@@ -506,6 +506,10 @@ async function cmdUpdate(flags: ParsedFlags): Promise<void> {
     add_scope: addScope.length > 0 ? addScope : undefined,
     remove_scope: removeScope.length > 0 ? removeScope : undefined,
   });
+  // This command WRITES a touch event. Warn on the write path for the same reason as
+  // reap: a failed append is otherwise invisible, and the log then under-reports the
+  // live intervals the staleness threshold is tuned from.
+  warnEventLog();
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(result, null, 2));
@@ -673,6 +677,7 @@ async function cmdFinish(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const result = await finishLock(locksRoot, { lock_id: lockId, summary, agent_id, force });
+  warnEventLog(); // writes a touch event — a failed append must not be silent
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(result, null, 2));
@@ -692,6 +697,7 @@ async function cmdHeartbeat(flags: ParsedFlags): Promise<void> {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const result = await heartbeatLock(locksRoot, { lock_id: lockId });
+  warnEventLog(); // writes a touch event — a failed append must not be silent
 
   if (flags.boolFlags.has('--json')) {
     console.log(JSON.stringify(result, null, 2));

@@ -487,18 +487,25 @@ async function uniqueFilePath(activeDirPath, doneDirPath, timestamp, slug) {
   for (; ; ) {
     const candidateId = suffix === 0 ? `${timestamp}-${slug}` : `${timestamp}-${slug}-${suffix + 1}`;
     const filePath = path3.join(activeDirPath, `${candidateId}.md`);
-    const takenIn = await Promise.all(
-      [filePath, path3.join(doneDirPath, `${candidateId}.md`)].map(async (candidate) => {
-        try {
-          await fs3.access(candidate);
-          return true;
-        } catch {
-          return false;
-        }
-      })
-    );
-    if (!takenIn.some(Boolean)) return { filePath, id: candidateId };
-    suffix += 1;
+    let archived = false;
+    try {
+      await fs3.access(path3.join(doneDirPath, `${candidateId}.md`));
+      archived = true;
+    } catch {
+      archived = false;
+    }
+    if (archived) {
+      suffix += 1;
+      continue;
+    }
+    try {
+      const handle = await fs3.open(filePath, "wx");
+      await handle.close();
+      return { filePath, id: candidateId };
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      suffix += 1;
+    }
   }
 }
 async function assertDestinationFree(destination, lockId, what) {
@@ -535,7 +542,13 @@ async function createLock(locksRoot, params) {
     tasks: params.tasks.map((text) => ({ text, done: false })),
     notes: []
   };
-  await writeRecord(record);
+  try {
+    await writeRecord(record);
+  } catch (err) {
+    await fs3.rm(filePath, { force: true }).catch(() => {
+    });
+    throw err;
+  }
   return { id, filePath };
 }
 async function queryLocks(locksRoot, params) {
@@ -777,29 +790,31 @@ async function reapStaleLocks(locksRoot, params = {}) {
     record.notes.push(
       `Auto-reaped: last touched ${record.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
     );
-    const lastTouch = record.frontmatter.updated;
-    record.frontmatter.status = "done";
-    record.frontmatter.finished_by = "reap";
-    record.frontmatter.updated = formatTimestamp();
-    const newFilePath = path3.join(doneDir(locksRoot), path3.basename(record.filePath));
-    const oldFilePath = record.filePath;
-    record.filePath = newFilePath;
-    await ensureDirs(locksRoot);
-    await writeRecord(record);
-    await fs3.unlink(oldFilePath);
-    await appendEvent(locksRoot, {
-      event: "reap",
-      ts: record.frontmatter.updated,
-      lock_id: record.frontmatter.id,
-      repository: record.frontmatter.repository ?? "",
-      agent_id: record.frontmatter.agent_id,
-      created: record.frontmatter.created,
-      last_touch: lastTouch,
-      age_seconds: Math.max(0, Math.round((now.getTime() - parseTimestamp(record.frontmatter.created).getTime()) / 1e3)),
-      idle_seconds: summary.staleForSeconds,
-      tasks_total: record.tasks.length,
-      tasks_done: record.tasks.filter((t) => t.done).length,
-      threshold_minutes: staleMinutes
+    await withRecordLock(record.filePath, async () => {
+      const lastTouch = record.frontmatter.updated;
+      record.frontmatter.status = "done";
+      record.frontmatter.finished_by = "reap";
+      record.frontmatter.updated = formatTimestamp();
+      const newFilePath = path3.join(doneDir(locksRoot), path3.basename(record.filePath));
+      const oldFilePath = record.filePath;
+      record.filePath = newFilePath;
+      await ensureDirs(locksRoot);
+      await writeRecord(record);
+      await fs3.unlink(oldFilePath);
+      await appendEvent(locksRoot, {
+        event: "reap",
+        ts: record.frontmatter.updated,
+        lock_id: record.frontmatter.id,
+        repository: record.frontmatter.repository ?? "",
+        agent_id: record.frontmatter.agent_id,
+        created: record.frontmatter.created,
+        last_touch: lastTouch,
+        age_seconds: Math.max(0, Math.round((now.getTime() - parseTimestamp(record.frontmatter.created).getTime()) / 1e3)),
+        idle_seconds: summary.staleForSeconds,
+        tasks_total: record.tasks.length,
+        tasks_done: record.tasks.filter((t) => t.done).length,
+        threshold_minutes: staleMinutes
+      });
     });
   }
   return reaped;
@@ -1543,6 +1558,7 @@ async function cmdUpdate(flags) {
     add_scope: addScope.length > 0 ? addScope : void 0,
     remove_scope: removeScope.length > 0 ? removeScope : void 0
   });
+  warnEventLog();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
     return;
@@ -1676,6 +1692,7 @@ async function cmdFinish(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const result = await finishLock(locksRoot, { lock_id: lockId, summary, agent_id, force });
+  warnEventLog();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
   } else {
@@ -1692,6 +1709,7 @@ async function cmdHeartbeat(flags) {
   const cwd = resolveBaseDir(flags);
   const locksRoot = await resolveLocksRoot(cwd);
   const result = await heartbeatLock(locksRoot, { lock_id: lockId });
+  warnEventLog();
   if (flags.boolFlags.has("--json")) {
     console.log(JSON.stringify(result, null, 2));
   } else {

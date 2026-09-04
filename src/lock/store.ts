@@ -448,18 +448,34 @@ async function uniqueFilePath(
   for (;;) {
     const candidateId = suffix === 0 ? `${timestamp}-${slug}` : `${timestamp}-${slug}-${suffix + 1}`;
     const filePath = path.join(activeDirPath, `${candidateId}.md`);
-    const takenIn = await Promise.all(
-      [filePath, path.join(doneDirPath, `${candidateId}.md`)].map(async (candidate) => {
-        try {
-          await fs.access(candidate);
-          return true;
-        } catch {
-          return false;
-        }
-      }),
-    );
-    if (!takenIn.some(Boolean)) return { filePath, id: candidateId };
-    suffix += 1;
+
+    // The archive is checked by a plain probe: an archived id is never re-issued, and
+    // nothing else is competing to create files in there.
+    let archived = false;
+    try {
+      await fs.access(path.join(doneDirPath, `${candidateId}.md`));
+      archived = true;
+    } catch {
+      archived = false;
+    }
+    if (archived) {
+      suffix += 1;
+      continue;
+    }
+
+    // The ACTIVE id is claimed by CREATING the file exclusively, not by probing it.
+    // Probe-then-write is a TOCTOU: twelve concurrent claims with the same title all
+    // saw the same id free and all took it, leaving ONE lock on disk and eleven
+    // callers each holding an id for a claim that no longer exists. Measured before
+    // this was atomic. O_CREAT|O_EXCL makes exactly one creator win.
+    try {
+      const handle = await fs.open(filePath, 'wx');
+      await handle.close();
+      return { filePath, id: candidateId };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      suffix += 1;
+    }
   }
 }
 
@@ -522,7 +538,15 @@ export async function createLock(locksRoot: string, params: CreateLockParams): P
     tasks: params.tasks.map((text): LockTask => ({ text, done: false })),
     notes: [],
   };
-  await writeRecord(record);
+  try {
+    await writeRecord(record);
+  } catch (err) {
+    // uniqueFilePath reserved the id by creating an EMPTY file. If the real write
+    // fails, that placeholder would be read by everyone as a corrupt lock, so the
+    // reservation has to be released rather than left behind.
+    await fs.rm(filePath, { force: true }).catch(() => {});
+    throw err;
+  }
   return { id, filePath };
 }
 
@@ -1013,6 +1037,11 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
         `no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), ` +
         `threshold ${staleMinutes} minute(s).`,
     );
+    // Serialize like every other mutator. Reap is the ADJACENT function to the ones
+    // that were fixed first, and it writes the same records — an unserialized reap
+    // racing an update archives a record it read before that update, discarding it.
+    // eslint-disable-next-line no-await-in-loop
+    await withRecordLock(record.filePath, async () => {
     const lastTouch = record.frontmatter.updated;
     record.frontmatter.status = 'done';
     record.frontmatter.finished_by = 'reap';
@@ -1049,6 +1078,7 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
       tasks_total: record.tasks.length,
       tasks_done: record.tasks.filter((t) => t.done).length,
       threshold_minutes: staleMinutes,
+    });
     });
   }
 

@@ -648,3 +648,24 @@ describe('CLI surface roster', () => {
     }
   });
 });
+
+describe('event-log warnings on the WRITE path', () => {
+  // Fixing cmdReap alone was fixing the instance and leaving the class: update,
+  // finish and heartbeat all write touch events too, and all three were silent.
+  // A failed append there under-reports exactly the live intervals the staleness
+  // threshold is meant to be tuned from.
+  it.each(['update', 'heartbeat', 'finish'])('%s warns when the event-log append fails', async (verb) => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', `Log ${verb}`, '--scope', 'src/a/**', '--task', 'tt']);
+    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+
+    // Make the log unwritable by putting a directory where the file goes.
+    await fs.mkdir(path.join(repo, '.git', 'agents-locks', 'events.jsonl'), { recursive: true });
+
+    errors.length = 0;
+    const argv = verb === 'update' ? ['update', lockId, '--task', 'tt', '--done'] : [verb, lockId];
+    const code = await runCliIn(repo, argv);
+    expect(code).toBe(0); // the operation itself must still succeed
+    expect(errors.join('\n'), `${verb} swallowed an event-log failure`).toContain('problem(s) with the event log');
+  });
+});
