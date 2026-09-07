@@ -1,0 +1,11 @@
+# Repository policy: main is protected. Reach it through a pull request.
+#
+# One fnmatch pattern per line. This file is TRACKED, so the policy propagates to
+# fresh clones and supersedes any clone-local hookshim.protectedbranch value —
+# which is the point: a machine-local setting is invisible to everyone else.
+#
+# `main` is also hookshim's built-in default, so this file does not change what is
+# protected today. It states the policy rather than inheriting it, so the
+# protection survives a change to those defaults and a reader can see it is
+# deliberate. CONTRIBUTING.md carries the same rule in prose for humans.
+main

@@ -19,9 +19,19 @@ one where none are.
 
 ## Where to send changes
 
-- **Pull requests target `main`.** There is no `devel` branch here; every merged PR to
-  date (#1, #2, #3, #5) targeted `main` directly.
-- Branch from `main`, keep the branch focused, and rebase rather than merge `main` back in.
+- **Pull requests target `main`, and `main` is protected** — `.hookshim` at the repo root
+  names it, so a direct push is refused by the pre-push hook. Reach it through a PR.
+- **There IS a `devel` branch**, used as an integration branch: work lands there first and
+  reaches `main` by PR. PRs #1, #2, #3 and #5 came from topic branches directly; **#4 came
+  from `devel`**. Either route is fine — what is not fine is pushing to `main`.
+- Branch from `main` (or from `devel` if you are joining work already staged there), keep
+  the branch focused, and rebase rather than merge the base back in.
+
+> An earlier version of this section stated "There is no `devel` branch here" and listed
+> the merged PRs as #1, #2, #3, #5 — omitting #4, which is the one that came from `devel`.
+> Both halves were wrong at the time of writing. Noted rather than silently corrected,
+> because a contributor who read the old text and branched accordingly was following the
+> documentation, not disregarding it.
 
 ## Development workflow
 
