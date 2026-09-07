@@ -23,6 +23,7 @@ import {
   ScopeAmendmentError,
   EmptyScopeError,
   EmptyUpdateError,
+  ScopeNarrowingRefusedError,
   IncompleteTaskUpdateError,
 } from './lock/store.js';
 import { checkScopeDrift } from './lock/drift.js';
@@ -264,7 +265,8 @@ export function createServer(): McpServer {
         'Call this AS SOON as a task actually completes — not batched at the end of your work — so other agents watching lock_query see live progress. ' +
         'task_text must match an EXISTING task\'s text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock\'s actual task texts rather than silently doing nothing. ' +
         'task_text and done are required TOGETHER, and both are optional overall, so a scope amendment or a note does not have to flip a task to be recorded. ' +
-        'AMENDING SCOPE: pass add_scope to widen the claim as the work grows (the common case — scope is declared when you know least about what you will touch), or scope to replace it outright, which is how a lock that over-claimed gets narrowed instead of left blocking others. ' +
+        'AMENDING SCOPE: pass add_scope to widen the claim as the work grows (the common case — scope is declared when you know least about what you will touch), or set_scope to replace it outright, which is how a lock that over-claimed gets narrowed instead of left blocking others. ' +
+        'A replacement that DROPS globs takes protection away, so it is gated the same way lock_finish is: refused when the lock is held by a different, named agent, unless force:true — which is recorded on the lock. Widening is never gated. ' +
         'The two are mutually exclusive. Amendments are appended to the lock file\'s scope_history with a timestamp rather than overwriting the old value silently, so a later reader can reconstruct what this lock claimed at the moment another agent checked it. ' +
         'The result ALWAYS echoes the lock\'s current scope, amended or not, along with a prompt to re-derive it against what you are really editing — because lock_check_conflict matches these globs, and any file outside them is invisible to every other agent looking for a conflict. ' +
         'Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).',
@@ -285,12 +287,26 @@ export function createServer(): McpServer {
             'Glob patterns to ADD to this lock\'s existing scope — the usual way to keep a claim honest as work grows beyond what you first declared. ' +
               'Adding a glob already claimed is a no-op and records no amendment. Mutually exclusive with `scope`.',
           ),
-        scope: z
+        set_scope: z
           .array(z.string())
           .optional()
           .describe(
             'REPLACE this lock\'s scope with these glob patterns. Use to narrow a lock that over-claimed, rather than leaving it blocking work it is not really doing. ' +
-              'Must contain at least one non-empty pattern — an empty scope would still read as an active claim in lock_query while matching nothing in lock_check_conflict. Mutually exclusive with `add_scope`.',
+              'Must contain at least one non-empty pattern — an empty scope would still read as an active claim in lock_query while matching nothing in lock_check_conflict. Mutually exclusive with `add_scope`. ' +
+              'Named set_scope and NOT scope deliberately: `scope` is what lock_create calls the whole claim, so copying create arguments into an update would silently REPLACE a claim you had been widening.',
+          ),
+        agent_id: z
+          .string()
+          .nullable()
+          .optional()
+          .describe(
+            'Your own agent id, if you already know it. Used ONLY to detect a narrowing of someone else\'s claim; widening never consults it, and it is never fabricated. Same honesty caveat as lock_create.',
+          ),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Proceed with a narrowing that would otherwise be refused because the lock is held by another session. Deliberate and RECORDED on the lock — a refusal nobody can get past becomes one everyone routes around.',
           ),
         note: z.string().optional().describe('Optional free-text note to append to the lock\'s Notes section.'),
         base_dir: z
@@ -307,7 +323,7 @@ export function createServer(): McpServer {
       // whether to confirm should be told that is possible.
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ lock_id, task_text, done, note, scope, add_scope, base_dir }) => {
+    async ({ lock_id, task_text, done, note, set_scope, add_scope, agent_id, force, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const [locksRoot, repoRoot] = await Promise.all([resolveLocksRoot(cwd), resolveRepoRoot(cwd)]);
@@ -316,8 +332,10 @@ export function createServer(): McpServer {
           task_text,
           done,
           note,
-          scope,
+          set_scope,
           add_scope,
+          agent_id,
+          force,
           repository: repoRoot,
         });
         return textResult(JSON.stringify(result, null, 2));
@@ -504,4 +522,5 @@ export {
   EmptyScopeError,
   EmptyUpdateError,
   IncompleteTaskUpdateError,
+  ScopeNarrowingRefusedError,
 };

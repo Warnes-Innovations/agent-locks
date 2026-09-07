@@ -142,6 +142,20 @@ export class LockNotOwnedError extends Error {
   }
 }
 
+export class ScopeNarrowingRefusedError extends Error {
+  constructor(lockId: string, holder: string, caller: string, removed: string[]) {
+    super(
+      `Lock "${lockId}" is held by ${holder}, not by ${caller}, and this update would REMOVE ` +
+        `${removed.map((g) => `"${g}"`).join(', ')} from its claim. Refusing: narrowing another session's ` +
+        `live claim makes their work invisible to every conflict check while their lock still reads as ` +
+        `active and healthy — quieter than finishing it, and harder to notice. Coordinate with the holder ` +
+        `first. If you genuinely must: force:true via MCP, or --force on the CLI. Either is allowed, and ` +
+        `either is recorded on the lock.`,
+    );
+    this.name = 'ScopeNarrowingRefusedError';
+  }
+}
+
 export class LockNotActiveError extends Error {
   constructor(lockId: string) {
     super(`Lock "${lockId}" is not active (it may already be finished), so it cannot be finished again.`);
@@ -598,6 +612,10 @@ export interface UpdateLockParams extends ScopeAmendmentRequest {
   note?: string;
   /** Canonical repository root, used only to backfill locks written before that field existed. */
   repository?: string;
+  /** The caller's own agent id, if known. Used only to detect a FOREIGN narrowing; never fabricate it. */
+  agent_id?: string | null;
+  /** Proceed with a narrowing that would otherwise be refused. Deliberate, and recorded on the lock. */
+  force?: boolean;
   /** Which command names the echoed scope-check prompt should name. Defaults to 'mcp'. */
   dialect?: ScopeCheckDialect;
 }
@@ -624,7 +642,7 @@ export interface UpdateLockResult {
 
 export async function updateLock(locksRoot: string, params: UpdateLockParams): Promise<UpdateLockResult> {
   const wantsTaskFlip = params.task_text !== undefined || params.done !== undefined;
-  const wantsScopeAmendment = params.scope !== undefined || params.add_scope !== undefined;
+  const wantsScopeAmendment = params.set_scope !== undefined || params.add_scope !== undefined;
   // `note === undefined` was the wrong test: an empty-or-whitespace note passed
   // the guard and then recorded nothing (the write below is `if (params.note)`),
   // bumping `updated` for a call that did nothing — precisely what this error's
@@ -676,6 +694,33 @@ export async function updateLock(locksRoot: string, params: UpdateLockParams): P
       ];
       record.frontmatter.scope = amendment.next;
       if (amendment.removed.length > 0) {
+        // OWNERSHIP, enforced exactly as far as the data allows — the same shape as
+        // finishLock, and gated on the NARROWING rather than on amendment at large.
+        // Widening stays frictionless; only the operation that takes protection away
+        // is refused, and only when both identities are known and differ. Most locks
+        // carry agent_id null, so requiring a match would strand them.
+        //
+        // Evaluated here, inside the guard, against the freshly-read record: deciding
+        // "is this mine?" from an earlier scan can pass on a holder that no longer
+        // holds it.
+        const holder = record.frontmatter.agent_id;
+        const foreign =
+          params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
+        if (foreign && !params.force) {
+          throw new ScopeNarrowingRefusedError(
+            params.lock_id,
+            holder,
+            params.agent_id as string,
+            amendment.removed,
+          );
+        }
+        if (foreign) {
+          record.notes.push(
+            `Scope force-narrowed by ${params.agent_id}, which is NOT the holder (${holder}). ` +
+              `Dropped ${amendment.removed.map((g) => `\`${g}\``).join(', ')}. This note is the only ` +
+              `record that another session's claim was reduced.`,
+          );
+        }
         // Mirror lock_reap's auto-generated honesty note. A narrowing removes
         // protection from files that may still be in flight, and unlike a reap
         // it leaves the lock reading as active and healthy — so the fact that

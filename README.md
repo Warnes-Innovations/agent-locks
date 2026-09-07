@@ -212,14 +212,18 @@ Returns `{id, filePath, scope, scopeCheck}` — the scope it actually recorded, 
 ```json
 { "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "task_text": "Reproduce the flake", "done": true, "note": "Repro'd via 50x loop with -t 30s" } }
 { "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "add_scope": ["backend/src/telemetry/**"] } }
-{ "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "scope": ["backend/src/oauth/callback.ts"] } }
+{ "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "set_scope": ["backend/src/oauth/callback.ts"], "agent_id": "subagent-4f2a" } }
 ```
 
 Checks a task off, amends the scope, and/or appends a note — **any combination, at least one required**. A call with nothing to do is an error rather than a silent timestamp bump; the operation that only says "I'm still alive" is `lock_heartbeat`, and keeping the two distinguishable is the point.
 
 `task_text` must match an existing task **exactly** (chosen deliberately over fuzzy/partial matching — it's the unambiguous, predictable default). A non-matching `task_text` returns a real MCP tool error (`isError: true`) listing the lock's actual task texts, never a silent no-op. `task_text` and `done` are required **together** — both optional overall, so amending scope or adding a note doesn't have to flip a task, but supplying one without the other is an error rather than a guess.
 
-`add_scope` widens the claim; `scope` replaces it outright (how a lock that over-claimed gets narrowed instead of left blocking others). They are mutually exclusive — applying both would require guessing an order. Adding a glob already claimed is a no-op that records no amendment, so `lock_update` stays idempotent.
+`add_scope` widens the claim; `set_scope` replaces it outright (how a lock that over-claimed gets narrowed instead of left blocking others). They are mutually exclusive — applying both would require guessing an order. Adding a glob already claimed is a no-op that records no amendment, so `lock_update` stays idempotent.
+
+**Why `set_scope` and not `scope`.** `scope` is what `lock_create` calls the *whole claim*, so an agent copying its create arguments into an update would silently replace a claim it had been widening — a destructive operation reached by a copy-paste that looks like a no-op. The CLI flag was `--set-scope` from the start; the MCP surface now matches it. Renamed before first release, so no caller ever saw `scope`.
+
+**A replacement that DROPS globs is gated, the same way `lock_finish` is.** Narrowing takes protection away, and does it quietly — the lock goes on reading as active and healthy while the files it used to cover become invisible to every conflict check. So it is refused when the lock is held by a *different, named* agent, unless `force: true`, which is recorded on the lock. Refused only when **both** identities are known and differ: most locks carry `agent_id: null`, and requiring a match would strand them. Widening is never gated. As with `lock_finish`, `agent_id` is self-asserted and unverified, so this narrows accidents rather than preventing impersonation.
 
 Returns `{id, percentComplete, scope, scopeChanged, scopeCheck}`, plus `previousScope` when the scope actually changed, so the before/after diff is visible in the transcript rather than having to be inferred; plus `removedFromScope` and `warnings` when the amendment **narrowed** the claim. **The scope is echoed on every call, amended or not.**
 

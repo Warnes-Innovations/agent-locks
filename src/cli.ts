@@ -38,6 +38,7 @@ import {
   TaskNotFoundError,
   LockNotActiveError,
   LockNotOwnedError,
+  ScopeNarrowingRefusedError,
   LockNotStaleError,
   ScopeAmendmentError,
   EmptyScopeError,
@@ -114,6 +115,10 @@ Options:
   --add-scope <glob>     Add a glob to the lock's existing scope. Repeatable. The usual amendment.
   --set-scope <glob>     Replace the lock's whole scope with these globs. Repeatable. Use to
                           narrow a lock that over-claimed. Mutually exclusive with --add-scope.
+  --agent <id>           Your own agent id, so ownership can be checked when this narrows
+                          the claim. Widening never needs it.
+  --force                Proceed with a narrowing that would otherwise be refused because
+                          the lock is held by someone else. Recorded on the lock.
   --note <text>           Append a free-text note to the lock.
   --base-dir <path>      Look up the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
@@ -211,7 +216,8 @@ const SUBCOMMAND_FLAGS: Record<string, string[]> = {
   check: ['--stale-minutes', '--base-dir', '--json', '--help'],
   claim: ['--title', '--scope', '--task', '--agent', '--parent', '--base-dir', '--json', '--help'],
   update: [
-    '--task', '--done', '--undone', '--add-scope', '--set-scope', '--note', '--base-dir', '--json', '--help',
+    '--task', '--done', '--undone', '--add-scope', '--set-scope', '--note',
+    '--agent', '--force', '--base-dir', '--json', '--help',
   ],
   drift: ['--base-dir', '--json', '--help'],
   finish: ['--summary', '--agent', '--force', '--base-dir', '--json', '--help'],
@@ -472,8 +478,10 @@ async function cmdUpdate(flags: ParsedFlags): Promise<void> {
     task_text: taskText,
     done,
     note,
+    agent_id: oneOf(flags.flags, '--agent') ?? null,
+    force: flags.boolFlags.has('--force'),
     add_scope: addScope.length > 0 ? addScope : undefined,
-    scope: setScope.length > 0 ? setScope : undefined,
+    set_scope: setScope.length > 0 ? setScope : undefined,
     dialect: 'cli',
   });
 
@@ -700,6 +708,7 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof TaskNotFoundError ||
       error instanceof LockNotActiveError ||
       error instanceof LockNotOwnedError ||
+      error instanceof ScopeNarrowingRefusedError ||
       error instanceof LockNotStaleError ||
       error instanceof ScopeAmendmentError ||
       error instanceof EmptyScopeError ||

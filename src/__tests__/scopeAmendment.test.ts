@@ -14,6 +14,7 @@ import {
   lastUnreadableLocks,
   queryLocks,
   ScopeAmendmentError,
+  ScopeNarrowingRefusedError,
   TaskNotFoundError,
   updateLock,
 } from '../lock/store.js';
@@ -93,7 +94,7 @@ describe('updateLock scope amendment', () => {
 
   it('scope replaces the claim, which is how a lock that over-claimed stops blocking others', async () => {
     const id = await claim(['src/**']);
-    const result = await updateLock(locksRoot, { lock_id: id, scope: ['src/auth/**'] });
+    const result = await updateLock(locksRoot, { lock_id: id, set_scope: ['src/auth/**'] });
 
     expect(result.scope).toEqual(['src/auth/**']);
     expect(result.previousScope).toEqual(['src/**']);
@@ -164,13 +165,13 @@ describe('updateLock scope amendment', () => {
   it('rejects scope and add_scope in the same call', async () => {
     const id = await claim(['a/**']);
     await expect(
-      updateLock(locksRoot, { lock_id: id, scope: ['b/**'], add_scope: ['c/**'] }),
+      updateLock(locksRoot, { lock_id: id, set_scope: ['b/**'], add_scope: ['c/**'] }),
     ).rejects.toThrow(ScopeAmendmentError);
   });
 
   it('rejects an amendment that would leave the lock claiming nothing', async () => {
     const id = await claim(['a/**']);
-    await expect(updateLock(locksRoot, { lock_id: id, scope: [] })).rejects.toThrow(EmptyScopeError);
+    await expect(updateLock(locksRoot, { lock_id: id, set_scope: [] })).rejects.toThrow(EmptyScopeError);
   });
 });
 
@@ -410,5 +411,98 @@ describe('malformed lock files', () => {
     await expect(updateLock(locksRoot, { lock_id: id, add_scope: ['b/**'] })).rejects.toThrow(
       MalformedLockFileError,
     );
+  });
+});
+
+/**
+ * #7 — narrowing another session's claim. Gated the same way lock_finish is,
+ * and gated on the NARROWING rather than on amendment at large: widening is what
+ * agents do constantly and must stay frictionless, while dropping globs is the
+ * one amendment that takes protection away — quietly, since the lock goes on
+ * reading as active and healthy.
+ */
+describe('scope narrowing is gated like lock_finish', () => {
+  async function claimAs(agent: string, scope: string[]): Promise<string> {
+    const { id } = await createLock(locksRoot, {
+      title: 'held work',
+      scope,
+      tasks: [],
+      agent_id: agent,
+      repository: TEST_REPO,
+    });
+    return id;
+  }
+
+  it('refuses a foreign caller narrowing a held claim', async () => {
+    const id = await claimAs('Blue [aa1111]', ['src/**', 'docs/**']);
+    await expect(
+      updateLock(locksRoot, { lock_id: id, set_scope: ['src/**'], agent_id: 'Red [bb2222]' }),
+    ).rejects.toThrow(ScopeNarrowingRefusedError);
+
+    const after = await findLockById(locksRoot, id);
+    expect(after!.frontmatter.scope).toEqual(['src/**', 'docs/**']);
+  });
+
+  it('allows a foreign caller to WIDEN without any identity or force', async () => {
+    // Widening adds protection; gating it would add friction to the operation
+    // agents are supposed to perform constantly.
+    const id = await claimAs('Blue [aa1111]', ['src/**']);
+    const result = await updateLock(locksRoot, {
+      lock_id: id,
+      add_scope: ['docs/**'],
+      agent_id: 'Red [bb2222]',
+    });
+    expect(result.scope).toEqual(['src/**', 'docs/**']);
+  });
+
+  it('allows the holder to narrow their own claim', async () => {
+    const id = await claimAs('Blue [aa1111]', ['src/**', 'docs/**']);
+    const result = await updateLock(locksRoot, {
+      lock_id: id,
+      set_scope: ['src/**'],
+      agent_id: 'Blue [aa1111]',
+    });
+    expect(result.scope).toEqual(['src/**']);
+    expect(result.removedFromScope).toEqual(['docs/**']);
+  });
+
+  it('matches the holder by REF, so a renamed session keeps its own claim', async () => {
+    const id = await claimAs('Blue [aa1111]', ['src/**', 'docs/**']);
+    const result = await updateLock(locksRoot, {
+      lock_id: id,
+      set_scope: ['src/**'],
+      agent_id: 'Azure [aa1111]', // same session, renamed
+    });
+    expect(result.scope).toEqual(['src/**']);
+  });
+
+  it('allows a forced foreign narrowing, and RECORDS that it happened', async () => {
+    const id = await claimAs('Blue [aa1111]', ['src/**', 'docs/**']);
+    await updateLock(locksRoot, {
+      lock_id: id,
+      set_scope: ['src/**'],
+      agent_id: 'Red [bb2222]',
+      force: true,
+    });
+    const after = await findLockById(locksRoot, id);
+    expect(after!.frontmatter.scope).toEqual(['src/**']);
+    // The archive must be able to answer "who reduced this claim?"
+    expect(after!.notes.join('\n')).toContain('force-narrowed by Red [bb2222]');
+    expect(after!.notes.join('\n')).toContain('NOT the holder');
+  });
+
+  it('does not gate when the lock has no recorded holder, which is most locks', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'unowned',
+      scope: ['src/**', 'docs/**'],
+      tasks: [],
+      repository: TEST_REPO,
+    });
+    const result = await updateLock(locksRoot, {
+      lock_id: id,
+      set_scope: ['src/**'],
+      agent_id: 'Red [bb2222]',
+    });
+    expect(result.scope).toEqual(['src/**']);
   });
 });

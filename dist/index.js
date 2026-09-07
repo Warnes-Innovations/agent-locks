@@ -355,11 +355,11 @@ function scopesEqual(a, b) {
   return a.length === b.length && a.every((pattern, i) => pattern === b[i]);
 }
 function applyScopeAmendment(current, request) {
-  const wantsReplace = request.scope !== void 0;
+  const wantsReplace = request.set_scope !== void 0;
   const wantsAdd = request.add_scope !== void 0;
   if (wantsReplace && wantsAdd) {
     throw new ScopeAmendmentError(
-      "Pass at most one of scope (replace the whole claim) / add_scope (widen the existing claim), not both. Applying them together would require guessing an order, and would produce a scope you did not ask for."
+      "Pass at most one of set_scope (replace the whole claim) / add_scope (widen the existing claim), not both. Applying them together would require guessing an order, and would produce a scope you did not ask for."
     );
   }
   if (!wantsReplace && !wantsAdd) {
@@ -368,10 +368,10 @@ function applyScopeAmendment(current, request) {
   const currentNormalized = normalizeScope(current);
   let next;
   if (wantsReplace) {
-    next = normalizeScope(request.scope);
+    next = normalizeScope(request.set_scope);
     if (next.length === 0) {
       throw new EmptyScopeError(
-        "scope must contain at least one non-empty glob pattern. A lock claiming nothing is worse than no lock at all: it still reads as an active claim in lock_query while matching no file in lock_check_conflict. To narrow a lock, pass the globs you are actually still touching; to give up the claim entirely, call lock_finish."
+        "set_scope must contain at least one non-empty glob pattern. A lock claiming nothing is worse than no lock at all: it still reads as an active claim in lock_query while matching no file in lock_check_conflict. To narrow a lock, pass the globs you are actually still touching; to give up the claim entirely, call lock_finish."
       );
     }
   } else {
@@ -478,6 +478,14 @@ var LockNotOwnedError = class extends Error {
       `Lock "${lockId}" is held by ${holder}, not by ${caller}. Refusing to finish another session's live claim \u2014 that is the failure this system exists to prevent, and finishing it silently is how uncommitted work loses its only marker. Coordinate with the holder first. If you genuinely must end their claim: --force on the CLI, or force:true via MCP. Either is allowed, and either is recorded in the archive.`
     );
     this.name = "LockNotOwnedError";
+  }
+};
+var ScopeNarrowingRefusedError = class extends Error {
+  constructor(lockId, holder, caller, removed) {
+    super(
+      `Lock "${lockId}" is held by ${holder}, not by ${caller}, and this update would REMOVE ${removed.map((g) => `"${g}"`).join(", ")} from its claim. Refusing: narrowing another session's live claim makes their work invisible to every conflict check while their lock still reads as active and healthy \u2014 quieter than finishing it, and harder to notice. Coordinate with the holder first. If you genuinely must: force:true via MCP, or --force on the CLI. Either is allowed, and either is recorded on the lock.`
+    );
+    this.name = "ScopeNarrowingRefusedError";
   }
 };
 var LockNotActiveError = class extends Error {
@@ -728,7 +736,7 @@ var IncompleteTaskUpdateError = class extends Error {
 };
 async function updateLock(locksRoot, params) {
   const wantsTaskFlip = params.task_text !== void 0 || params.done !== void 0;
-  const wantsScopeAmendment = params.scope !== void 0 || params.add_scope !== void 0;
+  const wantsScopeAmendment = params.set_scope !== void 0 || params.add_scope !== void 0;
   const wantsNote = params.note !== void 0 && params.note.trim() !== "";
   if (!wantsTaskFlip && !wantsScopeAmendment && !wantsNote) {
     throw new EmptyUpdateError(params.lock_id);
@@ -759,6 +767,21 @@ async function updateLock(locksRoot, params) {
       ];
       record2.frontmatter.scope = amendment2.next;
       if (amendment2.removed.length > 0) {
+        const holder = record2.frontmatter.agent_id;
+        const foreign = params.agent_id != null && holder != null && !agentMatches(holder, params.agent_id);
+        if (foreign && !params.force) {
+          throw new ScopeNarrowingRefusedError(
+            params.lock_id,
+            holder,
+            params.agent_id,
+            amendment2.removed
+          );
+        }
+        if (foreign) {
+          record2.notes.push(
+            `Scope force-narrowed by ${params.agent_id}, which is NOT the holder (${holder}). Dropped ${amendment2.removed.map((g) => `\`${g}\``).join(", ")}. This note is the only record that another session's claim was reduced.`
+          );
+        }
         record2.notes.push(
           `Scope narrowed at ${now}: no longer claims ${amendment2.removed.map((g) => `\`${g}\``).join(", ")}. Those paths are now invisible to other agents' conflict checks.`
         );
@@ -1110,7 +1133,7 @@ function createServer() {
     "lock_update",
     {
       title: "Update a lock",
-      description: "Flips one task on an existing lock to done or not-done, amends the lock's scope, and/or appends a note \u2014 any combination, at least one required. Call this AS SOON as a task actually completes \u2014 not batched at the end of your work \u2014 so other agents watching lock_query see live progress. task_text must match an EXISTING task's text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock's actual task texts rather than silently doing nothing. task_text and done are required TOGETHER, and both are optional overall, so a scope amendment or a note does not have to flip a task to be recorded. AMENDING SCOPE: pass add_scope to widen the claim as the work grows (the common case \u2014 scope is declared when you know least about what you will touch), or scope to replace it outright, which is how a lock that over-claimed gets narrowed instead of left blocking others. The two are mutually exclusive. Amendments are appended to the lock file's scope_history with a timestamp rather than overwriting the old value silently, so a later reader can reconstruct what this lock claimed at the moment another agent checked it. The result ALWAYS echoes the lock's current scope, amended or not, along with a prompt to re-derive it against what you are really editing \u2014 because lock_check_conflict matches these globs, and any file outside them is invisible to every other agent looking for a conflict. Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).",
+      description: "Flips one task on an existing lock to done or not-done, amends the lock's scope, and/or appends a note \u2014 any combination, at least one required. Call this AS SOON as a task actually completes \u2014 not batched at the end of your work \u2014 so other agents watching lock_query see live progress. task_text must match an EXISTING task's text EXACTLY (no fuzzy/partial matching); if it does not match, this returns an error listing the lock's actual task texts rather than silently doing nothing. task_text and done are required TOGETHER, and both are optional overall, so a scope amendment or a note does not have to flip a task to be recorded. AMENDING SCOPE: pass add_scope to widen the claim as the work grows (the common case \u2014 scope is declared when you know least about what you will touch), or set_scope to replace it outright, which is how a lock that over-claimed gets narrowed instead of left blocking others. A replacement that DROPS globs takes protection away, so it is gated the same way lock_finish is: refused when the lock is held by a different, named agent, unless force:true \u2014 which is recorded on the lock. Widening is never gated. The two are mutually exclusive. Amendments are appended to the lock file's scope_history with a timestamp rather than overwriting the old value silently, so a later reader can reconstruct what this lock claimed at the moment another agent checked it. The result ALWAYS echoes the lock's current scope, amended or not, along with a prompt to re-derive it against what you are really editing \u2014 because lock_check_conflict matches these globs, and any file outside them is invisible to every other agent looking for a conflict. Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).",
       inputSchema: {
         lock_id: z.string().describe("The id of the lock to update (as returned by lock_create or lock_query)."),
         task_text: z.string().optional().describe("The exact text of an existing task on this lock. Required together with `done`; omit both if you are only amending scope or adding a note."),
@@ -1118,8 +1141,14 @@ function createServer() {
         add_scope: z.array(z.string()).optional().describe(
           "Glob patterns to ADD to this lock's existing scope \u2014 the usual way to keep a claim honest as work grows beyond what you first declared. Adding a glob already claimed is a no-op and records no amendment. Mutually exclusive with `scope`."
         ),
-        scope: z.array(z.string()).optional().describe(
-          "REPLACE this lock's scope with these glob patterns. Use to narrow a lock that over-claimed, rather than leaving it blocking work it is not really doing. Must contain at least one non-empty pattern \u2014 an empty scope would still read as an active claim in lock_query while matching nothing in lock_check_conflict. Mutually exclusive with `add_scope`."
+        set_scope: z.array(z.string()).optional().describe(
+          "REPLACE this lock's scope with these glob patterns. Use to narrow a lock that over-claimed, rather than leaving it blocking work it is not really doing. Must contain at least one non-empty pattern \u2014 an empty scope would still read as an active claim in lock_query while matching nothing in lock_check_conflict. Mutually exclusive with `add_scope`. Named set_scope and NOT scope deliberately: `scope` is what lock_create calls the whole claim, so copying create arguments into an update would silently REPLACE a claim you had been widening."
+        ),
+        agent_id: z.string().nullable().optional().describe(
+          "Your own agent id, if you already know it. Used ONLY to detect a narrowing of someone else's claim; widening never consults it, and it is never fabricated. Same honesty caveat as lock_create."
+        ),
+        force: z.boolean().optional().describe(
+          "Proceed with a narrowing that would otherwise be refused because the lock is held by another session. Deliberate and RECORDED on the lock \u2014 a refusal nobody can get past becomes one everyone routes around."
         ),
         note: z.string().optional().describe("Optional free-text note to append to the lock's Notes section."),
         base_dir: z.string().optional().describe(
@@ -1132,7 +1161,7 @@ function createServer() {
       // whether to confirm should be told that is possible.
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
     },
-    async ({ lock_id, task_text, done, note, scope, add_scope, base_dir }) => {
+    async ({ lock_id, task_text, done, note, set_scope, add_scope, agent_id, force, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const [locksRoot, repoRoot] = await Promise.all([resolveLocksRoot(cwd), resolveRepoRoot(cwd)]);
@@ -1141,8 +1170,10 @@ function createServer() {
           task_text,
           done,
           note,
-          scope,
+          set_scope,
           add_scope,
+          agent_id,
+          force,
           repository: repoRoot
         });
         return textResult(JSON.stringify(result, null, 2));
@@ -1323,6 +1354,10 @@ Options:
   --add-scope <glob>     Add a glob to the lock's existing scope. Repeatable. The usual amendment.
   --set-scope <glob>     Replace the lock's whole scope with these globs. Repeatable. Use to
                           narrow a lock that over-claimed. Mutually exclusive with --add-scope.
+  --agent <id>           Your own agent id, so ownership can be checked when this narrows
+                          the claim. Widening never needs it.
+  --force                Proceed with a narrowing that would otherwise be refused because
+                          the lock is held by someone else. Recorded on the lock.
   --note <text>           Append a free-text note to the lock.
   --base-dir <path>      Look up the lock in a different repository (any path inside it).
   --json                 Print raw JSON instead of a short confirmation line.`;
@@ -1387,6 +1422,8 @@ var SUBCOMMAND_FLAGS = {
     "--add-scope",
     "--set-scope",
     "--note",
+    "--agent",
+    "--force",
     "--base-dir",
     "--json",
     "--help"
@@ -1611,8 +1648,10 @@ async function cmdUpdate(flags) {
     task_text: taskText,
     done,
     note,
+    agent_id: oneOf(flags.flags, "--agent") ?? null,
+    force: flags.boolFlags.has("--force"),
     add_scope: addScope.length > 0 ? addScope : void 0,
-    scope: setScope.length > 0 ? setScope : void 0,
+    set_scope: setScope.length > 0 ? setScope : void 0,
     dialect: "cli"
   });
   if (flags.boolFlags.has("--json")) {
@@ -1791,7 +1830,7 @@ async function runCli(argv) {
       printError(error.message);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof LockNotStaleError || error instanceof ScopeAmendmentError || error instanceof EmptyScopeError || error instanceof EmptyUpdateError || error instanceof IncompleteTaskUpdateError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof ScopeNarrowingRefusedError || error instanceof LockNotStaleError || error instanceof ScopeAmendmentError || error instanceof EmptyScopeError || error instanceof EmptyUpdateError || error instanceof IncompleteTaskUpdateError) {
       printError(error.message);
       return 1;
     }

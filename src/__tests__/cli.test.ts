@@ -295,6 +295,25 @@ describe('runCli', () => {
     expect(errors[errors.length - 1]).toContain('require --task');
   });
 
+  it('narrowing another session\'s claim is refused FROM THE CLI, and --force gets past it', async () => {
+    // Wiring test, not a mechanism test: the store-level gate is covered
+    // elsewhere: what this proves is that --agent and --force actually reach it
+    // and that the refusal is an exit-1 message rather than a stack trace.
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'held', '--scope', 'src/**', '--scope', 'docs/**', '--agent', 'Blue [aa1111]']);
+    const lockId = lockIdFrom(logs);
+
+    expect(await runCliIn(repo, ['update', lockId, '--set-scope', 'src/**', '--agent', 'Red [bb2222]'])).toBe(1);
+    expect(errors[errors.length - 1]).toMatch(/held by Blue \[aa1111\]|Refusing/i);
+
+    // Widening by the same foreign caller is NOT gated.
+    expect(await runCliIn(repo, ['update', lockId, '--add-scope', 'extra/**', '--agent', 'Red [bb2222]'])).toBe(0);
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['update', lockId, '--set-scope', 'src/**', '--agent', 'Red [bb2222]', '--force'])).toBe(0);
+    expect(logs.join('\n')).toContain('NO LONGER CLAIMED');
+  });
+
   it('drift lists the changed files a lock does not cover, and clears once amended', async () => {
     const { logs } = captureConsole();
     await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'auth/**', '--task', 'y']);

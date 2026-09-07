@@ -91,9 +91,18 @@ export function scopesEqual(a: readonly string[], b: readonly string[]): boolean
 }
 
 export interface ScopeAmendmentRequest {
-  /** Replace the lock's scope wholesale. Mutually exclusive with `add_scope`. */
-  scope?: string[];
-  /** Add globs to the lock's existing scope. Mutually exclusive with `scope`. */
+  /**
+   * Replace the lock's scope wholesale. Mutually exclusive with `add_scope`.
+   *
+   * NAMED `set_scope`, NOT `scope`, and the difference is a safety property rather
+   * than taste. `scope` is what lock_create calls the WHOLE CLAIM, so an agent
+   * copying its create arguments into an update would silently replace the claim it
+   * had been widening — a destructive operation reached by a copy-paste that looks
+   * like a no-op. The CLI flag was `--set-scope` from the start; this aligns the MCP
+   * surface with it. Renamed before first release, so no caller ever saw `scope`.
+   */
+  set_scope?: string[];
+  /** Add globs to the lock's existing scope. Mutually exclusive with `set_scope`. */
   add_scope?: string[];
 }
 
@@ -129,12 +138,12 @@ export function applyScopeAmendment(
   current: readonly string[],
   request: ScopeAmendmentRequest,
 ): AppliedScopeAmendment {
-  const wantsReplace = request.scope !== undefined;
+  const wantsReplace = request.set_scope !== undefined;
   const wantsAdd = request.add_scope !== undefined;
 
   if (wantsReplace && wantsAdd) {
     throw new ScopeAmendmentError(
-      'Pass at most one of scope (replace the whole claim) / add_scope (widen the existing claim), not both. ' +
+      'Pass at most one of set_scope (replace the whole claim) / add_scope (widen the existing claim), not both. ' +
         'Applying them together would require guessing an order, and would produce a scope you did not ask for.',
     );
   }
@@ -147,10 +156,10 @@ export function applyScopeAmendment(
   let next: string[];
 
   if (wantsReplace) {
-    next = normalizeScope(request.scope as string[]);
+    next = normalizeScope(request.set_scope as string[]);
     if (next.length === 0) {
       throw new EmptyScopeError(
-        'scope must contain at least one non-empty glob pattern. A lock claiming nothing is worse than no lock at all: ' +
+        'set_scope must contain at least one non-empty glob pattern. A lock claiming nothing is worse than no lock at all: ' +
           'it still reads as an active claim in lock_query while matching no file in lock_check_conflict. ' +
           'To narrow a lock, pass the globs you are actually still touching; to give up the claim entirely, call lock_finish.',
       );

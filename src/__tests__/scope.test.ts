@@ -43,7 +43,7 @@ describe('applyScopeAmendment', () => {
   });
 
   it('scope replaces the whole claim, which is how an over-claiming lock gets narrowed', () => {
-    const result = applyScopeAmendment(['src/**', 'tests/**'], { scope: ['src/auth/**'] });
+    const result = applyScopeAmendment(['src/**', 'tests/**'], { set_scope: ['src/auth/**'] });
     expect(result.next).toEqual(['src/auth/**']);
     expect(result.changed).toBe(true);
     // A narrowing must be distinguishable from a widening: it is the only
@@ -54,7 +54,7 @@ describe('applyScopeAmendment', () => {
 
   it('reports no removals for a widening, so narrowings stand out', () => {
     expect(applyScopeAmendment(['a/**'], { add_scope: ['b/**'] }).removed).toEqual([]);
-    expect(applyScopeAmendment(['a/**'], { scope: ['a/**', 'b/**'] }).removed).toEqual([]);
+    expect(applyScopeAmendment(['a/**'], { set_scope: ['a/**', 'b/**'] }).removed).toEqual([]);
   });
 
   it('adding a glob already claimed is a no-op, so lock_update stays idempotent', () => {
@@ -64,17 +64,17 @@ describe('applyScopeAmendment', () => {
   });
 
   it('replacing with an identical scope reports no change', () => {
-    const result = applyScopeAmendment(['auth/**'], { scope: ['auth/**'] });
+    const result = applyScopeAmendment(['auth/**'], { set_scope: ['auth/**'] });
     expect(result.changed).toBe(false);
   });
 
   it('rejects scope and add_scope together rather than guessing an order', () => {
-    expect(() => applyScopeAmendment(['a/**'], { scope: ['b/**'], add_scope: ['c/**'] })).toThrow(ScopeAmendmentError);
+    expect(() => applyScopeAmendment(['a/**'], { set_scope: ['b/**'], add_scope: ['c/**'] })).toThrow(ScopeAmendmentError);
   });
 
   it('refuses to replace a scope with nothing — an empty claim reads as protection and provides none', () => {
-    expect(() => applyScopeAmendment(['a/**'], { scope: [] })).toThrow(EmptyScopeError);
-    expect(() => applyScopeAmendment(['a/**'], { scope: ['  '] })).toThrow(EmptyScopeError);
+    expect(() => applyScopeAmendment(['a/**'], { set_scope: [] })).toThrow(EmptyScopeError);
+    expect(() => applyScopeAmendment(['a/**'], { set_scope: ['  '] })).toThrow(EmptyScopeError);
   });
 
   it('refuses an add_scope that amends nothing', () => {
