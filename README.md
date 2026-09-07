@@ -421,6 +421,51 @@ There's no exact, general algorithm for "do these two glob patterns ever match a
 
 (There's also a documented, deliberately-accepted *over*-inclusion case for `{brace,expansion}` patterns — see the comments in `globOverlap.ts` and its test file for the reasoning; that direction is considered safe, not a gap, given this tool's informational-only nature.)
 
+## Which predicate answers which question
+
+There are two matchers, they are not interchangeable, and choosing between them by
+"is one side a concrete file?" gets it wrong. The rule is:
+
+> **Ask whose claim you are testing, and which wrong answer hurts.**
+
+| You are asking | Predicate | Because the costly error is… |
+|---|---|---|
+| "I want to claim `src/auth/**` — will that intersect an existing lock?" | `scopesOverlap` | …missing a real collision. Both sides are *claims*; neither names a file yet. Over-reporting costs you one look. |
+| "Is this file I am about to modify covered by **someone else's** lock?" | `scopesOverlap`, passing the file as a one-element scope | …missing THEIR claim and writing over live work. You want the over-inclusive answer here, even though one side is a concrete path. |
+| "Does **my own** lock cover the files I am about to commit?" (a gate) | `scopeCovers` | …passing work that nothing actually claims. A gate must only admit what is *provable*, so this one refuses when it cannot prove coverage. |
+| "Is my claim still honest about what I am touching?" (drift) | `scopeCovers` | …telling me my scope is fine when it does not really name those files. See below. |
+
+**Why "concrete path → `scopeCovers`" is the wrong rule.** Rows 2 and 3 both test a
+concrete file against a glob, and they want *opposite* biases. Row 2 asks whether to stay
+away from someone else's work, so a false negative is the expensive one — the answer must
+lean toward "yes, covered". Row 3 authorises your own action, so a false positive is the
+expensive one — the answer must lean toward "no, not covered". Same shapes, inverted
+safety directions. The predicate follows the *consequence*, not the argument types.
+
+`scopeCovers` is conservative toward FALSE: a pattern using syntax outside its supported
+subset (`**`, `*`, `?`) returns "not covered" rather than guessing, because for a gate "I
+cannot prove this is covered" must mean "not covered". `scopesOverlap` is conservative
+toward TRUE: an empty static prefix prefixes everything, so a lock scoped `*.md` reports
+overlap against `src/main.ts`. Each is right for its own row and dangerous in the other's.
+
+### What this means for `lock_check_drift`
+
+Drift is row 4, and it currently uses row 1's predicate. That is defensible but it answers
+a slightly different question than the one an agent asks:
+
+- With `scopesOverlap`, drift means *"would a peer's conflict check surface my lock for
+  this file?"* — so a broad scope like `**/*.ts` reports everything covered, and drift can
+  never fail. The lock genuinely does protect those files, over-broadly; the check just
+  cannot tell you anything.
+- With `scopeCovers`, drift means *"does my scope actually name these files?"* — which is
+  what "is my claim honest?" is really asking, and it can fail.
+
+**Both facts are worth having, and they are not in conflict**: a file can be outside your
+scope by the strict reading while a peer's check would still surface your lock by the
+loose one. Reporting the strict answer with the loose one as mitigation ("not covered by
+your globs, though a conflict check would still surface this lock") is more useful than
+either alone.
+
 ## Installing this as an MCP server in Claude Code
 
 **Node/TypeScript, not Python** — `uvx` (which runs Python packages via [`uv`](https://github.com/astral-sh/uv)) does not apply here. The correct launcher is `pnpm dlx` (pnpm's equivalent of Python's `uvx` / Node's `npx`, for running a package's binary without a permanent global install).
