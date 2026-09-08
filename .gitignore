@@ -1,4 +1,10 @@
+# Both forms are needed. `node_modules/` (trailing slash) matches a DIRECTORY
+# only, and a linked worktree normally gets node_modules as a SYMLINK back to
+# the main checkout's copy — which that pattern does not match at all. The
+# symlink then shows up as untracked and is one `git add -A` from being
+# committed. Hit for real while working in worktrees/.
 node_modules/
+node_modules
 *.tgz
 .DS_Store
 /worktrees/

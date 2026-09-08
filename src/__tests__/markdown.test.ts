@@ -92,4 +92,26 @@ scope:
     expect(parsed.notes).toEqual(['free text notes appended over time']);
     expect(parsed.frontmatter.scope).toEqual(['glob/pattern/**']);
   });
+
+  it('gives each parse of identical content its OWN frontmatter object, so mutating one cannot leak into the next', () => {
+    // gray-matter memoizes by input string and returns a SHALLOW copy on a
+    // hit, so a cached parse hands every caller the same `data` object.
+    // store.ts mutates frontmatter on every write (updated, status,
+    // scope_history), which would then write into the cache and contaminate
+    // the next lock parsed from byte-identical content. Verified failing
+    // before the NO_CACHE fix in markdown.ts: the second parse arrived
+    // already carrying the first's scope_history.
+    const serialized = serializeLockFile(SAMPLE);
+    const first = parseLockFile(serialized);
+    const second = parseLockFile(serialized);
+
+    expect(first.frontmatter).not.toBe(second.frontmatter);
+
+    first.frontmatter.scope_history = [{ replaced_at: '2026-07-17T19-00-00', scope: ['old/**'] }];
+    first.frontmatter.status = 'done';
+
+    expect(second.frontmatter.scope_history).toBeUndefined();
+    expect(second.frontmatter.status).toBe('active');
+    expect(parseLockFile(serialized).frontmatter.scope_history).toBeUndefined();
+  });
 });

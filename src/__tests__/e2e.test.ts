@@ -91,12 +91,85 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     expect(instructions).toContain('cannot detect your agent id');
   });
 
-  it('lists exactly the 7 documented tools', async () => {
+  it('lists exactly the 8 documented tools', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
-      ['lock_check_conflict', 'lock_create', 'lock_finish', 'lock_heartbeat', 'lock_query', 'lock_reap', 'lock_update'].sort(),
+      [
+        'lock_check_conflict',
+        'lock_check_drift',
+        'lock_create',
+        'lock_finish',
+        'lock_heartbeat',
+        'lock_query',
+        'lock_reap',
+        'lock_update',
+      ].sort(),
     );
+  });
+
+  it('tells agents scope is amendable, in the instructions they read before any tool call', async () => {
+    // The instructions are the only text an agent is guaranteed to see. A
+    // scope-amendment feature nothing points at is one no session will use.
+    const instructions = client.getInstructions() ?? '';
+    expect(instructions).toContain('add_scope');
+    expect(instructions).toContain('lock_check_drift');
+    // The consequence clause, matched on its stable core rather than an exact
+    // sentence — what must survive an edit is that the text names WHY an
+    // unamended scope hurts, not the particular verb it uses to say so.
+    expect(instructions).toMatch(/invisible to any other agent/);
+    // And it must be inside the numbered procedure an agent actually executes:
+    // guidance sitting only in the prose below the steps is a reminder, however
+    // forcefully worded, and gets read past.
+    const steps = instructions.slice(
+      instructions.indexOf('Recommended workflow'),
+      instructions.indexOf('Why steps 4 and 5'),
+    );
+    expect(steps).toContain('add_scope');
+    expect(steps).toContain('lock_check_drift');
+  });
+
+  it('drives a real amend -> conflict-visible -> drift round trip over JSON-RPC', async () => {
+    const created = toolResultJson(
+      await client.callTool({
+        name: 'lock_create',
+        arguments: { title: 'E2E scope amendment', scope: ['auth/**'], tasks: ['grow the work'] },
+      }),
+    ) as { id: string; scope: string[]; scopeCheck: string };
+
+    // lock_create echoes what it recorded, rather than only an id.
+    expect(created.scope).toEqual(['auth/**']);
+    expect(created.scopeCheck).toContain('`auth/**`');
+
+    // Before amending, a peer's conflict check on the grown file sees nothing.
+    const before = toolResultJson(
+      await client.callTool({ name: 'lock_check_conflict', arguments: { scope: ['mcp_ctl.py'] } }),
+    ) as Array<{ id: string }>;
+    expect(before.find((l) => l.id === created.id)).toBeUndefined();
+
+    const amended = toolResultJson(
+      await client.callTool({
+        name: 'lock_update',
+        arguments: { lock_id: created.id, add_scope: ['mcp_ctl.py'] },
+      }),
+    ) as { scope: string[]; previousScope: string[]; scopeChanged: boolean };
+    expect(amended.scopeChanged).toBe(true);
+    expect(amended.previousScope).toEqual(['auth/**']);
+    expect(amended.scope).toEqual(['auth/**', 'mcp_ctl.py']);
+
+    // After amending, the same conflict check surfaces the lock.
+    const after = toolResultJson(
+      await client.callTool({ name: 'lock_check_conflict', arguments: { scope: ['mcp_ctl.py'] } }),
+    ) as Array<{ id: string }>;
+    expect(after.find((l) => l.id === created.id)).toBeDefined();
+
+    const drift = toolResultJson(
+      await client.callTool({ name: 'lock_check_drift', arguments: { lock_id: created.id } }),
+    ) as { lock_id: string; scope: string[]; drifted: boolean; outOfScope: string[] };
+    expect(drift.lock_id).toBe(created.id);
+    expect(drift.scope).toEqual(['auth/**', 'mcp_ctl.py']);
+
+    await client.callTool({ name: 'lock_finish', arguments: { lock_id: created.id } });
   });
 
   it('drives a real create -> query -> update -> finish round trip against the filesystem', async () => {

@@ -90,7 +90,30 @@ Three properties worth stating explicitly, each of them tested (`src/__tests__/c
 
 Every lock is stamped with the repository it governs (`repository` in the frontmatter, and in every summary `lock_query` returns), so an agent reading a lock never has to infer that from the scope glob.
 
-`base_dir` is available on all 7 MCP tools and, as `--base-dir`, on every CLI subcommand except `serve`.
+`base_dir` is available on all 8 MCP tools and, as `--base-dir`, on every CLI subcommand except `serve`.
+
+## Scope is amendable, and you are expected to amend it
+
+A lock's `scope` is declared at `lock_create` — **the moment the agent knows least about what it will end up touching.** Work legitimately grows: a lock created for `auth/**` ends up spanning eight packages. If scope could never change, it would drift away from reality while the lock still read as active and healthy.
+
+That matters because `lock_check_conflict` and `lock_query`'s `scope` filter both match against **whatever globs are recorded now**. A lock whose footprint has grown, unamended, silently stops protecting the files it grew into — and the agent that would have caught the collision runs exactly the query these docs prescribe, sees nothing, and proceeds.
+
+This is not hypothetical. It is how two sessions in sibling worktrees came to independently rewrite the same files, having each done everything the tool asked of them:
+
+> Session A claimed `["auth/oauth_config.py", "auth/google_auth.py", "tests/auth/**"]`. Its branch legitimately grew to ~20 files across 8 packages, including `mcp_ctl.py` and `gdrive/drive_tools.py`. Session B ran `lock_query` and `lock_check_conflict` before writing, correctly. It saw A's lock, listed and ACTIVE, whose scope mentioned none of the files B was about to edit — so B proceeded, and made the *opposite* fix to the same three diagnostics. A's only recourse was a free-text `note`, which no matcher reads.
+
+**Scope drift is the expected outcome of a field set at the point of least information, not a discipline failure.** So the remedy here is mechanical rather than exhortative:
+
+1. **Amend it.** `lock_update` takes `add_scope` (widen — the common case, because work grows) or `scope` (replace — how a lock that over-claimed gets narrowed instead of left blocking others).
+2. **See it.** `lock_create` and `lock_update` echo the current scope back on *every* call, so it is in front of the agent continuously rather than written once at creation and never seen again.
+3. **Be asked to verify it, not reminded to care.** Alongside the scope, both return a `scopeCheck` prompt:
+
+   > Scope claimed: `auth/**`, `tests/auth/**`. Does this still match what you are touching? Compare it against `git status --porcelain` / `git diff --name-only`, or call `lock_check_drift`, which does that comparison for you. If you are writing outside this scope, amend it now with `lock_update`'s `add_scope` (widen) or `scope` (replace) — `lock_check_conflict` matches these globs, so every file outside them is invisible to any other agent looking for a conflict.
+
+   The last clause is the load-bearing one. It names the **consequence** rather than asking politely: an agent that knows an unamended scope makes its work invisible to its peers has a reason to act; one told to "remember to keep scope updated" does not.
+4. **Have the tool do it for you.** [`lock_check_drift`](#lock_check_drift) compares the working tree's changed files against the lock's globs and reports the difference. Points 2 and 3 make the right behaviour *visible*; this one makes it *automatic*, which is what survives contact with a busy session — guidance that depends on being remembered has a failure rate, and the observed one here was 100%.
+
+Amendments **append** to `scope_history` in the lock file with a timestamp; they never overwrite the previous value silently. See [File format](#file-format).
 
 ## File format
 
@@ -104,6 +127,12 @@ created: 2026-07-17T18-45-12
 updated: 2026-07-17T18-45-12
 scope:
   - backend/src/hindsight/**
+  - backend/src/telemetry/**
+scope_history:
+  - replaced_at: 2026-07-17T19-02-08
+    scope:
+      - backend/src/hindsight/**
+repository: /home/user/projects/my-app
 ---
 
 # Add hindsight route tests
@@ -114,6 +143,10 @@ scope:
 ## Notes
 - Started after checking for conflicts with the oauth-cleanup lock
 ```
+
+`scope_history` records every scope this lock previously claimed, oldest first, each with the timestamp at which it was retired. It appears only once a lock's scope has actually been amended (see [Scope is amendable](#scope-is-amendable-and-you-are-expected-to-amend-it)). Each entry holds the scope **as it stood before** that amendment — so the sample above says "this lock claimed only `backend/src/hindsight/**` until 19:02:08, and `backend/src/hindsight/**` plus `backend/src/telemetry/**` from then on". Recording the retired value rather than the new one is what makes the history reconstructable from the file alone: the newest value is already in the live `scope` field.
+
+That reconstruction is the point. When two agents collide, the question is *"was that file inside their claim at the moment I checked?"* — and the current scope alone cannot answer it.
 
 Parsed and serialized by `src/lock/markdown.ts` using [`gray-matter`](https://github.com/jonschlinkert/gray-matter) for the frontmatter/body split, plus a small hand-written parser/serializer for the specific body shape (title heading, checklist, Notes section) that this project owns entirely — calling agents never write raw markdown; they pass structured tool arguments and this module is the only place that turns them into (or back out of) the file format.
 
@@ -132,11 +165,11 @@ The `id` frontmatter field is, by design, **exactly the filename minus `.md`** �
 
 `{timestamp}-{kebab-case-title}.md` — purely chronological, no sequence numbers by design (these files are ephemeral coordination artifacts, not a numbered decision log).
 
-## The 7 MCP tools
+## The 8 MCP tools
 
-All seven are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
+All eight are implemented in `src/server.ts`; the actual filesystem logic lives in `src/lock/store.ts`.
 
-All seven also accept an optional `base_dir` to operate on a different repository — omitted from the examples below for brevity; see [Claiming work in a *different* repository](#claiming-work-in-a-different-repository-base_dir).
+All eight also accept an optional `base_dir` to operate on a different repository — omitted from the examples below for brevity; see [Claiming work in a *different* repository](#claiming-work-in-a-different-repository-base_dir).
 
 ### `lock_query`
 
@@ -172,15 +205,81 @@ Purely informational — **never blocks, never vetoes, has no side effects**. Re
 }
 ```
 
-Returns `{id, filePath}`.
+Returns `{id, filePath, scope, scopeCheck}` — the scope it actually recorded, plus the check prompt described in [Scope is amendable](#scope-is-amendable-and-you-are-expected-to-amend-it). Whitespace-padded and duplicate globs are normalized away; a `scope` that normalizes to nothing is rejected rather than stored.
 
 ### `lock_update`
 
 ```json
 { "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "task_text": "Reproduce the flake", "done": true, "note": "Repro'd via 50x loop with -t 30s" } }
+{ "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "add_scope": ["backend/src/telemetry/**"] } }
+{ "name": "lock_update", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test", "set_scope": ["backend/src/oauth/callback.ts"], "agent_id": "subagent-4f2a" } }
 ```
 
-`task_text` must match an existing task **exactly** (chosen deliberately over fuzzy/partial matching — it's the unambiguous, predictable default). A non-matching `task_text` returns a real MCP tool error (`isError: true`) listing the lock's actual task texts, never a silent no-op.
+Checks a task off, amends the scope, and/or appends a note — **any combination, at least one required**. A call with nothing to do is an error rather than a silent timestamp bump; the operation that only says "I'm still alive" is `lock_heartbeat`, and keeping the two distinguishable is the point.
+
+`task_text` must match an existing task **exactly** (chosen deliberately over fuzzy/partial matching — it's the unambiguous, predictable default). A non-matching `task_text` returns a real MCP tool error (`isError: true`) listing the lock's actual task texts, never a silent no-op. `task_text` and `done` are required **together** — both optional overall, so amending scope or adding a note doesn't have to flip a task, but supplying one without the other is an error rather than a guess.
+
+`add_scope` widens the claim; `set_scope` replaces it outright (how a lock that over-claimed gets narrowed instead of left blocking others). They are mutually exclusive — applying both would require guessing an order. Adding a glob already claimed is a no-op that records no amendment, so `lock_update` stays idempotent.
+
+**Why `set_scope` and not `scope`.** `scope` is what `lock_create` calls the *whole claim*, so an agent copying its create arguments into an update would silently replace a claim it had been widening — a destructive operation reached by a copy-paste that looks like a no-op. The CLI flag was `--set-scope` from the start; the MCP surface now matches it. Renamed before first release, so no caller ever saw `scope`.
+
+**A replacement that DROPS globs is gated, the same way `lock_finish` is.** Narrowing takes protection away, and does it quietly — the lock goes on reading as active and healthy while the files it used to cover become invisible to every conflict check. So it is refused when the lock is held by a *different, named* agent, unless `force: true`, which is recorded on the lock. Refused only when **both** identities are known and differ: most locks carry `agent_id: null`, and requiring a match would strand them. Widening is never gated. As with `lock_finish`, `agent_id` is self-asserted and unverified, so this narrows accidents rather than preventing impersonation.
+
+Returns `{id, percentComplete, scope, scopeChanged, scopeCheck}`, plus `previousScope` when the scope actually changed, so the before/after diff is visible in the transcript rather than having to be inferred; plus `removedFromScope` and `warnings` when the amendment **narrowed** the claim. **The scope is echoed on every call, amended or not.**
+
+Narrowing is legitimate — it is how a lock that over-claimed stops blocking others — but it is the only amendment that takes protection *away*, and it does so while the lock goes on reading as active and healthy. So a narrowing is reported distinguishably from a widening, warns about work still in flight under the dropped globs, and records an auto-generated note on the lock (the same honesty mechanism `lock_reap` uses) so `lock_query`'s text search can find it afterwards.
+
+### `lock_check_drift`
+
+```json
+{ "name": "lock_check_drift", "arguments": { "lock_id": "2026-07-17T18-45-12-fix-flaky-oauth-callback-test" } }
+```
+
+Compares what a lock **claims** against what your working tree has actually **changed**, and lists every changed file the scope does not cover:
+
+The CLI rendering (`agent-locks drift <lock-id>`), which is what the report actually looks like:
+
+```
+Lock 2026-07-17T18-45-12-fix-flaky-oauth-callback-test — "Fix flaky OAuth callback test"
+claims: auth/**, tests/auth/**
+14 changed file(s) in /home/user/projects/my-app (9 uncommitted, 5 committed since the claim); 2 covered by that scope.
+warning: 3 file(s) are ignored by git and were NOT examined. …
+outcome: DRIFTED
+
+files changed outside that scope (12):
+  core/utils.py
+  gdrive/drive_tools.py
+  gforms/forms_tools.py
+  mcp_ctl.py
+  …
+```
+
+Changed files come from `git status` in the working tree you call from — staged, unstaged and untracked alike, with untracked directories expanded into their files and renames counting both paths — **plus every file touched by a commit made since the lock was claimed**. That second half matters more than it sounds: `git status` reports the working tree against `HEAD`, so work you have already committed is invisible to it, and committing as you go is how a branch normally grows. Without it, an agent that committed its grown work got a clean bill of health from the one tool built to catch exactly that, at exactly the moment the instructions say to run it.
+
+Read-only: it never amends anything. Returns `{lock_id, title, scope, inspectedWorktree, lockCreatedIn, changedFileCount, uncommittedCount, committedSinceClaimCount, ignoredFilesNotExamined, inScopeCount, outOfScope, outOfScopeCount, outOfScopeTruncated, outcome, drifted, warnings, scopeCheck}`.
+
+**Prefer `outcome` over `drifted`.** The boolean cannot distinguish "the scope covers the work" from "nothing was measured", and those render identically to a reader in a hurry. `outcome` is one of `DRIFTED`, `COVERED`, or `NOTHING_MEASURED` (no files were compared — this says nothing about your scope).
+
+Reliability is carried separately, in `reliable` and `warnings`, and deliberately so: folding it into `outcome` made that field a *constant* in exactly the deployment this tool exists for. The multi-worktree warning fires on any repository with more than one worktree, so `outcome` could then never be `DRIFTED` or `COVERED` — a measurement field that had stopped varying, introduced by the very change meant to stop one state borrowing another's meaning. Read them together: "DRIFTED, and here is why the answer may not be about your work."
+
+**A scope broad enough that the check cannot fail is reported as such.** A pattern beginning with a wildcard (`**/*.ts`, `{src,docs}/**`) matches every path under the shared matcher. That is not a matcher bug — peers genuinely do see the lock for any file, so the work is over-claimed rather than unprotected — but a `COVERED` from a check that could not have failed is not evidence, and it says so.
+
+**Drift detects under-claiming only.** A lock whose scope is too *wide* blocks other agents without ever being reported here. That is a known gap, not an oversight.
+
+### What `lock_check_drift` cannot see
+
+Stated here rather than left to be discovered, because a clean result from a blind instrument is worse than no instrument:
+
+- **Files git ignores** — a `.env`, a generated config, anything under an ignored build directory. The *count* is reported as `ignoredFilesNotExamined` and raises a warning, but their names and their drift are not knowable here.
+- **Work committed *before* the lock was claimed.** The commit sweep starts at the lock's `created` timestamp.
+- **Anything outside this working tree**, and the contents of submodules (which git reports as a single gitlink path).
+- **A clean tree measures nothing.** That is reported as `NOTHING_MEASURED`, not as "no drift".
+
+The warnings print **above** the verdict in the CLI, deliberately: `| head -n` is routine, and a reason the result may be meaningless must not be the part the pipe drops.
+
+**Coverage is decided by the exact same glob matcher `lock_check_conflict` uses**, and that is deliberate rather than incidental. The question drift really answers is not the abstract "does this glob match this path" but *"would another agent's conflict check on this file see my lock?"* — and those are only the same question while both use the same matcher. A stricter matcher here would report files as uncovered that `lock_check_conflict` does surface (noise, which teaches agents to ignore the tool); a looser one would clear files that conflict checks miss (silence, which is the original bug). Sharing the matcher makes the two answers unable to disagree.
+
+**Read the `warnings`.** Drift is only meaningful for your *own* lock in your *own* worktree. Run against a lock created elsewhere and it compares that lock's scope to files its owner is not editing — a clean result there means nothing, and the tool says so.
 
 ### `lock_finish`
 
@@ -210,7 +309,7 @@ Finishes (same mechanism as `lock_finish`) every currently-stale active lock, or
 
 ## CLI usage
 
-The exact same lock store the 7 MCP tools above talk to is also reachable from a plain terminal or a shell script — useful for a human checking coordination state directly, or for any agent harness that can run a command but doesn't (yet) speak MCP.
+The exact same lock store the 8 MCP tools above talk to is also reachable from a plain terminal or a shell script — useful for a human checking coordination state directly, or for any agent harness that can run a command but doesn't (yet) speak MCP.
 
 `index.js` dispatches on `argv`: called with **no arguments** (or the explicit `serve` alias) it starts the MCP stdio server exactly as before — every existing MCP client config keeps working unchanged. Called with any other first argument, it runs as a CLI and exits with a real exit code (0 on success, 1 on a usage error or a store error like a missing lock id) instead of hanging waiting for JSON-RPC on stdin.
 
@@ -227,8 +326,11 @@ agent-locks check <scope-glob...>
 # Same as lock_create
 agent-locks claim --title <text> --scope <glob> [--scope <glob> ...] [--task <text> ...] [--agent <id>] [--parent <id>]
 
-# Same as lock_update
-agent-locks update <lock-id> --task <text> [--done | --undone] [--note <text>]
+# Same as lock_update — any combination of task flip, scope amendment and note; at least one required
+agent-locks update <lock-id> [--task <text> [--done | --undone]] [--add-scope <glob> ...] [--set-scope <glob> ...] [--note <text>]
+
+# Same as lock_check_drift — which changed files does this lock NOT cover?
+agent-locks drift <lock-id> [--json]
 
 # Same as lock_finish
 agent-locks finish <lock-id> [--summary <text>]
@@ -244,6 +346,10 @@ agent-locks serve
 ```
 
 `list`/`check` also accept `--stale-minutes <n>` to override the staleness threshold for that call, matching `lock_query`/`lock_check_conflict`'s own `stale_minutes` argument. The table view of `status`/`list`/`check` includes a STALE column (`yes (2h)` / `no` / `-` for done locks).
+
+`claim` and `update` print the lock's current scope and the check prompt on every call, phrased for a terminal (`agent-locks drift`, `--add-scope`) rather than naming MCP tools a human cannot call. `--add-scope` and `--set-scope` are mutually exclusive, `--done`/`--undone` require `--task`, and an `update` with nothing to do exits 1 rather than silently bumping a timestamp.
+
+> **Note for anything scripting the CLI:** the plain-text output of `claim` and `update` now ends with that scope-check prompt, so the confirmation line is no longer the last line printed. Parse `--json` instead. Its shape is purely additive: `claim` gains `scope` and `scopeCheck`; `update` gains `scope`, `scopeChanged` and `scopeCheck`, plus `previousScope` when the scope changed and `removedFromScope`/`warnings` when it narrowed.
 
 Every subcommand except `serve` accepts `--base-dir <path>` to operate on another repository, mirroring the MCP tools' `base_dir`:
 
@@ -285,6 +391,18 @@ If you need faster-than-threshold crash detection for the long-running MCP-serve
 
 `agent_id` and `parent_agent_id` on `lock_create` are therefore **plain optional strings that the calling agent supplies only if it happens to already know one from its own context** (some orchestration harnesses hand a subagent an explicit id when dispatching it). This server has no way to detect either value and never fabricates one — both default to `null` when omitted. Every tool description says this plainly.
 
+## Durability: atomic writes and one-writer-at-a-time
+
+A lock store that loses a claim under concurrency has failed at the one thing it exists for, so two mechanisms guard every write. They overlap on purpose; neither covers the other.
+
+**Writes are atomic.** `writeRecord` serializes to a sibling temp file and `rename`s it over the target. `fs.writeFile` opens `O_TRUNC` and *then* writes, so between those two syscalls a reader in another process — the normal case here, one server per worktree, all sharing one store — can observe a zero-length or half-written file. That matters more than it sounds, because a half-written lock file **does not fail to parse**: YAML truncation shortens a list rather than erroring, so the reader sees a valid-looking active lock claiming fewer globs than it really does. `rename(2)` is atomic on POSIX within a filesystem, so a reader sees either the whole old file or the whole new one.
+
+**Every write path holds that claim, not just `lock_update`.** `writeRecord` serialises the *whole* record, so an unguarded path meaning to touch one scalar rewrites the scope, the history, the tasks and the notes from whatever it last read. `finishLock`, `heartbeatLock` and `reapStaleLocks` therefore go through the same guard — `lock_heartbeat` most of all, since the instructions tell agents to call it during precisely the long stretch in which scope grows and gets amended. The move into `done/` happens inside the held guard too, so a lock is never observable in both `active/` and `done/`.
+
+**Updates hold an exclusive claim.** `lock_update` is a read-modify-write, and two concurrent amendments used to end with one simply gone — *both* calls returning success, each echoing a scope containing its own addition. Reproduced before the fix; pinned by a test now. Updates therefore take an `O_CREAT|O_EXCL` `.lock` sidecar for the duration of the read-modify-write, retry on contention, and fail with a named `ConcurrentUpdateError` rather than picking a winner. A sidecar left by a crashed process is taken over after 30 seconds, so nothing wedges permanently. A compare-and-swap on the file's bytes runs *inside* that guard as a second, independent check — a compare-and-swap alone is not sufficient, because two callers can both pass the re-read before either writes.
+
+**Malformed lock files are refused by name.** `parseLockFile` validates the frontmatter instead of casting it. Previously a damaged file parsed into an object with `undefined` where a required field belonged and failed far away — `TypeError: b is not iterable` from inside a glob matcher, naming no file, taking every lock in the repository offline for every agent until a human found the bad one. Validation cannot detect a truncation that leaves a *shorter but well-formed* list; nothing can, because nothing records how long the list should have been. That case is what the atomic write prevents.
+
 ## No database, no in-memory cache
 
 The markdown files are the entire source of truth. Every tool call reads whatever is currently on disk at that moment — there is no cached lock list, no in-memory index, and no assumption that this is the only server process for a given repo.
@@ -306,6 +424,51 @@ There's no exact, general algorithm for "do these two glob patterns ever match a
 **Filesystem case-sensitivity is not modeled.** `Src/**` and `src/foo.ts` are reported as non-overlapping (matching is case-sensitive, per `minimatch`'s default), but on a case-insensitive filesystem (default macOS, default Windows) these could refer to the exact same real file. This is not special-cased, because "is this filesystem case-sensitive" isn't knowable from the pattern strings alone, and the case-sensitive assumption matches the Linux dev environments this tool targets. Pinned down explicitly by a test in `src/__tests__/globOverlap.test.ts` so a future reader knows this is a deliberate, accepted limitation rather than an untested edge case.
 
 (There's also a documented, deliberately-accepted *over*-inclusion case for `{brace,expansion}` patterns — see the comments in `globOverlap.ts` and its test file for the reasoning; that direction is considered safe, not a gap, given this tool's informational-only nature.)
+
+## Which predicate answers which question
+
+There are two matchers, they are not interchangeable, and choosing between them by
+"is one side a concrete file?" gets it wrong. The rule is:
+
+> **Ask whose claim you are testing, and which wrong answer hurts.**
+
+| You are asking | Predicate | Because the costly error is… |
+|---|---|---|
+| "I want to claim `src/auth/**` — will that intersect an existing lock?" | `scopesOverlap` | …missing a real collision. Both sides are *claims*; neither names a file yet. Over-reporting costs you one look. |
+| "Is this file I am about to modify covered by **someone else's** lock?" | `scopesOverlap`, passing the file as a one-element scope | …missing THEIR claim and writing over live work. You want the over-inclusive answer here, even though one side is a concrete path. |
+| "Does **my own** lock cover the files I am about to commit?" (a gate) | `scopeCovers` | …passing work that nothing actually claims. A gate must only admit what is *provable*, so this one refuses when it cannot prove coverage. |
+| "Is my claim still honest about what I am touching?" (drift) | `scopeCovers` | …telling me my scope is fine when it does not really name those files. See below. |
+
+**Why "concrete path → `scopeCovers`" is the wrong rule.** Rows 2 and 3 both test a
+concrete file against a glob, and they want *opposite* biases. Row 2 asks whether to stay
+away from someone else's work, so a false negative is the expensive one — the answer must
+lean toward "yes, covered". Row 3 authorises your own action, so a false positive is the
+expensive one — the answer must lean toward "no, not covered". Same shapes, inverted
+safety directions. The predicate follows the *consequence*, not the argument types.
+
+`scopeCovers` is conservative toward FALSE: a pattern using syntax outside its supported
+subset (`**`, `*`, `?`) returns "not covered" rather than guessing, because for a gate "I
+cannot prove this is covered" must mean "not covered". `scopesOverlap` is conservative
+toward TRUE: an empty static prefix prefixes everything, so a lock scoped `*.md` reports
+overlap against `src/main.ts`. Each is right for its own row and dangerous in the other's.
+
+### What this means for `lock_check_drift`
+
+Drift is row 4, and it currently uses row 1's predicate. That is defensible but it answers
+a slightly different question than the one an agent asks:
+
+- With `scopesOverlap`, drift means *"would a peer's conflict check surface my lock for
+  this file?"* — so a broad scope like `**/*.ts` reports everything covered, and drift can
+  never fail. The lock genuinely does protect those files, over-broadly; the check just
+  cannot tell you anything.
+- With `scopeCovers`, drift means *"does my scope actually name these files?"* — which is
+  what "is my claim honest?" is really asking, and it can fail.
+
+**Both facts are worth having, and they are not in conflict**: a file can be outside your
+scope by the strict reading while a peer's check would still surface your lock by the
+loose one. Reporting the strict answer with the loose one as mitigation ("not covered by
+your globs, though a conflict check would still surface this lock") is more useful than
+either alone.
 
 ## Installing this as an MCP server in Claude Code
 
@@ -368,9 +531,15 @@ pnpm run dev         # run directly from source via tsx, no build step (for loca
 ### What's tested (`src/__tests__/`)
 
 - `timestamp.test.ts` — timestamp formatting and slug generation.
-- `markdown.test.ts` — frontmatter + body round-tripping (`parseLockFile(serializeLockFile(x)) === x`), including the exact documented file shape.
+- `markdown.test.ts` — frontmatter + body round-tripping (`parseLockFile(serializeLockFile(x)) === x`), including the exact documented file shape, and that two parses of identical content get independent frontmatter objects (`gray-matter`'s content-keyed cache returns a *shallow* copy, so without an options argument every frontmatter mutation leaks into the next parse of an identical file).
+- `scope.test.ts` — scope normalization, the amendment rules (widen/replace, mutual exclusion, no-op detection, empty-scope refusal), and that the check prompt names MCP tools to an agent and CLI commands to a human.
+- `scopeAmendment.test.ts` — amendment through the store: history appended with timestamps rather than overwritten, no history entry for a no-op, whole-or-nothing failure when a bad `task_text` accompanies a good amendment, and **the issue #3 collision reproduced end to end** — a conflict check that misses grown work before the amendment and catches it after.
+- `drift.test.ts` — `listChangedFiles` against a real git repo (staged/unstaged/untracked, untracked directories expanded, renames counting both paths, paths containing spaces unmangled), and `checkScopeDrift`'s reporting, warnings, read-only guarantee, and agreement with the conflict matcher.
 - `globOverlap.test.ts` — the overlap heuristic, including the extglob fallback case and the documented case-sensitivity gap.
 - `store.test.ts` — the full lock lifecycle (create → update → finish), the hard "done excluded from default query" requirement, exact task-text matching (with a clear error on mismatch, never a silent no-op), and conflict-checking.
+- `cli.test.ts` — every subcommand's success and usage-error paths, including scope amendment via `--add-scope`/`--set-scope`, the `drift` report, and that `--base-dir` is actually honoured rather than accepted and ignored.
+- `crossRepo.test.ts` — that `base_dir` genuinely reaches another repository's store, in both directions, rather than being accepted and ignored.
+- `staleness.test.ts` — the computed `stale`/`staleForSeconds` flags, the env-var and per-call thresholds, and that reading never mutates.
 - `git.test.ts` — creates a **real** temporary git repository and a **real** linked worktree (via actual `git init`/`git worktree add` subprocess calls) and proves `resolveLocksRoot()` returns the identical path from both, that `--git-dir` would have differed, and that a path under `.git/agents-locks/` can never enter git's index.
 - `e2e.test.ts` — spawns the **actual compiled `dist/index.js`** as a real subprocess (via the MCP SDK's own `Client` + `StdioClientTransport`, exactly how Claude Code itself talks to an MCP server) and drives real JSON-RPC round trips: `initialize`, `tools/list`, and a full `lock_create` → `lock_query` → `lock_update` → `lock_finish` → `lock_query` cycle against the real filesystem, plus a real tool-error round trip for a bad `task_text`.
 

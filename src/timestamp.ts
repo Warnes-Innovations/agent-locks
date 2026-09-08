@@ -36,7 +36,8 @@ export function formatTimestamp(date: Date = new Date()): string {
   return `${year}-${month}-${day}T${hours}-${minutes}-${seconds}`;
 }
 
-const TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})$/;
+/** Shared with lock/markdown.ts, which validates these fields on parse rather than trusting a cast. */
+export const TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})$/;
 
 /**
  * The inverse of formatTimestamp. Needed for staleness math (comparing a

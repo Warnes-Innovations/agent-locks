@@ -1,5 +1,6 @@
 /** Module: core data shapes for a single agent-locks lock file. */
 import { parseTimestamp } from '../timestamp.js';
+import type { ScopeAmendment } from './scope.js';
 
 export type LockStatus = 'active' | 'done';
 
@@ -34,8 +35,21 @@ export interface LockFrontmatter {
   created: string;
   /** UTC timestamp, same format as timestamp.ts formatTimestamp(). Bumped on every mutation. */
   updated: string;
-  /** Glob patterns describing which files/paths this lock claims. */
+  /** Glob patterns describing which files/paths this lock claims. Amendable — see scope.ts. */
   scope: string[];
+  /**
+   * Every scope this lock previously claimed, oldest first, each with the
+   * timestamp at which it was retired. Absent (undefined) on a lock whose
+   * scope has never been amended, and on lock files written before scope
+   * became mutable — so readers must treat it as optional, never as "[]
+   * means never amended" versus "undefined means old file".
+   *
+   * Amendments APPEND here rather than overwriting `scope` silently, because
+   * the history of what a lock claimed and when is exactly what lets a later
+   * reader reconstruct a collision: "was that file inside their claim at the
+   * time I checked?" is unanswerable from the current scope alone.
+   */
+  scope_history?: ScopeAmendment[];
   /**
    * Resolved repository root path — the directory returned by
    * `git rev-parse --show-toplevel` when the lock was created. Lets an agent
@@ -72,6 +86,15 @@ export interface LockSummary {
   status: LockStatus;
   percentComplete: number;
   scope: string[];
+  /**
+   * Every scope this lock previously claimed, oldest first. Present on the
+   * summary — not only in the file — because that is the only form any reader
+   * actually sees: lock_query and lock_check_conflict return summaries, and a
+   * history nothing surfaces cannot answer the question it was recorded for
+   * ("was that file inside their claim at the moment I checked?").
+   * Omitted entirely when the scope has never been amended.
+   */
+  scope_history?: ScopeAmendment[];
   repository: string;
   agent_id: string | null;
   parent_agent_id: string | null;
@@ -116,6 +139,9 @@ export function toSummary(record: LockRecord, options: StalenessOptions = {}): L
     status: record.frontmatter.status,
     percentComplete: computePercentComplete(record.tasks),
     scope: record.frontmatter.scope,
+    ...(record.frontmatter.scope_history && record.frontmatter.scope_history.length > 0
+      ? { scope_history: record.frontmatter.scope_history }
+      : {}),
     repository: record.frontmatter.repository ?? '',
     agent_id: record.frontmatter.agent_id,
     parent_agent_id: record.frontmatter.parent_agent_id,

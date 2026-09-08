@@ -9,6 +9,25 @@ import { runCli } from '../cli.js';
 const execFileAsync = promisify(execFile);
 
 async function git(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync('git', args, {
+    cwd,
+    // Pin fixture commit dates to the distant past. Drift counts files touched
+    // by commits made AT OR AFTER the lock's `created` second, and lock
+    // timestamps are second-granular — so a setup commit made in the same
+    // second as the claim legitimately counts as "committed since the claim".
+    // Dating the fixture's history explicitly is what keeps each test about the
+    // thing it is testing; a sleep would only make the flake rarer.
+    env: {
+      ...process.env,
+      GIT_AUTHOR_DATE: '2020-01-01T00:00:00Z',
+      GIT_COMMITTER_DATE: '2020-01-01T00:00:00Z',
+    },
+  });
+  return stdout.trim();
+}
+
+/** Commits with a REAL (now) timestamp — for tests that need "committed since the claim". */
+async function gitCommitNow(cwd: string, args: string[]): Promise<string> {
   const { stdout } = await execFileAsync('git', args, { cwd });
   return stdout.trim();
 }
@@ -50,6 +69,26 @@ async function runCliIn(repoDir: string, argv: string[]): Promise<number> {
   }
 }
 
+const CLAIMED_LINE_RE = /^Claimed .* as lock (\S+)$/;
+
+/**
+ * Pulls the lock id out of `agent-locks claim` output by finding its
+ * confirmation line, not by position.
+ *
+ * These tests used to read logs[logs.length - 1], which broke the moment
+ * `claim` gained a trailing scope-check line — six tests at once, all with
+ * misleading failures ("No lock found with id 'conflict.'") pointing at the
+ * lock store rather than at the scraping. Match the line you actually want.
+ * Takes the LAST match, because some tests claim twice without clearing logs.
+ */
+function lockIdFrom(logs: string[]): string {
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const match = CLAIMED_LINE_RE.exec(logs[i]);
+    if (match) return match[1];
+  }
+  throw new Error(`No "Claimed ... as lock <id>" line in CLI output:\n${logs.join('\n')}`);
+}
+
 function captureConsole(): { logs: string[]; errors: string[] } {
   const logs: string[] = [];
   const errors: string[] = [];
@@ -68,6 +107,18 @@ describe('runCli', () => {
     expect(await runCliIn(repo, ['--help'])).toBe(0);
     expect(await runCliIn(repo, [])).toBe(0);
     expect(logs.every((line) => line.includes('agent-locks'))).toBe(true);
+  });
+
+  it('reports a version that matches package.json, so a build in the field can be identified', async () => {
+    const { logs } = captureConsole();
+    expect(await runCliIn(repo, ['--version'])).toBe(0);
+    const pkg = JSON.parse(
+      await fs.readFile(path.join(import.meta.dirname, '..', '..', 'package.json'), 'utf8'),
+    ) as { version: string };
+    // Two hand-maintained copies drift, and a version that disagrees with
+    // itself is worse than none: "which build wrote this lock file?" is the
+    // first question any field diagnosis asks.
+    expect(logs[0]).toBe(pkg.version);
   });
 
   it('exits 1 with a clear message for an unknown command', async () => {
@@ -89,8 +140,8 @@ describe('runCli', () => {
       '--agent', 'claude-code',
     ]);
     expect(claimCode).toBe(0);
-    expect(logs[logs.length - 1]).toMatch(/^Claimed "Refactor auth" as lock \S+$/);
-    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+    expect(logs.some((line) => /^Claimed "Refactor auth" as lock \S+$/.test(line))).toBe(true);
+    const lockId = lockIdFrom(logs);
 
     logs.length = 0;
     expect(await runCliIn(repo, ['status'])).toBe(0);
@@ -146,7 +197,7 @@ describe('runCli', () => {
   it('update with a task_text that does not match exactly exits 1 listing the real available tasks', async () => {
     const { logs, errors } = captureConsole();
     await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**', '--task', 'Do the thing']);
-    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+    const lockId = lockIdFrom(logs);
 
     const code = await runCliIn(repo, ['update', lockId, '--task', 'wrong text']);
     expect(code).toBe(1);
@@ -156,7 +207,7 @@ describe('runCli', () => {
   it('rejects passing both --done and --undone to update', async () => {
     const { logs, errors } = captureConsole();
     await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**', '--task', 'y']);
-    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+    const lockId = lockIdFrom(logs);
 
     const code = await runCliIn(repo, ['update', lockId, '--task', 'y', '--done', '--undone']);
     expect(code).toBe(1);
@@ -175,6 +226,158 @@ describe('runCli', () => {
     const code = await runCliIn(repo, ['list', '--status', 'bogus']);
     expect(code).toBe(1);
     expect(errors[0]).toContain('--status must be one of active, done, all');
+  });
+
+  it('claim and update print the claimed scope with the check prompt, so it is never written once and never seen again', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'auth/**', '--task', 'y']);
+    expect(logs.join('\n')).toContain('Scope claimed: `auth/**`');
+    // The CLI dialect must name CLI commands: telling a human at a terminal
+    // to "call lock_update" is wrong advice.
+    expect(logs.join('\n')).toContain('--add-scope');
+    expect(logs.join('\n')).not.toContain('lock_update');
+    const lockId = lockIdFrom(logs);
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['update', lockId, '--task', 'y', '--done'])).toBe(0);
+    expect(logs.join('\n')).toContain('"y" marked done');
+    expect(logs.join('\n')).toContain('Scope claimed: `auth/**`');
+  });
+
+  it('update --add-scope widens the claim and shows the before/after', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'auth/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['update', lockId, '--add-scope', 'mcp_ctl.py'])).toBe(0);
+    const output = logs.join('\n');
+    expect(output).toContain('scope amended');
+    expect(output).toContain('was: auth/**');
+    expect(output).toContain('now: auth/**, mcp_ctl.py');
+
+    // And the widened claim is what a conflict check now matches against.
+    logs.length = 0;
+    expect(await runCliIn(repo, ['check', 'mcp_ctl.py'])).toBe(0);
+    expect(logs.join('\n')).toContain('1 active lock(s) overlap');
+  });
+
+  it('update --set-scope narrows a lock that over-claimed', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'src/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+
+    expect(await runCliIn(repo, ['update', lockId, '--set-scope', 'src/auth/**'])).toBe(0);
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['check', 'src/billing/invoice.ts'])).toBe(0);
+    expect(logs.join('\n')).toContain('No active locks overlap');
+  });
+
+  it('rejects --add-scope together with --set-scope, and an update with nothing to do', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+
+    expect(await runCliIn(repo, ['update', lockId, '--add-scope', 'b/**', '--set-scope', 'c/**'])).toBe(1);
+    expect(errors[errors.length - 1]).toContain('at most one of --add-scope');
+
+    expect(await runCliIn(repo, ['update', lockId])).toBe(1);
+    expect(errors[errors.length - 1]).toContain('needs something to do');
+  });
+
+  it('rejects --done without --task, rather than letting a typo become a silent no-op', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+
+    expect(await runCliIn(repo, ['update', lockId, '--done'])).toBe(1);
+    expect(errors[errors.length - 1]).toContain('require --task');
+  });
+
+  it('narrowing another session\'s claim is refused FROM THE CLI, and --force gets past it', async () => {
+    // Wiring test, not a mechanism test: the store-level gate is covered
+    // elsewhere: what this proves is that --agent and --force actually reach it
+    // and that the refusal is an exit-1 message rather than a stack trace.
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'held', '--scope', 'src/**', '--scope', 'docs/**', '--agent', 'Blue [aa1111]']);
+    const lockId = lockIdFrom(logs);
+
+    expect(await runCliIn(repo, ['update', lockId, '--set-scope', 'src/**', '--agent', 'Red [bb2222]'])).toBe(1);
+    expect(errors[errors.length - 1]).toMatch(/held by Blue \[aa1111\]|Refusing/i);
+
+    // Widening by the same foreign caller is NOT gated.
+    expect(await runCliIn(repo, ['update', lockId, '--add-scope', 'extra/**', '--agent', 'Red [bb2222]'])).toBe(0);
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['update', lockId, '--set-scope', 'src/**', '--agent', 'Red [bb2222]', '--force'])).toBe(0);
+    expect(logs.join('\n')).toContain('NO LONGER CLAIMED');
+  });
+
+  it('drift lists the changed files a lock does not cover, and clears once amended', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'auth/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+
+    await fs.mkdir(path.join(repo, 'auth'), { recursive: true });
+    await fs.writeFile(path.join(repo, 'auth', 'login.ts'), 'a\n');
+    await fs.writeFile(path.join(repo, 'mcp_ctl.py'), 'b\n');
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['drift', lockId])).toBe(0);
+    const output = logs.join('\n');
+    expect(output).toContain('files changed outside that scope (1)');
+    expect(output).toContain('mcp_ctl.py');
+    expect(output).not.toContain('auth/login.ts');
+
+    expect(await runCliIn(repo, ['update', lockId, '--add-scope', 'mcp_ctl.py'])).toBe(0);
+    logs.length = 0;
+    expect(await runCliIn(repo, ['drift', lockId])).toBe(0);
+    expect(logs.join('\n')).toContain('No drift');
+  });
+
+  it('drift prints warnings ABOVE the verdict, so a pipe cannot strip the qualifier', async () => {
+    const { logs } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'auth/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+    await gitCommitNow(repo, ['worktree', 'add', '-q', '-b', 'side', path.join(sandbox, 'side')]);
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['drift', lockId])).toBe(0);
+    const warningAt = logs.findIndex((l) => l.startsWith('warning:'));
+    const verdictAt = logs.findIndex((l) => l.startsWith('outcome:') || l.includes('No drift') || l.includes('outside that scope'));
+    expect(warningAt).toBeGreaterThanOrEqual(0);
+    // `| head -n` is routine; a reason the result may be meaningless must not
+    // be the part that the pipe drops.
+    expect(warningAt).toBeLessThan(verdictAt);
+  });
+
+  it('rejects an unknown flag rather than accepting and ignoring it', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+
+    // An older build accepted --add-scope, printed success, and did nothing —
+    // turning a version skew into a silent no-op. Unknown flags must be loud.
+    expect(await runCliIn(repo, ['update', lockId, '--task', 'y', '--done', '--not-a-flag', 'v'])).toBe(1);
+    expect(errors[errors.length - 1]).toContain('unknown flag --not-a-flag');
+    expect(await runCliIn(repo, ['claim', '--title', 'z', '--scope', 'a/**', '--add-scope', 'b/**'])).toBe(1);
+    expect(errors[errors.length - 1]).toContain('unknown flag --add-scope');
+  });
+
+  it('drift --json exits 0 and reports structurally, and errors clearly with no lock id', async () => {
+    const { logs, errors } = captureConsole();
+    await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'auth/**', '--task', 'y']);
+    const lockId = lockIdFrom(logs);
+    await fs.writeFile(path.join(repo, 'mcp_ctl.py'), 'b\n');
+
+    logs.length = 0;
+    expect(await runCliIn(repo, ['drift', lockId, '--json'])).toBe(0);
+    expect(JSON.parse(logs[0])).toMatchObject({ lock_id: lockId, drifted: true, outOfScope: ['mcp_ctl.py'] });
+    expect(JSON.parse(logs[0]).outcome).toBe('DRIFTED');
+
+    expect(await runCliIn(repo, ['drift'])).toBe(1);
+    expect(errors[errors.length - 1]).toContain('requires a lock id');
   });
 
   it('status run outside a git repository exits 1 with NotAGitRepoError\'s message, not a stack trace', async () => {
@@ -268,7 +471,7 @@ describe('runCli heartbeat/reap', () => {
   it('heartbeat resets an active lock to not-stale', async () => {
     const { logs } = captureConsole();
     await runCliIn(repo, ['claim', '--title', 'Long task', '--scope', 'a/**']);
-    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+    const lockId = lockIdFrom(logs);
 
     await sleepPastStaleThreshold();
     logs.length = 0;
@@ -300,11 +503,11 @@ describe('runCli heartbeat/reap', () => {
   it('reap with no lock_id reaps every stale active lock and reports them', async () => {
     const { logs } = captureConsole();
     await runCliIn(repo, ['claim', '--title', 'Stale one', '--scope', 'a/**']);
-    const staleId = logs[logs.length - 1].split(' ').pop() as string;
+    const staleId = lockIdFrom(logs);
 
     await sleepPastStaleThreshold();
     await runCliIn(repo, ['claim', '--title', 'Fresh one', '--scope', 'b/**']);
-    const freshId = logs[logs.length - 1].split(' ').pop() as string;
+    const freshId = lockIdFrom(logs);
 
     logs.length = 0;
     const code = await runCliIn(repo, ['reap', '--stale-minutes', SHORT_STALE_MINUTES]);
@@ -322,7 +525,7 @@ describe('runCli heartbeat/reap', () => {
   it('reap --dry-run reports without mutating anything', async () => {
     const { logs } = captureConsole();
     await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**']);
-    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+    const lockId = lockIdFrom(logs);
 
     await sleepPastStaleThreshold();
     logs.length = 0;
@@ -337,7 +540,7 @@ describe('runCli heartbeat/reap', () => {
   it('reap refuses to reap a named lock_id that is not actually stale', async () => {
     const { logs, errors } = captureConsole();
     await runCliIn(repo, ['claim', '--title', 'x', '--scope', 'a/**']);
-    const lockId = logs[logs.length - 1].split(' ').pop() as string;
+    const lockId = lockIdFrom(logs);
 
     const code = await runCliIn(repo, ['reap', lockId, '--stale-minutes', '1000']);
     expect(code).toBe(1);
