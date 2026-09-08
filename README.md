@@ -514,6 +514,28 @@ claude mcp add --transport stdio agent-locks -- pnpm dlx github:luohoa97/agent-l
 
 Once added, Claude Code will always launch it with `command: pnpm, args: [dlx, ...]` — no manual build step, no cloning required on the user's part; `pnpm dlx` handles fetching and installing the package on demand.
 
+## Rollout: merging is not the same as fixed
+
+`dist/` is committed and sessions launch it from the main worktree, so **merging updates
+the artifact on disk**. It does not update anybody.
+
+**A running MCP server serves the bundle and tool list it started with, for the life of
+that session.** It never re-reads `dist/index.js`. So after a merge:
+
+- sessions started *before* it keep the old behaviour until they restart — there is no
+  way to update one in place;
+- `serverInfo.version` is the only field a running session exposes that can distinguish
+  which side of a change it is on. Bump it when the change matters to a caller, or
+  "merged" reads as "fixed" to everyone, forever, and the difference surfaces only as an
+  inexplicable bug report.
+
+Measured 2026-09-08: twelve `agent-locks` servers were running, and **every one had
+started before the artifact it was supposed to be running existed.**
+
+A second-order version of the same trap: the deploy path is *whatever branch is checked
+out in the main worktree*. Checking out another branch there silently un-deploys the
+release for every session started afterwards, with no signal.
+
 ## Packaging: why `dist/` is committed to this repo
 
 Normally a compiled `dist/` directory has no place in git. Here it's committed deliberately: `pnpm dlx github:...` (the pre-npm-publish install path above) clones the full repository and runs the package as-is — there is no `npm publish`-time "files" filtering step for a git-based install, and pnpm's script-execution security model means a `prepare`/`postinstall` build step is not guaranteed to run automatically for a fresh `dlx` invocation. Committing the already-built `dist/index.js` means the `pnpm dlx github:...` flow works with zero assumptions about lifecycle-script execution. Once this package is published to npm, the packed tarball (governed by `"files": ["dist"]` in `package.json`) is what consumers actually receive, and the committed copy becomes a convenience for the interim git-based flow — kept in sync by running `pnpm run build` before every commit that touches `src/` (the `pretest` script also rebuilds automatically before every `pnpm test` run, so a stale `dist/` is caught by CI/local testing rather than silently drifting).

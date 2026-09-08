@@ -586,7 +586,7 @@ export class EmptyUpdateError extends Error {
   constructor(lockId: string) {
     super(
       `lock_update on "${lockId}" was given nothing to do. Pass task_text + done to check a task off, ` +
-        `note to record something, scope/add_scope to amend the claim, or any combination. ` +
+        `note to record something, set_scope/add_scope to amend the claim, or any combination. ` +
         `Refusing a no-op rather than bumping the timestamp silently: a call that only proves the agent is alive is lock_heartbeat, and saying so keeps the two distinguishable.`,
     );
     this.name = 'EmptyUpdateError';

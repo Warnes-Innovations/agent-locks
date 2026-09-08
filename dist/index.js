@@ -721,7 +721,7 @@ async function checkConflicts(locksRoot, scope, staleMinutesOverride) {
 var EmptyUpdateError = class extends Error {
   constructor(lockId) {
     super(
-      `lock_update on "${lockId}" was given nothing to do. Pass task_text + done to check a task off, note to record something, scope/add_scope to amend the claim, or any combination. Refusing a no-op rather than bumping the timestamp silently: a call that only proves the agent is alive is lock_heartbeat, and saying so keeps the two distinguishable.`
+      `lock_update on "${lockId}" was given nothing to do. Pass task_text + done to check a task off, note to record something, set_scope/add_scope to amend the claim, or any combination. Refusing a no-op rather than bumping the timestamp silently: a call that only proves the agent is alive is lock_heartbeat, and saying so keeps the two distinguishable.`
     );
     this.name = "EmptyUpdateError";
   }
@@ -987,7 +987,7 @@ async function checkScopeDrift(locksRoot, params) {
 }
 
 // src/version.ts
-var VERSION = "0.2.0";
+var VERSION = "0.2.1";
 
 // src/server.ts
 var SERVER_NAME = "agent-locks";
