@@ -392,7 +392,7 @@ function formatPatterns(scope) {
 }
 function formatScopeCheck(scope, dialect = "mcp", lockId) {
   if (dialect === "mcp") {
-    return `Scope claimed: ${formatPatterns(scope)}. Does this still match what you are touching? Compare it against \`git status --porcelain\` / \`git diff --name-only\`, or call lock_check_drift, which does that comparison for you. If you are writing outside this scope, amend it now with lock_update's add_scope (widen) or scope (replace) \u2014 lock_check_conflict matches these globs, so every file outside them is invisible to any other agent looking for a conflict.`;
+    return `Scope claimed: ${formatPatterns(scope)}. Does this still match what you are touching? Compare it against \`git status --porcelain\` / \`git diff --name-only\`, or call lock_check_drift, which does that comparison for you. If you are writing outside this scope, amend it now with lock_update's add_scope (widen) or set_scope (replace) \u2014 lock_check_conflict matches these globs, so every file outside them is invisible to any other agent looking for a conflict.`;
   }
   const id = lockId ?? "<lock-id>";
   return `Scope claimed: ${formatPatterns(scope)}. Does this still match what you are touching? Compare it against \`git status --porcelain\` / \`git diff --name-only\`, or run \`agent-locks drift ${id}\`, which does that comparison for you. If you are writing outside this scope, amend it now with \`agent-locks update ${id} --add-scope <glob>\` (or \`--set-scope <glob>...\` to narrow an over-claim) \u2014 \`agent-locks check <glob>\` matches these globs, so every file outside them is invisible to any other agent looking for a conflict.`;

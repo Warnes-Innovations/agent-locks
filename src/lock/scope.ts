@@ -205,7 +205,7 @@ export function formatScopeCheck(
       `Scope claimed: ${formatPatterns(scope)}. ` +
       'Does this still match what you are touching? Compare it against `git status --porcelain` / ' +
       '`git diff --name-only`, or call lock_check_drift, which does that comparison for you. ' +
-      "If you are writing outside this scope, amend it now with lock_update's add_scope (widen) or scope (replace) — " +
+      "If you are writing outside this scope, amend it now with lock_update's add_scope (widen) or set_scope (replace) — " +
       'lock_check_conflict matches these globs, so every file outside them is invisible to any other agent looking for a conflict.'
     );
   }
