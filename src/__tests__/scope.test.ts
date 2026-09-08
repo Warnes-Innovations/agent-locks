@@ -42,7 +42,7 @@ describe('applyScopeAmendment', () => {
     expect(result.changed).toBe(true);
   });
 
-  it('scope replaces the whole claim, which is how an over-claiming lock gets narrowed', () => {
+  it('set_scope replaces the whole claim, which is how an over-claiming lock gets narrowed', () => {
     const result = applyScopeAmendment(['src/**', 'tests/**'], { set_scope: ['src/auth/**'] });
     expect(result.next).toEqual(['src/auth/**']);
     expect(result.changed).toBe(true);
@@ -103,7 +103,7 @@ describe('formatScopeCheck', () => {
     // parameter name in it is an instruction. It said `scope (replace)` for two
     // commits after the parameter was renamed to `set_scope` in f7984f8, and an
     // agent following it would have passed `scope` — which the MCP schema strips
-    // silently, returning success and doing nothing (issue #9). Our own guidance
+    // silently, returning success and doing nothing (https://github.com/Warnes-Innovations/agent-locks/issues/9). Our own guidance
     // would have caused the failure our own issue describes.
     const mcp = formatScopeCheck(['a/**'], 'mcp');
     expect(mcp).toContain('set_scope');

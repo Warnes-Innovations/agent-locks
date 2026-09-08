@@ -104,11 +104,11 @@ This is not hypothetical. It is how two sessions in sibling worktrees came to in
 
 **Scope drift is the expected outcome of a field set at the point of least information, not a discipline failure.** So the remedy here is mechanical rather than exhortative:
 
-1. **Amend it.** `lock_update` takes `add_scope` (widen — the common case, because work grows) or `scope` (replace — how a lock that over-claimed gets narrowed instead of left blocking others).
+1. **Amend it.** `lock_update` takes `add_scope` (widen — the common case, because work grows) or `set_scope` (replace — how a lock that over-claimed gets narrowed instead of left blocking others).
 2. **See it.** `lock_create` and `lock_update` echo the current scope back on *every* call, so it is in front of the agent continuously rather than written once at creation and never seen again.
 3. **Be asked to verify it, not reminded to care.** Alongside the scope, both return a `scopeCheck` prompt:
 
-   > Scope claimed: `auth/**`, `tests/auth/**`. Does this still match what you are touching? Compare it against `git status --porcelain` / `git diff --name-only`, or call `lock_check_drift`, which does that comparison for you. If you are writing outside this scope, amend it now with `lock_update`'s `add_scope` (widen) or `scope` (replace) — `lock_check_conflict` matches these globs, so every file outside them is invisible to any other agent looking for a conflict.
+   > Scope claimed: `auth/**`, `tests/auth/**`. Does this still match what you are touching? Compare it against `git status --porcelain` / `git diff --name-only`, or call `lock_check_drift`, which does that comparison for you. If you are writing outside this scope, amend it now with `lock_update`'s `add_scope` (widen) or `set_scope` (replace) — `lock_check_conflict` matches these globs, so every file outside them is invisible to any other agent looking for a conflict.
 
    The last clause is the load-bearing one. It names the **consequence** rather than asking politely: an agent that knows an unamended scope makes its work invisible to its peers has a reason to act; one told to "remember to keep scope updated" does not.
 4. **Have the tool do it for you.** [`lock_check_drift`](#lock_check_drift) compares the working tree's changed files against the lock's globs and reports the difference. Points 2 and 3 make the right behaviour *visible*; this one makes it *automatic*, which is what survives contact with a busy session — guidance that depends on being remembered has a failure rate, and the observed one here was 100%.

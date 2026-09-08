@@ -127,6 +127,30 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     );
     expect(steps).toContain('add_scope');
     expect(steps).toContain('lock_check_drift');
+
+    // And the REPLACE parameter by its real name. The handshake said `scope`
+    // for two commits after the rename to `set_scope`, and this assertion —
+    // which already existed for add_scope — is exactly what would have caught
+    // it. An agent following the stale step passed `scope`, which the schema
+    // strips silently: success returned, claim unchanged.
+    expect(instructions).toContain('set_scope');
+    expect(steps).toContain('set_scope');
+    expect(steps).not.toMatch(/\(scope replaces it/);
+  });
+
+  it('every lock_update parameter description names only parameters that exist', async () => {
+    // A description citing a sibling key that is not in the same schema is an
+    // instruction to call something absent. add_scope's description named
+    // `scope` while the schema carried `set_scope`, eight keys away.
+    const { tools } = await client.listTools();
+    const update = tools.find((t) => t.name === 'lock_update');
+    const props = Object.keys((update?.inputSchema as { properties: object }).properties);
+    expect(props).toContain('set_scope');
+    expect(props).not.toContain('scope');
+
+    const described = JSON.stringify(update?.inputSchema);
+    // No description may cite a bare `scope` parameter — only set_scope/add_scope.
+    expect(described).not.toMatch(/Mutually exclusive with `scope`/);
   });
 
   it('drives a real amend -> conflict-visible -> drift round trip over JSON-RPC', async () => {

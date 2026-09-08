@@ -113,7 +113,7 @@ export interface AppliedScopeAmendment {
   changed: boolean;
   /**
    * Globs the amendment REMOVED — always empty for `add_scope`, potentially
-   * non-empty for a `scope` replacement.
+   * non-empty for a `set_scope` replacement.
    *
    * Narrowing is a legitimate operation (it is how a lock that over-claimed
    * stops blocking others) but it is the only amendment that takes protection
@@ -127,7 +127,7 @@ export interface AppliedScopeAmendment {
 /**
  * Computes the amended scope without touching disk.
  *
- * Passing both `scope` and `add_scope` is rejected rather than resolved in
+ * Passing both `set_scope` and `add_scope` is rejected rather than resolved in
  * some defined order: "replace with A, then also add B" is a request nobody
  * means to make, and picking an order for it would silently produce a scope
  * the caller did not ask for. An amendment that no-ops (adding a glob already

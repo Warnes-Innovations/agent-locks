@@ -998,7 +998,7 @@ Recommended workflow, in order:
 1. Before starting work on a set of files, call lock_query (default view, active locks only) to see what other agents are already doing, and call lock_check_conflict with the globs you're about to touch to see if anyone's active lock overlaps them. lock_check_conflict is purely informational \u2014 it never blocks you, it just gives you information to make your own judgment call with.
 2. If you decide to proceed, call lock_create to claim the work: give it a title, the glob patterns describing what you're touching, and a checklist of the tasks you plan to do.
 3. As you actually complete each task, call lock_update immediately \u2014 not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime. If you're doing a long stretch of work without a task boundary to check off, call lock_heartbeat periodically so your lock doesn't read as abandoned to anyone else watching.
-4. Whenever the work grows past what you claimed, amend the scope in the same lock_update call: add_scope widens it (scope replaces it outright, which is how a lock that over-claimed gets narrowed). Do this when you notice, not at the end \u2014 lock_check_conflict matches the globs recorded RIGHT NOW, so until you amend, every file you have touched outside your scope is invisible to any other agent checking for a conflict, while your lock still reads to them as active and healthy.
+4. Whenever the work grows past what you claimed, amend the scope in the same lock_update call: add_scope widens it (set_scope replaces it outright, which is how a lock that over-claimed gets narrowed). Do this when you notice, not at the end \u2014 lock_check_conflict matches the globs recorded RIGHT NOW, so until you amend, every file you have touched outside your scope is invisible to any other agent checking for a conflict, while your lock still reads to them as active and healthy.
 5. Before you finish, call lock_check_drift. It lists the changed files in your working tree that your scope does not cover, so you are not relying on having remembered step 4.
 6. When the work is COMMITTED \u2014 not merely when the edits are done \u2014 call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
 
@@ -1139,7 +1139,7 @@ function createServer() {
         task_text: z.string().optional().describe("The exact text of an existing task on this lock. Required together with `done`; omit both if you are only amending scope or adding a note."),
         done: z.boolean().optional().describe("true to mark the task done, false to mark it not done. Required together with `task_text`."),
         add_scope: z.array(z.string()).optional().describe(
-          "Glob patterns to ADD to this lock's existing scope \u2014 the usual way to keep a claim honest as work grows beyond what you first declared. Adding a glob already claimed is a no-op and records no amendment. Mutually exclusive with `scope`."
+          "Glob patterns to ADD to this lock's existing scope \u2014 the usual way to keep a claim honest as work grows beyond what you first declared. Adding a glob already claimed is a no-op and records no amendment. Mutually exclusive with `set_scope`."
         ),
         set_scope: z.array(z.string()).optional().describe(
           "REPLACE this lock's scope with these glob patterns. Use to narrow a lock that over-claimed, rather than leaving it blocking work it is not really doing. Must contain at least one non-empty pattern \u2014 an empty scope would still read as an active claim in lock_query while matching nothing in lock_check_conflict. Mutually exclusive with `add_scope`. Named set_scope and NOT scope deliberately: `scope` is what lock_create calls the whole claim, so copying create arguments into an update would silently REPLACE a claim you had been widening."
@@ -1155,7 +1155,7 @@ function createServer() {
           "Target a different repository by its working-tree path (or any path inside it). The lock is looked up in that repository's shared .git directory. Omit to use the current working directory."
         )
       },
-      // destructiveHint: `scope` can REPLACE a whole claim, and a narrowing
+      // destructiveHint: `set_scope` can REPLACE a whole claim, and a narrowing
       // removes protection from files that may still be in flight — recoverable
       // only by reading scope_history. A client using this hint to decide
       // whether to confirm should be told that is possible.
