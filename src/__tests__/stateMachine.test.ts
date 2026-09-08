@@ -370,3 +370,33 @@ describe('transitions that must stay ABSENT', () => {
     expect(lock.agent_id).toBeNull();
   });
 });
+
+describe('session gaps are not live intervals', () => {
+  it('a touch on an ALREADY-STALE lock is flagged and excluded from the live distribution', async () => {
+    // Observed for real: a lock left across a four-day break would have contributed a
+    // 109-hour "live inter-touch interval" to the distribution whose TAIL sets the
+    // staleness threshold — one point arguing for a five-day threshold. Somebody
+    // returning to an abandoned lock is a different population from a holder who was
+    // alive and quiet.
+    const id = await claim({ agent_id: 'Red [bd9522]' });
+    await backdate(id, 60 * 24 * 4); // four days
+    await updateLock(locksRoot, { lock_id: id, note: 'back after a long break', agent_id: 'Red [bd9522]' });
+
+    const touches = (await readEvents(locksRoot, { type: 'touch' })).filter((e) => e.event === 'touch');
+    expect(touches).toHaveLength(1);
+    const touch = touches[0];
+    if (touch.event !== 'touch') throw new Error('expected a touch');
+    expect(touch.was_stale).toBe(true);
+    expect(touch.idle_seconds).toBeGreaterThan(60 * 60 * 24 * 3);
+  });
+
+  it('an ordinary touch within the threshold is NOT flagged', async () => {
+    const id = await claim({ agent_id: 'Red [bd9522]' });
+    await updateLock(locksRoot, { lock_id: id, note: 'still working', agent_id: 'Red [bd9522]' });
+
+    const touches = (await readEvents(locksRoot, { type: 'touch' })).filter((e) => e.event === 'touch');
+    const touch = touches[0];
+    if (touch.event !== 'touch') throw new Error('expected a touch');
+    expect(touch.was_stale).toBe(false);
+  });
+});

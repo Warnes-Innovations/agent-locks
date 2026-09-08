@@ -646,7 +646,9 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
     // An envelope, not a bare array: the caveats are part of the answer. A consumer
     // reading a bare list of reopens would take the false-positive count as an
     // estimate of wrong reaps, when it is only ever a lower bound.
-    const liveJson = all.filter((e) => e.event === 'touch').map((e) => (e as { idle_seconds: number }).idle_seconds);
+    const liveJson = (all.filter((e) => e.event === 'touch') as Array<{ idle_seconds: number; was_stale?: boolean }>)
+      .filter((e) => e.was_stale !== true)
+      .map((e) => e.idle_seconds);
     console.log(
       JSON.stringify(
         {
@@ -657,6 +659,7 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
             reaps: all.filter((e) => e.event === 'reap').length,
             false_positives: all.filter((e) => e.event === 'reopen' && e.verdict === 'false-positive').length,
             live_intervals_n: liveJson.length,
+            session_gaps_excluded: (all.filter((e) => e.event === 'touch') as Array<{ was_stale?: boolean }>).filter((e) => e.was_stale === true).length,
             caveats: [
               'false_positives is a LOWER BOUND on wrong reaps: a holder who never noticed, or who re-claimed instead of reopening, leaves no record.',
               'live_intervals are right-truncated — a lock still open, or whose holder never returned, contributes nothing.',
@@ -703,7 +706,13 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
   // Every number below is computed over the WHOLE log, never the filtered view.
   const reaps = all.filter((e) => e.event === 'reap').length;
   const falsePositives = all.filter((e) => e.event === 'reopen' && e.verdict === 'false-positive').length;
-  const liveIntervals = all.filter((e) => e.event === 'touch').map((e) => (e as { idle_seconds: number }).idle_seconds);
+  // Exclude intervals that were ALREADY past the threshold when recorded: those are
+  // session gaps (someone returning to an abandoned lock), not evidence a holder was
+  // alive and quiet. Including them puts a multi-day outlier into a distribution whose
+  // TAIL sets the threshold.
+  const touches = all.filter((e) => e.event === 'touch') as Array<{ idle_seconds: number; was_stale?: boolean }>;
+  const liveIntervals = touches.filter((e) => e.was_stale !== true).map((e) => e.idle_seconds);
+  const gapCount = touches.length - liveIntervals.length;
 
   console.log('');
   if (liveIntervals.length > 0) {
@@ -715,6 +724,11 @@ async function cmdEvents(flags: ParsedFlags): Promise<void> {
     console.log(
       `  The threshold must sit above the TAIL of this distribution, not its median — a threshold at the median reaps half of all live locks.`,
     );
+    if (gapCount > 0) {
+      console.log(
+        `  ${gapCount} further touch(es) excluded: the lock was already past the threshold when touched, so the interval is a session gap rather than a live-and-quiet one.`,
+      );
+    }
   } else {
     console.log('No live inter-touch intervals recorded yet, so the threshold cannot be argued DOWN from this log.');
   }

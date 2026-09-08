@@ -454,6 +454,14 @@ async function recordTouch(
   previousUpdated: string,
   via: TouchEvent['via'],
   actor: string | null | undefined,
+  /**
+   * Override the was_stale determination when liveness is PROVEN independently of the
+   * clock. The only such case is a holder reopening its own reaped lock: the interval
+   * exceeded the threshold — that is why it was reaped — and the holder's return is
+   * direct evidence it was alive throughout. Excluding it by the clock rule would
+   * discard precisely the observation the reopen path exists to capture.
+   */
+  wasStaleOverride?: boolean,
 ): Promise<void> {
   // NEVER THROW. This runs AFTER the record has already been written, so an exception
   // here reports failure for a mutation that actually landed — `update` exited 1 with
@@ -464,6 +472,10 @@ async function recordTouch(
   try {
     const idleMs = Date.now() - parseTimestamp(previousUpdated).getTime();
     const holder = record.frontmatter.agent_id;
+    // Was this lock already reapable when the touch landed? If so the interval is a
+    // session gap, not a live-and-quiet interval, and must not enter the distribution
+    // the threshold is tuned against.
+    const wasStale = wasStaleOverride ?? idleMs > resolveStaleMinutes(undefined) * 60_000;
     await appendEvent(locksRoot, {
       event: 'touch',
       ts: record.frontmatter.updated,
@@ -477,6 +489,7 @@ async function recordTouch(
       foreign: actor != null && holder != null && !agentMatches(holder, actor),
       idle_seconds: Math.max(0, Math.round(idleMs / 1000)),
       via,
+      was_stale: wasStale,
       tasks_total: record.tasks.length,
       tasks_done: record.tasks.filter((t) => t.done).length,
     });
@@ -1376,7 +1389,10 @@ export async function reopenLock(locksRoot: string, params: ReopenLockParams): P
   // this long: the holder demonstrably came back. Record it as a live interval so the
   // distribution the threshold is tuned against contains the case that matters most.
   if (verdict === 'false-positive') {
-    await recordTouch(locksRoot, record, trueLastTouch, 'update', params.agent_id);
+    // was_stale: false, deliberately. The lock WAS past the threshold — that is why
+    // reap took it — but its holder came back, which is the evidence. This is the one
+    // interval that is both over-threshold and demonstrably live.
+    await recordTouch(locksRoot, record, trueLastTouch, 'update', params.agent_id, false);
   }
 
   await appendEvent(locksRoot, {

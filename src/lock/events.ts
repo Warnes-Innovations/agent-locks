@@ -143,6 +143,22 @@ export interface TouchEvent extends EventBase {
   idle_seconds: number;
   /** Which operation bumped it: a task/scope/note update, a bare heartbeat, or the closing finish. */
   via: 'update' | 'heartbeat' | 'finish';
+  /**
+   * True when the lock was ALREADY past the staleness threshold when this touch
+   * happened — i.e. it had been abandoned long enough to be reapable, and somebody
+   * came back to it anyway.
+   *
+   * Such an interval is NOT evidence that a holder was alive and quiet for that long,
+   * which is what the live distribution is supposed to contain. It is a session gap.
+   * Observed for real: a lock left over a four-day break would have contributed a
+   * 109-HOUR "live interval" to a distribution the threshold is meant to sit above the
+   * tail of — one point arguing for a five-day threshold.
+   *
+   * Recorded rather than dropped, because "somebody returned after N hours" is a real
+   * fact about how this gets used; it is simply a different population, and the
+   * summary excludes it from the live distribution.
+   */
+  was_stale: boolean;
   tasks_total: number;
   tasks_done: number;
 }

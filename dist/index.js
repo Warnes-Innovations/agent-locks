@@ -495,10 +495,11 @@ async function withRecordLock(filePath, fn) {
     }
   }
 }
-async function recordTouch(locksRoot, record, previousUpdated, via, actor) {
+async function recordTouch(locksRoot, record, previousUpdated, via, actor, wasStaleOverride) {
   try {
     const idleMs = Date.now() - parseTimestamp(previousUpdated).getTime();
     const holder = record.frontmatter.agent_id;
+    const wasStale = wasStaleOverride ?? idleMs > resolveStaleMinutes(void 0) * 6e4;
     await appendEvent(locksRoot, {
       event: "touch",
       ts: record.frontmatter.updated,
@@ -512,6 +513,7 @@ async function recordTouch(locksRoot, record, previousUpdated, via, actor) {
       foreign: actor != null && holder != null && !agentMatches(holder, actor),
       idle_seconds: Math.max(0, Math.round(idleMs / 1e3)),
       via,
+      was_stale: wasStale,
       tasks_total: record.tasks.length,
       tasks_done: record.tasks.filter((t) => t.done).length
     });
@@ -962,7 +964,7 @@ async function reopenLock(locksRoot, params) {
     await writeRecord(record);
     await fs3.unlink(oldFilePath);
     if (verdict === "false-positive") {
-      await recordTouch(locksRoot, record, trueLastTouch, "update", params.agent_id);
+      await recordTouch(locksRoot, record, trueLastTouch, "update", params.agent_id, false);
     }
     await appendEvent(locksRoot, {
       event: "reopen",
@@ -1766,7 +1768,7 @@ async function cmdEvents(flags) {
   const all = type === void 0 && limit === void 0 && lockFilter === void 0 ? events : await readEvents(locksRoot, {});
   warnEventLog();
   if (flags.boolFlags.has("--json")) {
-    const liveJson = all.filter((e) => e.event === "touch").map((e) => e.idle_seconds);
+    const liveJson = all.filter((e) => e.event === "touch").filter((e) => e.was_stale !== true).map((e) => e.idle_seconds);
     console.log(
       JSON.stringify(
         {
@@ -1777,6 +1779,7 @@ async function cmdEvents(flags) {
             reaps: all.filter((e) => e.event === "reap").length,
             false_positives: all.filter((e) => e.event === "reopen" && e.verdict === "false-positive").length,
             live_intervals_n: liveJson.length,
+            session_gaps_excluded: all.filter((e) => e.event === "touch").filter((e) => e.was_stale === true).length,
             caveats: [
               "false_positives is a LOWER BOUND on wrong reaps: a holder who never noticed, or who re-claimed instead of reopening, leaves no record.",
               "live_intervals are right-truncated \u2014 a lock still open, or whose holder never returned, contributes nothing.",
@@ -1813,7 +1816,9 @@ async function cmdEvents(flags) {
   }
   const reaps = all.filter((e) => e.event === "reap").length;
   const falsePositives = all.filter((e) => e.event === "reopen" && e.verdict === "false-positive").length;
-  const liveIntervals = all.filter((e) => e.event === "touch").map((e) => e.idle_seconds);
+  const touches = all.filter((e) => e.event === "touch");
+  const liveIntervals = touches.filter((e) => e.was_stale !== true).map((e) => e.idle_seconds);
+  const gapCount = touches.length - liveIntervals.length;
   console.log("");
   if (liveIntervals.length > 0) {
     const sorted = [...liveIntervals].sort((a, b) => a - b);
@@ -1824,6 +1829,11 @@ async function cmdEvents(flags) {
     console.log(
       `  The threshold must sit above the TAIL of this distribution, not its median \u2014 a threshold at the median reaps half of all live locks.`
     );
+    if (gapCount > 0) {
+      console.log(
+        `  ${gapCount} further touch(es) excluded: the lock was already past the threshold when touched, so the interval is a session gap rather than a live-and-quiet one.`
+      );
+    }
   } else {
     console.log("No live inter-touch intervals recorded yet, so the threshold cannot be argued DOWN from this log.");
   }
