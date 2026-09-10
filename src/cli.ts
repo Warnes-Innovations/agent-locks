@@ -39,6 +39,7 @@ import {
   LockNotActiveError,
   LockNotOwnedError,
   ScopeNarrowingRefusedError,
+  DuplicateTaskTextError,
   LockNotStaleError,
   ScopeAmendmentError,
   EmptyScopeError,
@@ -709,6 +710,7 @@ export async function runCli(argv: string[]): Promise<number> {
       error instanceof LockNotActiveError ||
       error instanceof LockNotOwnedError ||
       error instanceof ScopeNarrowingRefusedError ||
+      error instanceof DuplicateTaskTextError ||
       error instanceof LockNotStaleError ||
       error instanceof ScopeAmendmentError ||
       error instanceof EmptyScopeError ||

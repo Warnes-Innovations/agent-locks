@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   checkConflicts,
   createLock,
+  DuplicateTaskTextError,
   EmptyScopeError,
   EmptyUpdateError,
   findLockById,
@@ -504,5 +505,83 @@ describe('scope narrowing is gated like lock_finish', () => {
       agent_id: 'Red [bb2222]',
     });
     expect(result.scope).toEqual(['src/**']);
+  });
+});
+
+/**
+ * Issue #6 — a task text that cannot be selected.
+ * https://github.com/Warnes-Innovations/agent-locks/issues/6
+ */
+describe('unaddressable task texts', () => {
+  it('refuses duplicates, because the second copy can never be selected', async () => {
+    // Before this, lock_create accepted them and lock_update's exact-match
+    // selector always found the first: success reported, second left unchecked,
+    // and the lock could never reach 100% with nothing saying why.
+    await expect(
+      createLock(locksRoot, {
+        title: 'x',
+        scope: ['a/**'],
+        tasks: ['review file', 'write tests', 'review file'],
+        repository: TEST_REPO,
+      }),
+    ).rejects.toThrow(DuplicateTaskTextError);
+  });
+
+  it('names the offending text, so the caller can fix it without guessing', async () => {
+    await expect(
+      createLock(locksRoot, { title: 'x', scope: ['a/**'], tasks: ['dup', 'dup'], repository: TEST_REPO }),
+    ).rejects.toThrow(/"dup"/);
+  });
+
+  it('treats whitespace-only difference as duplication, not distinction', async () => {
+    // "write tests" and "write tests " are one task to a human and two
+    // unreachable ones to an exact matcher — the same hazard normalizeScope
+    // already closes for globs.
+    await expect(
+      createLock(locksRoot, {
+        title: 'x',
+        scope: ['a/**'],
+        tasks: ['write tests', '  write tests  '],
+        repository: TEST_REPO,
+      }),
+    ).rejects.toThrow(DuplicateTaskTextError);
+  });
+
+  it('DROPS empty and whitespace-only tasks rather than refusing', async () => {
+    // Asymmetric on purpose: an empty string carries no intent worth preserving,
+    // where a duplicate is a caller who meant two steps and will notice one gone.
+    const { id } = await createLock(locksRoot, {
+      title: 'x',
+      scope: ['a/**'],
+      tasks: ['real task', '', '   '],
+      repository: TEST_REPO,
+    });
+    const record = await findLockById(locksRoot, id);
+    expect(record!.tasks.map((t) => t.text)).toEqual(['real task']);
+  });
+
+  it('stores the TRIMMED text, so the text lock_update must match is the text shown', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'x',
+      scope: ['a/**'],
+      tasks: ['  padded  '],
+      repository: TEST_REPO,
+    });
+    const record = await findLockById(locksRoot, id);
+    expect(record!.tasks[0].text).toBe('padded');
+    // And that stored text is selectable — the round trip is the point.
+    const result = await updateLock(locksRoot, { lock_id: id, task_text: 'padded', done: true });
+    expect(result.percentComplete).toBe(100);
+  });
+
+  it('still accepts distinct tasks unchanged', async () => {
+    const { id } = await createLock(locksRoot, {
+      title: 'x',
+      scope: ['a/**'],
+      tasks: ['one', 'two', 'three'],
+      repository: TEST_REPO,
+    });
+    const record = await findLockById(locksRoot, id);
+    expect(record!.tasks.map((t) => t.text)).toEqual(['one', 'two', 'three']);
   });
 });

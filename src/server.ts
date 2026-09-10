@@ -25,6 +25,7 @@ import {
   EmptyUpdateError,
   ScopeNarrowingRefusedError,
   IncompleteTaskUpdateError,
+  DuplicateTaskTextError,
 } from './lock/store.js';
 import { checkScopeDrift } from './lock/drift.js';
 import { DEFAULT_STALE_MINUTES } from './lock/types.js';
@@ -219,7 +220,14 @@ export function createServer(): McpServer {
             'Glob patterns describing the files/paths this lock claims. Declare your best guess now and amend it later with lock_update — ' +
               'this is the moment you know least about what you will touch, and an unamended scope silently stops covering the files the work grows into.',
           ),
-        tasks: z.array(z.string()).describe('Plain-text descriptions of the tasks you plan to do. All are created unchecked.'),
+        tasks: z
+          .array(z.string())
+          .describe(
+            'Plain-text descriptions of the tasks you plan to do. All are created unchecked. ' +
+              'Each must be DISTINCT: task_text is lock_update\'s only selector and it matches exactly, so a repeated ' +
+              'text is unaddressable — the second copy could never be checked off and the lock could never reach 100%. ' +
+              'Duplicates are refused; empty or whitespace-only entries are dropped, and texts are stored trimmed.',
+          ),
         agent_id: z
           .string()
           .nullable()
@@ -523,4 +531,5 @@ export {
   EmptyUpdateError,
   IncompleteTaskUpdateError,
   ScopeNarrowingRefusedError,
+  DuplicateTaskTextError,
 };
