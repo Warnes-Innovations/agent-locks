@@ -42,7 +42,7 @@ describe('applyScopeAmendment', () => {
     expect(result.changed).toBe(true);
   });
 
-  it('scope replaces the whole claim, which is how an over-claiming lock gets narrowed', () => {
+  it('set_scope replaces the whole claim, which is how an over-claiming lock gets narrowed', () => {
     const result = applyScopeAmendment(['src/**', 'tests/**'], { set_scope: ['src/auth/**'] });
     expect(result.next).toEqual(['src/auth/**']);
     expect(result.changed).toBe(true);
@@ -96,6 +96,22 @@ describe('formatScopeCheck', () => {
     // The consequence clause is the whole point of this prompt: an agent told
     // WHY an unamended scope hurts acts on it, one told to "remember" does not.
     expect(text).toContain('invisible to any other agent looking for a conflict');
+  });
+
+  it('names PARAMETERS THAT EXIST — the prompt is executed, not just read', () => {
+    // This prompt is echoed to an agent on every create and update, so a
+    // parameter name in it is an instruction. It said `scope (replace)` for two
+    // commits after the parameter was renamed to `set_scope` in f7984f8, and an
+    // agent following it would have passed `scope` — which the MCP schema strips
+    // silently, returning success and doing nothing (https://github.com/Warnes-Innovations/agent-locks/issues/9). Our own guidance
+    // would have caused the failure our own issue describes.
+    const mcp = formatScopeCheck(['a/**'], 'mcp');
+    expect(mcp).toContain('set_scope');
+    // The bare old name must not appear as a parameter instruction.
+    expect(mcp).not.toMatch(/\bor scope \(replace\)/);
+
+    const cli = formatScopeCheck(['a/**'], 'cli');
+    expect(cli).toContain('--set-scope');
   });
 
   it('names MCP tools to an agent and CLI commands to a human', () => {

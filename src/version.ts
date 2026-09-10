@@ -6,4 +6,4 @@
  * because two hand-maintained copies drift and a version that disagrees with
  * itself is worse than none — a test pins it to package.json.
  */
-export const VERSION = '0.2.0';
+export const VERSION = '0.2.1';

@@ -127,6 +127,85 @@ describe('agent-locks MCP server (real subprocess, real JSON-RPC)', () => {
     );
     expect(steps).toContain('add_scope');
     expect(steps).toContain('lock_check_drift');
+
+    // And the REPLACE parameter by its real name. The handshake said `scope`
+    // for two commits after the rename to `set_scope`, and this assertion —
+    // which already existed for add_scope — is exactly what would have caught
+    // it. An agent following the stale step passed `scope`, which the schema
+    // strips silently: success returned, claim unchanged.
+    expect(instructions).toContain('set_scope');
+    expect(steps).toContain('set_scope');
+    expect(steps).not.toMatch(/\(scope replaces it/);
+  });
+
+  /**
+   * The CLASS-level guard, and the reason the instance-level ones were not enough.
+   *
+   * Three separate sweeps for the `scope` -> `set_scope` rename each grepped for a
+   * PHRASE that had broken ("or scope (replace)", "Mutually exclusive with `scope`")
+   * and each came back clean while agent-facing strings were still wrong — the
+   * survivors used different wording every time, ending with `scope/add_scope` in an
+   * error message, which matched no phrase anyone thought to search for.
+   *
+   * So this asserts the PROPERTY instead: every snake_case token appearing in text we
+   * hand to an agent must be a name that actually exists in the served schema. The
+   * vocabulary is DERIVED from tools/list rather than hand-copied, because a literal
+   * list in a test is a second copy of the schema and drifts green — the next rename
+   * would leave this asserting that the stale token must remain.
+   */
+  it('no agent-facing string names an identifier that does not exist', async () => {
+    const { tools } = await client.listTools();
+
+    const known = new Set<string>();
+    const corpus: Array<{ where: string; text: string }> = [
+      { where: 'INSTRUCTIONS', text: client.getInstructions() ?? '' },
+    ];
+    for (const tool of tools) {
+      known.add(tool.name);
+      corpus.push({ where: `${tool.name}.description`, text: tool.description ?? '' });
+      const props = ((tool.inputSchema as { properties?: Record<string, { description?: string }> })
+        .properties) ?? {};
+      for (const [param, spec] of Object.entries(props)) {
+        known.add(param);
+        corpus.push({ where: `${tool.name}.${param}`, text: spec.description ?? '' });
+      }
+    }
+
+    // Declared exceptions, reported rather than silent: names that are real but are
+    // not tool or parameter names. Keep this list SHORT and justified — every entry
+    // is a hole in the check.
+    const EXCEPTIONS = new Map<string, string>([
+      ['scope_history', 'a lock-file frontmatter field, not a tool parameter'],
+    ]);
+
+    const offenders: string[] = [];
+    const exceptionsUsed = new Set<string>();
+    for (const { where, text } of corpus) {
+      for (const token of text.match(/\b[a-z][a-z0-9]*_[a-z0-9_]+\b/g) ?? []) {
+        if (known.has(token)) continue;
+        if (EXCEPTIONS.has(token)) { exceptionsUsed.add(token); continue; }
+        offenders.push(`${where}: "${token}"`);
+      }
+    }
+
+    // M0: state the exception list's effect even when it changes nothing.
+    expect(EXCEPTIONS.size).toBeGreaterThanOrEqual(exceptionsUsed.size);
+    expect(offenders, `agent-facing text names identifiers absent from the served schema:\n${offenders.join('\n')}`).toEqual([]);
+  });
+
+  it('every lock_update parameter description names only parameters that exist', async () => {
+    // A description citing a sibling key that is not in the same schema is an
+    // instruction to call something absent. add_scope's description named
+    // `scope` while the schema carried `set_scope`, eight keys away.
+    const { tools } = await client.listTools();
+    const update = tools.find((t) => t.name === 'lock_update');
+    const props = Object.keys((update?.inputSchema as { properties: object }).properties);
+    expect(props).toContain('set_scope');
+    expect(props).not.toContain('scope');
+
+    const described = JSON.stringify(update?.inputSchema);
+    // No description may cite a bare `scope` parameter — only set_scope/add_scope.
+    expect(described).not.toMatch(/Mutually exclusive with `scope`/);
   });
 
   it('drives a real amend -> conflict-visible -> drift round trip over JSON-RPC', async () => {

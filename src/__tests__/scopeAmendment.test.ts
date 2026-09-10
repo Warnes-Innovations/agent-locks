@@ -92,7 +92,7 @@ describe('updateLock scope amendment', () => {
     );
   });
 
-  it('scope replaces the claim, which is how a lock that over-claimed stops blocking others', async () => {
+  it('set_scope replaces the claim, which is how a lock that over-claimed stops blocking others', async () => {
     const id = await claim(['src/**']);
     const result = await updateLock(locksRoot, { lock_id: id, set_scope: ['src/auth/**'] });
 
