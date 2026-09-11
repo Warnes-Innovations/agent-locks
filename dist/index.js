@@ -458,6 +458,14 @@ function agentMatches(stored, query) {
   }
   return false;
 }
+var DuplicateTaskTextError = class extends Error {
+  constructor(duplicates) {
+    super(
+      `lock_create was given the same task text more than once: ${duplicates.map((t) => `"${t}"`).join(", ")}. Refusing, because a duplicate task is UNADDRESSABLE: task_text is the only selector lock_update has, so the second copy can never be reached \u2014 flipping it reports success and leaves it unchecked, and the lock can never reach 100%. Give each task distinct text, or make it one task.`
+    );
+    this.name = "DuplicateTaskTextError";
+  }
+};
 var LockNotFoundError = class extends Error {
   constructor(lockId) {
     super(`No lock found with id "${lockId}".`);
@@ -660,6 +668,23 @@ async function uniqueFilePath(dir, timestamp, slug) {
     }
   }
 }
+function normalizeTasks(tasks) {
+  const seen = /* @__PURE__ */ new Set();
+  const duplicates = [];
+  const out = [];
+  for (const raw of tasks) {
+    const text = raw.trim();
+    if (text === "") continue;
+    if (seen.has(text)) {
+      if (!duplicates.includes(text)) duplicates.push(text);
+      continue;
+    }
+    seen.add(text);
+    out.push({ text, done: false });
+  }
+  if (duplicates.length > 0) throw new DuplicateTaskTextError(duplicates);
+  return out;
+}
 async function createLock(locksRoot, params) {
   await ensureDirs(locksRoot);
   const now = formatTimestamp();
@@ -685,7 +710,7 @@ async function createLock(locksRoot, params) {
     filePath,
     frontmatter,
     title: params.title,
-    tasks: params.tasks.map((text) => ({ text, done: false })),
+    tasks: normalizeTasks(params.tasks),
     notes: []
   };
   await writeRecord(record);
@@ -1106,7 +1131,9 @@ function createServer() {
         scope: z.array(z.string()).min(1).describe(
           "Glob patterns describing the files/paths this lock claims. Declare your best guess now and amend it later with lock_update \u2014 this is the moment you know least about what you will touch, and an unamended scope silently stops covering the files the work grows into."
         ),
-        tasks: z.array(z.string()).describe("Plain-text descriptions of the tasks you plan to do. All are created unchecked."),
+        tasks: z.array(z.string()).describe(
+          "Plain-text descriptions of the tasks you plan to do. All are created unchecked. Each must be DISTINCT: task_text is lock_update's only selector and it matches exactly, so a repeated text is unaddressable \u2014 the second copy could never be checked off and the lock could never reach 100%. Duplicates are refused; empty or whitespace-only entries are dropped, and texts are stored trimmed."
+        ),
         agent_id: z.string().nullable().optional().describe("Your own agent id, ONLY if you already know it from your context. Omit or pass null otherwise \u2014 never guess."),
         parent_agent_id: z.string().nullable().optional().describe("The id of whatever spawned you, ONLY if you already know it. Omit or pass null otherwise \u2014 never guess."),
         base_dir: z.string().optional().describe(
@@ -1830,7 +1857,7 @@ async function runCli(argv) {
       printError(error.message);
       return 1;
     }
-    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof ScopeNarrowingRefusedError || error instanceof LockNotStaleError || error instanceof ScopeAmendmentError || error instanceof EmptyScopeError || error instanceof EmptyUpdateError || error instanceof IncompleteTaskUpdateError) {
+    if (error instanceof NotAGitRepoError || error instanceof LockNotFoundError || error instanceof TaskNotFoundError || error instanceof LockNotActiveError || error instanceof LockNotOwnedError || error instanceof ScopeNarrowingRefusedError || error instanceof DuplicateTaskTextError || error instanceof LockNotStaleError || error instanceof ScopeAmendmentError || error instanceof EmptyScopeError || error instanceof EmptyUpdateError || error instanceof IncompleteTaskUpdateError) {
       printError(error.message);
       return 1;
     }

@@ -109,6 +109,18 @@ export function agentMatches(stored: string | null, query: string | null): boole
 // one place, rather than some from here and some from ./scope.
 export { ScopeAmendmentError, EmptyScopeError } from './scope.js';
 
+export class DuplicateTaskTextError extends Error {
+  constructor(duplicates: string[]) {
+    super(
+      `lock_create was given the same task text more than once: ${duplicates.map((t) => `"${t}"`).join(', ')}. ` +
+        `Refusing, because a duplicate task is UNADDRESSABLE: task_text is the only selector lock_update has, ` +
+        `so the second copy can never be reached — flipping it reports success and leaves it unchecked, and the ` +
+        `lock can never reach 100%. Give each task distinct text, or make it one task.`,
+    );
+    this.name = 'DuplicateTaskTextError';
+  }
+}
+
 export class LockNotFoundError extends Error {
   constructor(lockId: string) {
     super(`No lock found with id "${lockId}".`);
@@ -496,6 +508,44 @@ export interface CreateLockResult {
   scopeCheck: string;
 }
 
+/**
+ * Trims task texts, drops the empty ones, and REFUSES duplicates.
+ *
+ * `task_text` is the only selector `lock_update` has, and it matches exactly. So a
+ * task whose text is empty, or identical to an earlier one, is not merely untidy —
+ * it is UNADDRESSABLE. The second copy can never be reached: flipping it matches the
+ * first, reports success, and leaves the second unchecked, so the lock can never
+ * reach 100% and nothing in the response says why. That contradicts lock_update's
+ * own stated contract, which promises an error listing the real task texts "rather
+ * than silently doing nothing".
+ *
+ * Duplicates ERROR and empties are DROPPED, deliberately asymmetric. A duplicate is
+ * a caller who meant two distinct steps and will notice one missing; refusing tells
+ * them at the point of the mistake. An empty string carries no intent to preserve —
+ * dropping it matches normalizeScope, which trims and drops for the same reason.
+ *
+ * Verified before choosing to refuse: across all 16 lock files then present in both
+ * repositories on this machine, no lock carried a duplicate task text. Rejecting
+ * strands nothing that exists.
+ */
+function normalizeTasks(tasks: string[]): LockTask[] {
+  const seen = new Set<string>();
+  const duplicates: string[] = [];
+  const out: LockTask[] = [];
+  for (const raw of tasks) {
+    const text = raw.trim();
+    if (text === '') continue;
+    if (seen.has(text)) {
+      if (!duplicates.includes(text)) duplicates.push(text);
+      continue;
+    }
+    seen.add(text);
+    out.push({ text, done: false });
+  }
+  if (duplicates.length > 0) throw new DuplicateTaskTextError(duplicates);
+  return out;
+}
+
 export async function createLock(locksRoot: string, params: CreateLockParams): Promise<CreateLockResult> {
   await ensureDirs(locksRoot);
   const now = formatTimestamp();
@@ -523,7 +573,7 @@ export async function createLock(locksRoot: string, params: CreateLockParams): P
     filePath,
     frontmatter,
     title: params.title,
-    tasks: params.tasks.map((text): LockTask => ({ text, done: false })),
+    tasks: normalizeTasks(params.tasks),
     notes: [],
   };
   await writeRecord(record);
