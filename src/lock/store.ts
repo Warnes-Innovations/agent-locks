@@ -491,6 +491,8 @@ export interface CreateLockParams {
   parent_agent_id?: string | null;
   /** Canonical repository root path, recorded at creation time so lock summaries always carry it. Defaults to empty string for backward compat. */
   repository?: string;
+  /** HEAD's sha at creation, when the repo has one. Used by drift to order commits against the claim; see LockFrontmatter.head. */
+  head?: string | null;
   /** Which command names the echoed scope-check prompt should name. Defaults to 'mcp'. */
   dialect?: ScopeCheckDialect;
 }
@@ -568,6 +570,7 @@ export async function createLock(locksRoot: string, params: CreateLockParams): P
     updated: now,
     scope,
     repository: params.repository ?? '',
+    ...(params.head ? { head: params.head } : {}),
   };
   const record: LockRecord = {
     filePath,

@@ -5,7 +5,7 @@
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
+import { resolveLocksRoot, resolveRepoRoot, resolveHeadSha, NotAGitRepoError } from './git.js';
 import {
   lastReapFloor,
   lastUnreadableLocks,
@@ -252,11 +252,12 @@ export function createServer(): McpServer {
     async ({ title, scope, tasks, agent_id, parent_agent_id, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
-        const [locksRoot, repoRoot] = await Promise.all([
+        const [locksRoot, repoRoot, head] = await Promise.all([
           resolveLocksRoot(cwd),
           resolveRepoRoot(cwd),
+          resolveHeadSha(cwd),
         ]);
-        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot });
+        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot, head });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);

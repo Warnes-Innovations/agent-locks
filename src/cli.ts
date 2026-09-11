@@ -23,7 +23,7 @@
  * agent session still coordinates correctly, for the same git-common-dir
  * reason documented in git.ts.
  */
-import { resolveLocksRoot, resolveRepoRoot, NotAGitRepoError } from './git.js';
+import { resolveLocksRoot, resolveRepoRoot, resolveHeadSha, NotAGitRepoError } from './git.js';
 import {
   lastReapFloor,
   lastUnreadableLocks,
@@ -419,11 +419,13 @@ async function cmdClaim(flags: ParsedFlags): Promise<void> {
   const parent_agent_id = oneOf(flags.flags, '--parent') ?? null;
 
   const cwd = resolveBaseDir(flags);
-  const [locksRoot, repoRoot] = await Promise.all([
+  const [locksRoot, repoRoot, head] = await Promise.all([
     resolveLocksRoot(cwd),
     resolveRepoRoot(cwd),
+    resolveHeadSha(cwd),
   ]);
   const result = await createLock(locksRoot, {
+    head,
     title,
     scope,
     tasks,

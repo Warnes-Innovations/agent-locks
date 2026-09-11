@@ -300,13 +300,27 @@ function parseStatusPaths(stdout: string): string[] {
  * since the claim", i.e. reintroducing exactly the false-clean this function
  * exists to remove. Reproduced on a UTC-4 machine while writing this.
  */
-export async function listCommittedFilesSince(cwd: string, since: Date): Promise<string[]> {
+export async function listCommittedFilesSince(
+  cwd: string,
+  since: Date,
+  /** When given, restrict to commits NOT reachable from this sha — i.e. those that genuinely postdate it. */
+  notReachableFrom?: string,
+): Promise<string[]> {
   const sinceUtc = since.toISOString();
   let stdout: string;
   try {
     ({ stdout } = await execFileAsync(
       'git',
-      [...SAFE_GIT_PREFIX, 'log', '-z', '--name-only', '--pretty=format:', `--since=${sinceUtc}`, 'HEAD'],
+      [
+        ...SAFE_GIT_PREFIX,
+        'log',
+        '-z',
+        '--name-only',
+        '--pretty=format:',
+        `--since=${sinceUtc}`,
+        ...(notReachableFrom ? [`^${notReachableFrom}`] : []),
+        'HEAD',
+      ],
       { cwd, maxBuffer: 64 * 1024 * 1024 },
     ));
   } catch (error) {
@@ -332,6 +346,45 @@ async function hasNoCommits(cwd: string): Promise<boolean> {
     return false;
   } catch {
     return true;
+  }
+}
+
+/**
+ * The current HEAD commit sha, or null when the repository has none yet.
+ *
+ * Recorded at lock_create so drift can tell a commit that PREDATES the claim from
+ * one that followed it. Timestamps cannot: `created` has one-second resolution, so
+ * a commit stamped in the same second as the claim is unorderable against it and
+ * `--since` (which is inclusive at the boundary — verified) counts it as "since".
+ *
+ * Returns null rather than throwing on a repository with no commits: that is a real
+ * state (`git rev-parse HEAD` -> "fatal: Needed a single revision"), and a lock is
+ * perfectly valid there. The field is optional everywhere downstream.
+ */
+export async function resolveHeadSha(cwd: string = process.cwd()): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when `ancestor` is an ancestor of `descendant` (or the same commit).
+ *
+ * Returns FALSE when either sha is unreachable — after a rebase, an amend, or a
+ * dropped branch, the sha recorded on a lock may no longer exist. That is not an
+ * error here: a filter that cannot prove a commit predates the claim must not
+ * suppress it, so an unknown sha degrades to today's behaviour rather than to a
+ * silently smaller result.
+ */
+export async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+  try {
+    await execFileAsync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd });
+    return true;
+  } catch {
+    return false;
   }
 }
 
