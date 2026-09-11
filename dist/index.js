@@ -109,13 +109,22 @@ function parseStatusPaths(stdout) {
   }
   return [...files].sort();
 }
-async function listCommittedFilesSince(cwd, since) {
+async function listCommittedFilesSince(cwd, since, notReachableFrom) {
   const sinceUtc = since.toISOString();
   let stdout;
   try {
     ({ stdout } = await execFileAsync(
       "git",
-      [...SAFE_GIT_PREFIX, "log", "-z", "--name-only", "--pretty=format:", `--since=${sinceUtc}`, "HEAD"],
+      [
+        ...SAFE_GIT_PREFIX,
+        "log",
+        "-z",
+        "--name-only",
+        "--pretty=format:",
+        `--since=${sinceUtc}`,
+        ...notReachableFrom ? [`^${notReachableFrom}`] : [],
+        "HEAD"
+      ],
       { cwd, maxBuffer: 64 * 1024 * 1024 }
     ));
   } catch (error) {
@@ -132,6 +141,22 @@ async function hasNoCommits(cwd) {
     return false;
   } catch {
     return true;
+  }
+}
+async function resolveHeadSha(cwd = process.cwd()) {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+async function isAncestor(cwd, ancestor, descendant) {
+  try {
+    await execFileAsync("git", ["merge-base", "--is-ancestor", ancestor, descendant], { cwd });
+    return true;
+  } catch {
+    return false;
   }
 }
 async function getRealGitCommonDir(cwd) {
@@ -679,7 +704,8 @@ async function createLock(locksRoot, params) {
     created: now,
     updated: now,
     scope,
-    repository: params.repository ?? ""
+    repository: params.repository ?? "",
+    ...params.head ? { head: params.head } : {}
   };
   const record = {
     filePath,
@@ -902,13 +928,18 @@ async function checkScopeDrift(locksRoot, params) {
   if (!record) throw new LockNotFoundError(params.lock_id);
   const cwd = params.cwd ?? process.cwd();
   const claimedAt = parseTimestamp(record.frontmatter.created);
-  const [uncommitted, committed, inspectedWorktree, ignoredFilesNotExamined, worktreeCount] = await Promise.all([
+  const [uncommitted, committedByTime, inspectedWorktree, ignoredFilesNotExamined, worktreeCount] = await Promise.all([
     listChangedFiles(cwd),
     listCommittedFilesSince(cwd, claimedAt),
     resolveRepoRoot(cwd),
     countIgnoredFiles(cwd),
     countWorktrees(cwd)
   ]);
+  let committed = committedByTime;
+  const head = record.frontmatter.head;
+  if (head && committedByTime.length > 0 && await isAncestor(cwd, head, "HEAD")) {
+    committed = await listCommittedFilesSince(cwd, claimedAt, head);
+  }
   const changed = [.../* @__PURE__ */ new Set([...uncommitted, ...committed])].sort();
   const scope = record.frontmatter.scope ?? [];
   const outOfScope = [];
@@ -1118,11 +1149,12 @@ function createServer() {
     async ({ title, scope, tasks, agent_id, parent_agent_id, base_dir }) => {
       try {
         const cwd = base_dir ?? process.cwd();
-        const [locksRoot, repoRoot] = await Promise.all([
+        const [locksRoot, repoRoot, head] = await Promise.all([
           resolveLocksRoot(cwd),
-          resolveRepoRoot(cwd)
+          resolveRepoRoot(cwd),
+          resolveHeadSha(cwd)
         ]);
-        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot });
+        const result = await createLock(locksRoot, { title, scope, tasks, agent_id, parent_agent_id, repository: repoRoot, head });
         return textResult(JSON.stringify(result, null, 2));
       } catch (error) {
         return errorResult(error);
@@ -1594,11 +1626,13 @@ async function cmdClaim(flags) {
   const agent_id = oneOf(flags.flags, "--agent") ?? null;
   const parent_agent_id = oneOf(flags.flags, "--parent") ?? null;
   const cwd = resolveBaseDir(flags);
-  const [locksRoot, repoRoot] = await Promise.all([
+  const [locksRoot, repoRoot, head] = await Promise.all([
     resolveLocksRoot(cwd),
-    resolveRepoRoot(cwd)
+    resolveRepoRoot(cwd),
+    resolveHeadSha(cwd)
   ]);
   const result = await createLock(locksRoot, {
+    head,
     title,
     scope,
     tasks,

@@ -12,6 +12,7 @@
 import {
   countIgnoredFiles,
   countWorktrees,
+  isAncestor,
   listChangedFiles,
   listCommittedFilesSince,
   resolveRepoRoot,
@@ -105,7 +106,7 @@ export async function checkScopeDrift(
   // Both halves of "what am I touching". `git status` alone would miss every
   // file already committed on this branch — see listCommittedFilesSince.
   const claimedAt = parseTimestamp(record.frontmatter.created);
-  const [uncommitted, committed, inspectedWorktree, ignoredFilesNotExamined, worktreeCount] =
+  const [uncommitted, committedByTime, inspectedWorktree, ignoredFilesNotExamined, worktreeCount] =
     await Promise.all([
       listChangedFiles(cwd),
       listCommittedFilesSince(cwd, claimedAt),
@@ -113,6 +114,28 @@ export async function checkScopeDrift(
       countIgnoredFiles(cwd),
       countWorktrees(cwd),
     ]);
+  // SUPPRESS commits that provably predate the claim.
+  //
+  // `created` has one-second resolution and `git log --since` is inclusive at the
+  // boundary (verified), so a commit stamped in the same second as the claim is
+  // unorderable against it by time alone and gets counted as "since". The sha
+  // recorded at lock_create orders them exactly: anything reachable from it
+  // existed before the claim did.
+  //
+  // THIS FILTER MUST FAIL OPEN. No recorded sha (every lock predating the field, and
+  // every lock in a repo with no commits), or a sha rewritten away by a rebase or
+  // amend, means we cannot PROVE a commit predates the claim — and an unprovable
+  // case must not be suppressed. Every such path falls through to the timestamp
+  // answer, which over-reports. Over-reporting costs an unnecessary widening;
+  // under-reporting is the silent failure drift exists to remove.
+  let committed = committedByTime;
+  const head = record.frontmatter.head;
+  if (head && committedByTime.length > 0 && (await isAncestor(cwd, head, 'HEAD'))) {
+    // `^<sha>` asks git itself to exclude everything reachable from the claim-time
+    // HEAD, which is exactly "everything that already existed when the lock was made".
+    committed = await listCommittedFilesSince(cwd, claimedAt, head);
+  }
+
   const changed = [...new Set([...uncommitted, ...committed])].sort();
 
   const scope = record.frontmatter.scope ?? [];

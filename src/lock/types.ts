@@ -58,6 +58,18 @@ export interface LockFrontmatter {
    * field was added (backward compatibility).
    */
   repository: string;
+  /**
+   * HEAD's commit sha at the moment this lock was created, when the repository had
+   * one. Lets drift distinguish a commit that PREDATES the claim from one that
+   * followed it — `created` cannot, because at one-second resolution a commit
+   * stamped in the same second as the claim is unorderable against it.
+   *
+   * OPTIONAL and may be unreachable. Absent on every lock written before this field
+   * existed, absent in a repository with no commits, and stale after a rebase or
+   * amend rewrites the commit it names. Every consumer must treat all three the same
+   * way: fall through to the timestamp, never to a smaller answer.
+   */
+  head?: string;
 }
 
 export interface LockTask {

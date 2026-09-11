@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { checkScopeDrift } from '../lock/drift.js';
 import { listChangedFiles, NotAGitRepoError } from '../git.js';
-import { createLock, finishLock, LockNotFoundError, updateLock } from '../lock/store.js';
+import { createLock, findLockById, finishLock, LockNotFoundError, updateLock } from '../lock/store.js';
 import { resolveLocksRoot, resolveRepoRoot } from '../git.js';
 
 const execFileAsync = promisify(execFile);
@@ -319,5 +319,90 @@ describe('checkScopeDrift', () => {
       'scopeCheck',
       expect.stringContaining('--add-scope'),
     );
+  });
+});
+
+/**
+ * Issue #5 — a commit in the SAME SECOND as the claim.
+ * https://github.com/Warnes-Innovations/agent-locks/issues/5
+ *
+ * `created` has one-second resolution and `git log --since` is inclusive at that
+ * boundary (verified directly: a commit at exactly 12:00:00Z is returned by
+ * `--since=12:00:00Z`). So time alone cannot order a commit against a claim made in
+ * the same second, and drift counted such commits as "since". The sha recorded at
+ * lock_create orders them exactly.
+ */
+describe('same-second claim boundary (#5)', () => {
+  /** Builds a lock whose `created` second and `head` are chosen by the test. */
+  async function lockAt(created: string, head: string | undefined, scope: string[]): Promise<string> {
+    const { id, filePath } = await createLock(locksRoot, {
+      title: 'boundary probe',
+      scope,
+      tasks: [],
+      repository: repoRoot,
+      ...(head ? { head } : {}),
+    });
+    const raw = await fs.readFile(filePath, 'utf8');
+    await fs.writeFile(filePath, raw.replace(/^created: .*$/m, `created: ${created}`));
+    return id;
+  }
+
+  it('suppresses a commit that PREDATES the claim but shares its second', async () => {
+    // The seed commit is reachable from HEAD-at-claim-time, so it provably
+    // existed before the lock did — regardless of what the clock says.
+    const head = (await gitCommitNow(repo, ['rev-parse', 'HEAD'])).trim();
+    const committedAt = (await gitCommitNow(repo, ['log', '-1', '--format=%cd', '--date=format:%Y-%m-%dT%H-%M-%S'])).trim();
+
+    const id = await lockAt(committedAt, head, ['zzz/**']);
+    const result = await checkScopeDrift(locksRoot, { lock_id: id, cwd: repo });
+
+    expect(result.committedSinceClaimCount).toBe(0);
+    expect(result.outOfScope).toEqual([]);
+  });
+
+  it('still reports a commit made AFTER the claim in that same second', async () => {
+    // The other direction, and the one that must not regress: suppressing by
+    // ancestry must not suppress work that genuinely followed the claim.
+    const head = (await gitCommitNow(repo, ['rev-parse', 'HEAD'])).trim();
+    const committedAt = (await gitCommitNow(repo, ['log', '-1', '--format=%cd', '--date=format:%Y-%m-%dT%H-%M-%S'])).trim();
+    const id = await lockAt(committedAt, head, ['zzz/**']);
+
+    await fs.writeFile(path.join(repo, 'grown.py'), 'x\n');
+    await gitCommitNow(repo, ['add', '.']);
+    await gitCommitNow(repo, ['commit', '-q', '-m', 'after the claim']);
+
+    const result = await checkScopeDrift(locksRoot, { lock_id: id, cwd: repo });
+    expect(result.outOfScope).toContain('grown.py');
+  });
+
+  it('FAILS OPEN on a lock with no recorded head — every lock written before the field', async () => {
+    const committedAt = (await gitCommitNow(repo, ['log', '-1', '--format=%cd', '--date=format:%Y-%m-%dT%H-%M-%S'])).trim();
+    const id = await lockAt(committedAt, undefined, ['zzz/**']);
+
+    const result = await checkScopeDrift(locksRoot, { lock_id: id, cwd: repo });
+    // Unsuppressed — the timestamp answer, which over-reports. That is the safe
+    // direction: an unprovable case must never be silently dropped.
+    expect(result.committedSinceClaimCount).toBeGreaterThan(0);
+  });
+
+  it('FAILS OPEN on a head sha that no longer exists — rebased or amended away', async () => {
+    const committedAt = (await gitCommitNow(repo, ['log', '-1', '--format=%cd', '--date=format:%Y-%m-%dT%H-%M-%S'])).trim();
+    const id = await lockAt(committedAt, '0'.repeat(40), ['zzz/**']);
+
+    const result = await checkScopeDrift(locksRoot, { lock_id: id, cwd: repo });
+    expect(result.committedSinceClaimCount).toBeGreaterThan(0);
+  });
+
+  it('records head at creation, and omits it in a repo with no commits', async () => {
+    const withHead = await createLock(locksRoot, {
+      title: 'has head', scope: ['a/**'], tasks: [], repository: repoRoot,
+      head: (await gitCommitNow(repo, ['rev-parse', 'HEAD'])).trim(),
+    });
+    expect((await findLockById(locksRoot, withHead.id))!.frontmatter.head).toMatch(/^[0-9a-f]{40}$/);
+
+    const without = await createLock(locksRoot, {
+      title: 'no head', scope: ['a/**'], tasks: [], repository: repoRoot, head: null,
+    });
+    expect((await findLockById(locksRoot, without.id))!.frontmatter.head).toBeUndefined();
   });
 });

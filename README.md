@@ -133,6 +133,7 @@ scope_history:
     scope:
       - backend/src/hindsight/**
 repository: /home/user/projects/my-app
+head: 4d9c1f2e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d
 ---
 
 # Add hindsight route tests
@@ -147,6 +148,10 @@ repository: /home/user/projects/my-app
 `scope_history` records every scope this lock previously claimed, oldest first, each with the timestamp at which it was retired. It appears only once a lock's scope has actually been amended (see [Scope is amendable](#scope-is-amendable-and-you-are-expected-to-amend-it)). Each entry holds the scope **as it stood before** that amendment — so the sample above says "this lock claimed only `backend/src/hindsight/**` until 19:02:08, and `backend/src/hindsight/**` plus `backend/src/telemetry/**` from then on". Recording the retired value rather than the new one is what makes the history reconstructable from the file alone: the newest value is already in the live `scope` field.
 
 That reconstruction is the point. When two agents collide, the question is *"was that file inside their claim at the moment I checked?"* — and the current scope alone cannot answer it.
+
+`head` is HEAD's commit sha at the moment the lock was created, when the repository had one. It exists so drift can tell a commit that **predates** the claim from one that followed it — `created` cannot, because at one-second resolution a commit stamped in the same second as the claim is unorderable against it, and `git log --since` is inclusive at that boundary (verified: a commit at exactly `12:00:00Z` is returned by `--since=12:00:00Z`).
+
+It is **optional and may be unreachable**: absent on every lock written before the field existed, absent in a repository with no commits, and stale once a rebase or amend rewrites the commit it names. All three cases are treated identically — drift falls through to the timestamp answer, which over-reports. That direction is deliberate: over-reporting costs an unnecessary widening, under-reporting is the silent failure the check exists to remove.
 
 Parsed and serialized by `src/lock/markdown.ts` using [`gray-matter`](https://github.com/jonschlinkert/gray-matter) for the frontmatter/body split, plus a small hand-written parser/serializer for the specific body shape (title heading, checklist, Notes section) that this project owns entirely — calling agents never write raw markdown; they pass structured tool arguments and this module is the only place that turns them into (or back out of) the file format.
 
