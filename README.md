@@ -390,6 +390,66 @@ Every lock summary (`lock_query`, `lock_check_conflict`) carries two computed fi
 
 If you need faster-than-threshold crash detection for the long-running MCP-server case specifically, that's a reasonable follow-up (e.g. an opt-in PID check that only applies when the caller identifies itself as a persistent session) — deliberately left out of this change to keep the staleness model uniform and simple across both interfaces first.
 
+### Harness activity: asking the harnesses who is actually here
+
+`stale` answers *"how long since this lock was touched?"* It cannot answer *"is
+anybody working in this repository right now?"* — and that second question is the one
+you actually want before reaping something.
+
+Optional probes ask each installed harness for its own session list:
+
+| harness | command | kind of answer |
+|---|---|---|
+| Claude Code | `claude agents --json` | **live registry** — pid, cwd, sessionId, name |
+| OpenCode | `opencode session list --format json` | **historical log** — survives exiting a session |
+
+Turn it on with `lock_query`'s `check_harness_activity: true`; `lock_reap` includes it
+automatically whenever it actually reaps something. Off by default, because it spawns
+subprocesses.
+
+**It is repository-level, and it can never be narrowed to one lock.** A lock records
+`agent_id` — whatever the agent knew to call itself. A harness records its own
+auto-generated `name` and a `sessionId`. Measured 2026-09-11: one live session appeared
+as `agent_id: 'sable-1 [1a3e60]'` on its lock and `name: 'agent-locks-9a'` in the
+registry, at the same moment. Different namespaces. The only stable join key is
+`sessionId`, and locks do not carry one, because `lock_create` refuses to invent
+identity it cannot observe.
+
+**So this never touches the `stale` flag**, and that restraint is the design rather than
+an omission. Folding repo-level activity into a per-lock verdict would mark every lock in
+a busy repository as fresh — including the genuinely abandoned ones, which is the exact
+protection staleness exists to provide. It only ever adds context to a decision you are
+already making.
+
+Three further things it deliberately does *not* do:
+
+- **Fail.** A probe that cannot run becomes a reported outcome, never an exception. This
+  is decoration on a lock operation and must not be able to break one.
+- **Trust the harness's own scoping.** Every returned session's `cwd` is independently
+  checked for containment in the target repository. OpenCode's listing *is* cwd-scoped
+  and Claude Code's is *not*, and a caller holding the result cannot tell which.
+- **Guess at PATH.** `claude` lives at `~/.local/bin/claude` on the machine this was
+  written for and is *not* on the PATH a stdio MCP subprocess inherits — probing PATH
+  alone reported the harness absent while nineteen of its sessions were running. Known
+  install locations are tried first. A false "no harness here" is the worst answer this
+  can give, because it is indistinguishable from a genuinely idle repository.
+
+Gemini CLI and Cursor are **not** registered, for different reasons, both tracked in
+issue #2.
+
+**Cursor** is simply untested — its CLI has not been installed anywhere this has run.
+
+**Gemini CLI was tested, and excluded on the result.** `gemini --list-sessions` is a
+*historical* log, not a live registry: a session created and then exited still appears in
+the listing. That puts it in OpenCode's category, where it would add a third weak signal
+saying little that a lock's own `updated` field does not already say. The two ways to
+read it are both poor bargains — `--list-sessions` ignores `-o json` and emits prose with
+a relative timestamp, and it will not list anything without `GEMINI_API_KEY`, which is a
+bad dependency for a tool whose job is answering "who is working here"; the on-disk record
+*is* machine-readable and needs no credential, but sits at an undocumented path under a
+directory named `tmp/`. The measurements are recorded on issue #2 so that if the
+trade-off changes, the work starts from data rather than from a `--help` page.
+
 ## Honest `agent_id` / `parent_agent_id` semantics
 
 **Claude Code does not expose any session id to a stdio MCP server subprocess** — not via environment variable, not via any MCP `initialize` parameter (the spec's `initialize` params are only `protocolVersion`, `capabilities`, `clientInfo`), and there is no documented mechanism for a subagent's MCP server process to learn its parent session's id either.
@@ -540,6 +600,33 @@ started before the artifact it was supposed to be running existed.**
 A second-order version of the same trap: the deploy path is *whatever branch is checked
 out in the main worktree*. Checking out another branch there silently un-deploys the
 release for every session started afterwards, with no signal.
+
+### A missing *parameter* cannot be detected the way a missing *tool* can
+
+Calling a tool that does not exist is an error, so "test by calling" works for tools.
+It does **not** work for parameters, and that difference caused a real silent failure.
+
+Every tool's input schema is `.strict()`, so **this** server rejects an unrecognised
+parameter with `unrecognized_keys` instead of dropping it. That is the structural fix,
+and it only protects servers started after it shipped:
+
+- an older server wraps the same schema in a plain `z.object()`, which **strips unknown
+  keys by default** — it accepts `add_scope`, returns an ordinary success result, and
+  discards the amendment;
+- there is no error, no warning, and no response field that differs from a real
+  amendment;
+- nothing can retrofit a process that is already running.
+
+So **verify an amendment by its effect, not by the absence of an error.** `lock_update`
+returns `scopeChanged` and echoes the resulting `scope` on every call; `scopeChanged:
+false` on a call you meant as an amendment means it did not happen. Fall back to the
+unamended workflow and say so. A free-text `note` is not a substitute — no matcher reads
+notes.
+
+One consequence worth stating plainly, because it makes the JSON Schema untrustworthy as
+evidence: `tools/list` advertises `additionalProperties: false` **either way**. The
+pre-fix server published a schema claiming strictness it did not enforce. Only calling it
+and reading the result tells you which you are talking to.
 
 ## Packaging: why `dist/` is committed to this repo
 
