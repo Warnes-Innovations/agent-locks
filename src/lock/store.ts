@@ -175,6 +175,17 @@ export class LockNotActiveError extends Error {
   }
 }
 
+export class DuplicateLockIdError extends Error {
+  constructor(lockId: string, destination: string, what: string) {
+    super(
+      `Refusing to ${what} lock "${lockId}": ${destination} already exists. Moving onto it would destroy that lock ` +
+        `— its scope, checklist, owner and progress — with no way to recover it. Two lock files share this id, which ` +
+        `should be impossible; inspect the store by hand rather than letting a move pick a winner.`,
+    );
+    this.name = 'DuplicateLockIdError';
+  }
+}
+
 function activeDir(locksRoot: string): string {
   return locksRoot;
 }
@@ -288,10 +299,20 @@ export class ConcurrentUpdateError extends Error {
  * the file keeps changing under repeated attempts does this give up — and then
  * it says so instead of picking a winner.
  */
+/**
+ * The mutator may be async, and its promise is awaited INSIDE the held guard.
+ *
+ * Do not narrow this back to a synchronous mutator. A mutator that needs to touch the
+ * filesystem before deciding — finish and reap both do, to refuse a move that would
+ * clobber an existing archived lock — would otherwise have to run that check outside
+ * the exclusion, which is precisely the check-then-act window the guard exists to
+ * close. Awaiting here keeps the whole read-decide-modify-write sequence under one
+ * claim. Synchronous mutators are unaffected: `await` on a non-promise is a no-op.
+ */
 async function mutateRecord<T>(
   locksRoot: string,
   lockId: string,
-  mutate: (record: LockRecord) => T,
+  mutate: (record: LockRecord) => T | Promise<T>,
 ): Promise<{ record: LockRecord; result: T }> {
   const ATTEMPTS = 8;
   for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
@@ -308,7 +329,7 @@ async function mutateRecord<T>(
     if (!release) continue; // someone else holds it; back off and retry
     try {
       const { record, raw } = await readRecordWithRaw(found);
-      const result = mutate(record);
+      const result = await mutate(record);
 
       // Belt and suspenders: even holding the guard, verify the bytes are still
       // the ones we read. If the exclusion ever fails (a stale-lock takeover, a
@@ -469,18 +490,91 @@ export async function findLockById(locksRoot: string, lockId: string): Promise<L
   return null;
 }
 
-async function uniqueFilePath(dir: string, timestamp: string, slug: string): Promise<{ filePath: string; id: string }> {
+/**
+ * Claims an id and writes the lock in ONE atomic step.
+ *
+ * Do not "simplify" this back into a probe-then-write helper that returns a free
+ * path for the caller to write later. Two properties are load-bearing and both are
+ * lost the moment the check and the write are separate statements:
+ *
+ * 1. PROBING FOR A FREE NAME AND THEN WRITING IT IS A TOCTOU. Between the probe and
+ *    the write, another process takes the same name, and the loser silently holds an
+ *    id belonging to a claim that no longer exists — while reporting success. Twelve
+ *    concurrent claims sharing a title collapsed onto ONE id this way.
+ *
+ *    Reserving the id by first creating an EMPTY file fixes the race and introduces a
+ *    worse artefact: a process killed between reserve and write leaves a zero-byte
+ *    `.md` that every reader reports as a corrupt lock, forever, with nothing able to
+ *    clean it up. So the full contents are written by the same `open(..., 'wx')` that
+ *    claims the name, and there is no window in which the file exists without being a
+ *    valid lock.
+ *
+ * 2. THE ARCHIVE MUST BE CHECKED, NOT JUST THE ACTIVE DIRECTORY. An id whose lock has
+ *    already been finished still identifies that archived record. Re-issuing it gives
+ *    two different claims one id, and the finish of the second then moves onto the
+ *    first — see assertDestinationFree below, which catches what this prevents.
+ */
+async function writeNewLock(
+  activeDirPath: string,
+  doneDirPath: string,
+  timestamp: string,
+  slug: string,
+  build: (id: string) => LockRecord,
+): Promise<{ record: LockRecord; id: string }> {
   let suffix = 0;
   for (;;) {
     const candidateId = suffix === 0 ? `${timestamp}-${slug}` : `${timestamp}-${slug}-${suffix + 1}`;
-    const filePath = path.join(dir, `${candidateId}.md`);
+
+    // A plain probe is correct for the archive: an archived id is never re-issued, and
+    // nothing else is competing to create files in there.
+    let archived = false;
     try {
-      await fs.access(filePath);
-      suffix += 1; // file exists, try the next suffix
+      await fs.access(path.join(doneDirPath, `${candidateId}.md`));
+      archived = true;
     } catch {
-      return { filePath, id: candidateId }; // ENOENT: this path is free
+      archived = false;
+    }
+    if (archived) {
+      suffix += 1;
+      continue;
+    }
+
+    const filePath = path.join(activeDirPath, `${candidateId}.md`);
+    const record = build(candidateId);
+    record.filePath = filePath;
+    const contents = serializeLockFile(record);
+    try {
+      const handle = await fs.open(filePath, 'wx');
+      try {
+        await handle.writeFile(contents, 'utf8');
+      } finally {
+        await handle.close();
+      }
+      return { record, id: candidateId };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      suffix += 1;
     }
   }
+}
+
+/**
+ * Refuses to rename a lock file over an existing one.
+ *
+ * Belt and suspenders with writeNewLock above: that one stops an id from being
+ * REISSUED, this one stops a move from silently clobbering if a duplicate ever arises
+ * another way — a hand-edited store, a restored backup, two processes racing. A
+ * destructive move must never be the fallback for an unexpected state: the file being
+ * moved onto is a whole lock, with its own scope, checklist, owner and progress, and
+ * nothing anywhere records that it existed once it is gone.
+ */
+async function assertDestinationFree(destination: string, lockId: string, what: string): Promise<void> {
+  try {
+    await fs.access(destination);
+  } catch {
+    return; // ENOENT: free, as expected
+  }
+  throw new DuplicateLockIdError(lockId, destination, what);
 }
 
 export interface CreateLockParams {
@@ -552,8 +646,10 @@ export async function createLock(locksRoot: string, params: CreateLockParams): P
   await ensureDirs(locksRoot);
   const now = formatTimestamp();
   const slug = slugify(params.title);
-  const { filePath, id } = await uniqueFilePath(activeDir(locksRoot), now, slug);
 
+  // Validate BEFORE claiming an id. Rejecting afterwards would burn a candidate id on
+  // a call that never produced a lock, leaving a gap that later reads as a reaped or
+  // hand-deleted claim.
   const scope = normalizeScope(params.scope);
   if (scope.length === 0) {
     throw new EmptyScopeError(
@@ -561,26 +657,28 @@ export async function createLock(locksRoot: string, params: CreateLockParams): P
         'because a glob carrying stray whitespace matches nothing and would produce a lock that claims a file it can never be matched against).',
     );
   }
-  const frontmatter: LockFrontmatter = {
-    id,
-    agent_id: params.agent_id ?? null,
-    parent_agent_id: params.parent_agent_id ?? null,
-    status: 'active',
-    created: now,
-    updated: now,
-    scope,
-    repository: params.repository ?? '',
-    ...(params.head ? { head: params.head } : {}),
-  };
-  const record: LockRecord = {
-    filePath,
-    frontmatter,
-    title: params.title,
-    tasks: normalizeTasks(params.tasks),
-    notes: [],
-  };
-  await writeRecord(record);
-  return { id, filePath, scope, scopeCheck: formatScopeCheck(scope, params.dialect ?? 'mcp', id) };
+
+  const { record, id } = await writeNewLock(activeDir(locksRoot), doneDir(locksRoot), now, slug, (candidateId) => {
+    const frontmatter: LockFrontmatter = {
+      id: candidateId,
+      agent_id: params.agent_id ?? null,
+      parent_agent_id: params.parent_agent_id ?? null,
+      status: 'active',
+      created: now,
+      updated: now,
+      scope,
+      repository: params.repository ?? '',
+      ...(params.head ? { head: params.head } : {}),
+    };
+    return {
+      filePath: '', // set by writeNewLock once the name is actually claimed
+      frontmatter,
+      title: params.title,
+      tasks: normalizeTasks(params.tasks),
+      notes: [],
+    };
+  });
+  return { id, filePath: record.filePath, scope, scopeCheck: formatScopeCheck(scope, params.dialect ?? 'mcp', id) };
 }
 
 export interface QueryLocksParams {
@@ -856,7 +954,7 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
   // Checking it against an earlier scan would decide "is this mine?" from a copy
   // that another session may already have replaced — the check would pass on a
   // holder that no longer holds it.
-  const { record } = await mutateRecord(locksRoot, params.lock_id, (record) => {
+  const { record } = await mutateRecord(locksRoot, params.lock_id, async (record) => {
     if (record.frontmatter.status !== 'active') throw new LockNotActiveError(params.lock_id);
 
     if (params.summary) record.notes.push(params.summary);
@@ -889,7 +987,12 @@ export async function finishLock(locksRoot: string, params: FinishLockParams): P
     // Setting filePath is what tells mutateRecord to complete the move; it
     // writes the new file and removes the old one inside the held guard, so the
     // lock is never observable in both active/ and done/.
-    record.filePath = path.join(doneDir(locksRoot), path.basename(record.filePath));
+    const newFilePath = path.join(doneDir(locksRoot), path.basename(record.filePath));
+    // Refuse rather than overwrite: the archived file this would land on is a whole
+    // lock belonging to someone else's claim. Checked inside the guard so nothing can
+    // create it between the check and the move.
+    await assertDestinationFree(newFilePath, params.lock_id, 'archive');
+    record.filePath = newFilePath;
   });
   return { id: record.frontmatter.id, filePath: record.filePath };
 }
@@ -1012,7 +1115,7 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
     if (params.dry_run) continue;
 
     await ensureDirs(locksRoot);
-    await mutateRecord(locksRoot, record.frontmatter.id, (fresh) => {
+    await mutateRecord(locksRoot, record.frontmatter.id, async (fresh) => {
       if (fresh.frontmatter.status !== 'active') throw new LockNotActiveError(fresh.frontmatter.id);
       // Record the EXACT prior last-touch stamp before overwriting it below.
       // `updated` is set to now on reap, which erases the inter-touch interval — the
@@ -1028,7 +1131,11 @@ export async function reapStaleLocks(locksRoot: string, params: ReapStaleLocksPa
       );
       fresh.frontmatter.status = 'done';
       fresh.frontmatter.updated = formatTimestamp();
-      fresh.filePath = path.join(doneDir(locksRoot), path.basename(fresh.filePath));
+      const newFilePath = path.join(doneDir(locksRoot), path.basename(fresh.filePath));
+      // Reap performs the same move as finish and needs the same guard. An automatic,
+      // unattended path is the one that must least be allowed to destroy a claim.
+      await assertDestinationFree(newFilePath, fresh.frontmatter.id, 'reap');
+      fresh.filePath = newFilePath;
     });
   }
 
