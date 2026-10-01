@@ -44,9 +44,24 @@ pnpm test         # vitest run — `pretest` builds first, so dist/ is always fr
 pnpm build        # tsup -> dist/index.js
 ```
 
-**Run all three before opening a PR.** There is currently **no CI** in this repository —
-no GitHub Actions workflows exist — so these checks run only where you run them. A broken
-`main` will not be caught for you.
+**Run all three before opening a PR.** CI (`.github/workflows/ci.yml`) runs the same
+checks on every push and PR to `main` and `devel`: typecheck and the full suite on Node 18
+and 22, plus a `dist` job described below. Running them locally first is still the faster
+way to find a problem, but a broken `main` will now be caught.
+
+**If the suite fails locally but passes in CI, check your git hooks first.** The tests
+shell out to `git commit` inside throwaway repositories. That is hermetic on a runner but
+not on a developer machine: a global `core.hooksPath` applies to those fixtures too, and a
+blocking `pre-commit` hook fails dozens of tests for reasons that have nothing to do with
+your change. Reproduce a CI result locally with:
+
+```bash
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
+  GIT_CONFIG_VALUE_0=/dev/null pnpm test
+```
+
+That redirects the hook path for one command instead of editing your global git config,
+so other work on the machine keeps running under the hooks it expects.
 
 ### `dist/` is committed
 
@@ -54,6 +69,13 @@ no GitHub Actions workflows exist — so these checks run only where you run the
 anything under `src/`, run `pnpm build` and include the regenerated `dist/index.js` in the
 same commit. Conversely, if your change is test-only, `dist/` should come out
 byte-identical — don't commit incidental churn.
+
+CI enforces this: the `dist` job rebuilds from `src/` and fails if the committed bundle
+differs. It is the only mechanical check that the artifact agents actually execute matches
+the source that was reviewed — every MCP server launches `dist/index.js` directly, so a
+`dist/` that lags `src/` means the fix is in the repository and not in the thing running.
+A merge can produce this without anyone making a mistake: git resolves `dist/index.js`
+textually, and the result is not guaranteed to equal a clean rebuild.
 
 ### Testing conventions
 
