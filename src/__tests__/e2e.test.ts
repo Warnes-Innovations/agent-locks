@@ -429,3 +429,65 @@ describe('the MCP response envelope is stable (Y3 regression)', () => {
     expect(parsed.floor).not.toBeNull();
   });
 });
+
+describe('unknown parameters are rejected, not silently dropped (issue #9)', () => {
+  // zod strips unknown keys by default, so before this was fixed a server that
+  // predated a parameter ACCEPTED a call carrying it, returned a normal success
+  // result, and discarded it. An agent widening its claim was told the widening
+  // worked while its files stayed invisible to every peer's conflict check —
+  // the exact failure amendable scope exists to remove, reintroduced through the
+  // parameter parser and made worse, because the agent now had confirmation.
+  //
+  // The guard is `z.object({...}).strict()` on every registerTool inputSchema.
+  // Do NOT "simplify" one back to a bare `{ ... }` raw shape: the SDK wraps a
+  // raw shape in a plain z.object(), which strips. tools/list advertises
+  // additionalProperties:false either way, so the JSON Schema will keep claiming
+  // strictness while the runtime quietly stops honouring it.
+
+  it('every registered tool rejects an unknown parameter', async () => {
+    // Derived from tools/list rather than hand-listed, so a ninth tool added
+    // with a raw shape is covered the day it appears instead of the day someone
+    // remembers to extend an array here.
+    const { tools } = await client.listTools();
+    expect(tools.length).toBeGreaterThan(0);
+
+    const accepted: string[] = [];
+    for (const tool of tools) {
+      const res = await client.callTool({
+        name: tool.name,
+        arguments: { __agent_locks_unknown_probe__: 1 },
+      });
+      const text = String((res.content as Array<{ text?: string }>)?.[0]?.text ?? '');
+      // The predicate is `unrecognized_keys`, NOT `isError`. Measured against the
+      // pre-fix build: lock_query and lock_reap take only optional parameters, so
+      // a junk-only call to them returned isError=false there — an isError-based
+      // assertion would have passed for six of the eight tools by accident, while
+      // the defect was live in all eight.
+      if (!text.includes('unrecognized_keys')) accepted.push(tool.name);
+    }
+
+    expect(accepted).toEqual([]);
+  });
+
+  it('the reported case: a task flip carrying an unknown key fails loudly', async () => {
+    // Issue #9's reproduction. This is the realistic call — the instructions tell
+    // agents to amend scope in the SAME call as the task flip — and it is the one
+    // that used to return isError:false with the amendment dropped.
+    const created = await client.callTool({
+      name: 'lock_create',
+      arguments: { title: 'strictness', scope: ['src/**'], tasks: ['t1'] },
+    });
+    const lockId = (JSON.parse(
+      ((created.content as Array<{ text?: string }>)[0].text as string),
+    ) as { id: string }).id;
+
+    const res = await client.callTool({
+      name: 'lock_update',
+      arguments: { lock_id: lockId, task_text: 't1', done: true, bogus_param: ['x'] },
+    });
+
+    expect(res.isError).toBe(true);
+    const text = String((res.content as Array<{ text?: string }>)[0].text ?? '');
+    expect(text).toContain('bogus_param');
+  });
+});

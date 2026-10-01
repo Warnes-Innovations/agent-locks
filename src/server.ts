@@ -28,6 +28,7 @@ import {
   DuplicateTaskTextError,
 } from './lock/store.js';
 import { checkScopeDrift } from './lock/drift.js';
+import { gatherHarnessEvidence } from './harness.js';
 import { DEFAULT_STALE_MINUTES } from './lock/types.js';
 import { VERSION } from './version.js';
 
@@ -41,6 +42,7 @@ Recommended workflow, in order:
 2. If you decide to proceed, call lock_create to claim the work: give it a title, the glob patterns describing what you're touching, and a checklist of the tasks you plan to do.
 3. As you actually complete each task, call lock_update immediately — not batched at the end. The whole point of this system is that other agents can see live, current state; a lock that only gets updated right before you finish is not useful to anyone watching in the meantime. If you're doing a long stretch of work without a task boundary to check off, call lock_heartbeat periodically so your lock doesn't read as abandoned to anyone else watching.
 4. Whenever the work grows past what you claimed, amend the scope in the same lock_update call: add_scope widens it (set_scope replaces it outright, which is how a lock that over-claimed gets narrowed). Do this when you notice, not at the end — lock_check_conflict matches the globs recorded RIGHT NOW, so until you amend, every file you have touched outside your scope is invisible to any other agent checking for a conflict, while your lock still reads to them as active and healthy.
+4a. Check that the amendment LANDED, by reading the response's \`scopeChanged\` and the \`scope\` it echoes — not by the call not erroring. This server rejects a parameter it does not recognise, so a typo or a name from a newer release fails loudly here. But that is only true of THIS server: an older one strips unknown keys silently, returns an ordinary success, and drops the amendment, and nothing can retrofit a process that is already running. \`scopeChanged: false\` on a call you meant as an amendment means it did not happen — fall back to the unamended workflow and say so in your report. Never paper over it with a free-text note: no matcher reads notes.
 5. Before you finish, call lock_check_drift. It lists the changed files in your working tree that your scope does not cover, so you are not relying on having remembered step 4.
 6. When the work is COMMITTED — not merely when the edits are done — call lock_finish with a short summary. The gap between finishing edits and committing them is exactly when another agent sweeps your uncommitted work into its own commit, so releasing early leaves that window unclaimed. This moves the lock out of the active set and into the done archive, and it will no longer show up in lock_query's default view.
 
@@ -79,7 +81,7 @@ export function createServer(): McpServer {
         'plus scope_history (the scopes this lock previously claimed, each with the timestamp it was retired) on any lock whose scope has been amended — that is what answers "was that file inside their claim at the moment I checked?". ' +
         'percentComplete is computed from the ratio of checked to total tasks on that lock (a lock with zero tasks reports 100). ' +
         `stale is true for an ACTIVE lock not touched in over stale_minutes (default ${DEFAULT_STALE_MINUTES}) — computed fresh on every call, never mutates anything; done locks are never stale.`,
-      inputSchema: {
+      inputSchema: z.object({
         status: z
           .enum(['active', 'done', 'all'])
           .optional()
@@ -109,14 +111,23 @@ export function createServer(): McpServer {
               'Locks are resolved from that repository\'s shared .git directory instead of the current working directory. ' +
               'Fails with a clear error if this path is not inside a git repository.',
           ),
-      },
+        check_harness_activity: z
+          .boolean()
+          .optional()
+          .describe(
+            'If true, additionally ask each installed AI coding harness for its own session list and report how many are working inside this repository. ' +
+              'Off by default because it spawns subprocesses. It answers "is anyone actually here right now?", which a lock\'s own stale flag cannot: staleness only measures how long ago the lock was touched. ' +
+              'It is REPOSITORY-level and cannot be attributed to a specific lock — a lock\'s agent_id and a harness session name are different namespaces — so it never changes any lock\'s stale flag, it only gives you context before you reap one.',
+          ),
+      }).strict(),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ status, scope, agent_id, text, stale_minutes, base_dir }) => {
+    async ({ status, scope, agent_id, text, stale_minutes, base_dir, check_harness_activity }) => {
       try {
         const cwd = base_dir ?? process.cwd();
         const locksRoot = await resolveLocksRoot(cwd);
         const results = await queryLocks(locksRoot, { status, scope, agent_id, text, stale_minutes });
+        const evidence = check_harness_activity === true ? await gatherHarnessEvidence(cwd) : null;
         // Surface unreadable locks HERE too — this is the surface agents actually use.
         // Reporting only on the CLI would leave the agent-facing path silent, which is
         // where the collision would then happen.
@@ -131,6 +142,24 @@ export function createServer(): McpServer {
               unreadable_locks: lastUnreadableLocks,
               ...(lastUnreadableLocks.length > 0
                 ? { warning: `${lastUnreadableLocks.length} lock file(s) could not be read and are NOT included in "locks". A claim you cannot see is a claim you will collide with.` }
+                : {}),
+              // Reported whenever it was ASKED FOR, including when it found nobody.
+              // Omitting an empty result would make "no sessions" indistinguishable
+              // from "you forgot to ask", and the caveat explaining how little an
+              // empty result proves would disappear exactly when it is most needed.
+              ...(evidence
+                ? {
+                    harness_activity: {
+                      live_sessions_in_repo: evidence.sessionsInRepo.filter((s) => s.live).length,
+                      sessions: evidence.sessionsInRepo.map((s) => ({
+                        harness: s.harness,
+                        name: s.name,
+                        live: s.live,
+                      })),
+                      probes: evidence.outcomes.map((o) => ({ harness: o.harness, status: o.status })),
+                      caveat: evidence.caveat,
+                    },
+                  }
                 : {}),
             },
             null,
@@ -154,7 +183,7 @@ export function createServer(): McpServer {
         'Overlap is determined by a static-prefix glob heuristic (not exact set intersection) that is intentionally biased toward reporting overlaps that turn out not to matter, rather than missing a real one — ' +
         'see this project\'s README for the exact heuristic and a documented case (filesystem case-sensitivity) it deliberately does not catch. ' +
         'Returns the same compact summary shape as lock_query (including stale/staleForSeconds) for every overlapping active lock (empty array if none).',
-      inputSchema: {
+      inputSchema: z.object({
         scope: z.array(z.string()).describe('Glob patterns describing the files/paths you are about to work on.'),
         stale_minutes: z
           .number()
@@ -168,7 +197,7 @@ export function createServer(): McpServer {
             'Target a different repository by its working-tree path (or any path inside it). ' +
               'Conflicts are checked against locks in that repository\'s shared .git directory instead of the current working directory.',
           ),
-      },
+      }).strict(),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ scope, stale_minutes, base_dir }) => {
@@ -211,7 +240,7 @@ export function createServer(): McpServer {
         'parent_agent_id specifically means "the id of whatever spawned you," if you are a subagent and happen to know it. ' +
         'The result echoes back the scope it recorded, along with a prompt to keep re-deriving it: scope is not frozen at creation — amend it with lock_update\'s add_scope as the work grows, ' +
         'because lock_check_conflict matches whatever globs are recorded now, and any file outside them is invisible to every other agent looking for a conflict.',
-      inputSchema: {
+      inputSchema: z.object({
         title: z.string().min(1).describe('Short human-readable title for this lock.'),
         scope: z
           .array(z.string())
@@ -246,7 +275,7 @@ export function createServer(): McpServer {
               'The lock is created in that repository\'s shared .git directory instead of the current working directory. ' +
               'Use this when an agent working in one repo needs to claim work in another — a lock the colliding agent cannot see is decorative.',
           ),
-      },
+      }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async ({ title, scope, tasks, agent_id, parent_agent_id, base_dir }) => {
@@ -278,8 +307,9 @@ export function createServer(): McpServer {
         'A replacement that DROPS globs takes protection away, so it is gated the same way lock_finish is: refused when the lock is held by a different, named agent, unless force:true — which is recorded on the lock. Widening is never gated. ' +
         'The two are mutually exclusive. Amendments are appended to the lock file\'s scope_history with a timestamp rather than overwriting the old value silently, so a later reader can reconstruct what this lock claimed at the moment another agent checked it. ' +
         'The result ALWAYS echoes the lock\'s current scope, amended or not, along with a prompt to re-derive it against what you are really editing — because lock_check_conflict matches these globs, and any file outside them is invisible to every other agent looking for a conflict. ' +
+        'VERIFY AN AMENDMENT BY ITS EFFECT, NOT BY THE ABSENCE OF AN ERROR: read scopeChanged and the echoed scope. This server rejects parameters it does not recognise, but an OLDER one accepts them, reports success, and discards them — and a server started before an upgrade keeps serving its old schema for the life of that session, so no rebuild can reach it. scopeChanged:false on a call you meant as an amendment means the widening did not happen. ' +
         'Works on a lock in either active or done status (found by lock_id regardless of which directory it currently lives in).',
-      inputSchema: {
+      inputSchema: z.object({
         lock_id: z.string().describe('The id of the lock to update (as returned by lock_create or lock_query).'),
         task_text: z
           .string()
@@ -325,7 +355,7 @@ export function createServer(): McpServer {
             'Target a different repository by its working-tree path (or any path inside it). ' +
               'The lock is looked up in that repository\'s shared .git directory. Omit to use the current working directory.',
           ),
-      },
+      }).strict(),
       // destructiveHint: `set_scope` can REPLACE a whole claim, and a narrowing
       // removes protection from files that may still be in flight — recoverable
       // only by reading scope_history. A client using this hint to decide
@@ -370,7 +400,7 @@ export function createServer(): McpServer {
         'Prefer `outcome` over `drifted`: the boolean cannot tell "the scope covers the work" from "nothing was measured". ' +
         'Returns {lock_id, title, scope, inspectedWorktree, lockCreatedIn, changedFileCount, uncommittedCount, committedSinceClaimCount, ignoredFilesNotExamined, inScopeCount, outOfScope, outOfScopeCount, outOfScopeTruncated, outcome, drifted, warnings, scopeCheck}. ' +
         'READ THE WARNINGS: drift is only meaningful for your OWN lock in your OWN worktree, and running it against a lock created elsewhere compares that lock\'s scope to files its owner is not editing — a clean result there means nothing.',
-      inputSchema: {
+      inputSchema: z.object({
         lock_id: z.string().describe('The id of the lock to check (as returned by lock_create or lock_query).'),
         base_dir: z
           .string()
@@ -379,7 +409,7 @@ export function createServer(): McpServer {
             'Target a different repository by its working-tree path (or any path inside it). ' +
               'Both the lock lookup AND the `git status` that supplies the changed files come from there instead of the current working directory.',
           ),
-      },
+      }).strict(),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ lock_id, base_dir }) => {
@@ -402,7 +432,7 @@ export function createServer(): McpServer {
         'Marks an active lock as done, optionally appending a closing summary to its Notes, and moves its file from the active set into the done archive. ' +
         'Once finished, the lock stops appearing in lock_query\'s default (status-omitted) view. ' +
         'Errors clearly if lock_id does not exist, or if it exists but is already done (rather than silently no-op-ing).',
-      inputSchema: {
+      inputSchema: z.object({
         lock_id: z.string().describe('The id of the active lock to finish.'),
         summary: z.string().optional().describe('Optional closing summary appended to the Notes section before the lock is archived.'),
         agent_id: z
@@ -424,7 +454,7 @@ export function createServer(): McpServer {
             'Target a different repository by its working-tree path (or any path inside it). ' +
               'The lock is looked up in that repository\'s shared .git directory. Omit to use the current working directory.',
           ),
-      },
+      }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async ({ lock_id, summary, agent_id, force, base_dir }) => {
@@ -449,7 +479,7 @@ export function createServer(): McpServer {
         'Bumps ONLY a lock\'s updated timestamp — no task, note, or scope change. Call this periodically during a long stretch of work that isn\'t naturally hitting lock_update often enough ' +
         '(completing a task also counts as a heartbeat for free) to keep the lock from being computed as stale by lock_query / lock_check_conflict. ' +
         'Restricted to active locks — errors clearly if lock_id does not exist, or exists but is already done (heartbeating finished work is not a meaningful operation).',
-      inputSchema: {
+      inputSchema: z.object({
         lock_id: z.string().describe('The id of the active lock to heartbeat.'),
         base_dir: z
           .string()
@@ -458,7 +488,7 @@ export function createServer(): McpServer {
             'Target a different repository by its working-tree path (or any path inside it). ' +
               'The lock is looked up in that repository\'s shared .git directory. Omit to use the current working directory.',
           ),
-      },
+      }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ lock_id, base_dir }) => {
@@ -483,7 +513,7 @@ export function createServer(): McpServer {
         'Each reaped lock gets an auto-generated note recording that it was reaped for inactivity (with how long) rather than finished by its owning agent, so the done archive stays honest. ' +
         'If lock_id is given but that lock is NOT actually stale, this errors rather than reaping it — reap cannot be used as a workaround to force-finish someone else\'s live work. A supplied stale_minutes may only LENGTHEN the window; it is floored at the default, so it cannot shorten the way to a live lock. ' +
         'Pass dry_run: true to see what WOULD be reaped without writing anything.',
-      inputSchema: {
+      inputSchema: z.object({
         lock_id: z.string().optional().describe('Reap only this lock id. Omit to reap every currently-stale active lock.'),
         stale_minutes: z
           .number()
@@ -498,7 +528,7 @@ export function createServer(): McpServer {
             'Target a different repository by its working-tree path (or any path inside it). ' +
               'Locks are reaped from that repository\'s shared .git directory. Omit to use the current working directory.',
           ),
-      },
+      }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async ({ lock_id, stale_minutes, dry_run, base_dir }) => {
@@ -509,7 +539,40 @@ export function createServer(): McpServer {
         // The floor must be reported HERE too. A CLI-only version left the surface
         // agents actually use claiming nothing was stale, when locks were stale by the
         // requested threshold and merely protected.
-        return textResult(JSON.stringify({ reaped: result, floor: lastReapFloor }, null, 2));
+        //
+        // Harness evidence is gathered AFTER the reap, not before, and is never
+        // allowed to change the outcome. It cannot: repo-level activity does not
+        // attribute to a lock (see harness.ts), so gating a reap on it would
+        // protect abandoned locks in any busy repo. It is here to stop the one
+        // thing a reap report cannot otherwise tell you — that the work you just
+        // marked abandoned may belong to someone still sitting in this repository.
+        const evidence = result.length > 0 ? await gatherHarnessEvidence(cwd) : null;
+        return textResult(
+          JSON.stringify(
+            {
+              reaped: result,
+              floor: lastReapFloor,
+              ...(evidence && evidence.sessionsInRepo.length > 0
+                ? {
+                    harness_activity: {
+                      live_sessions_in_repo: evidence.sessionsInRepo.filter((s) => s.live).length,
+                      sessions: evidence.sessionsInRepo.map((s) => ({
+                        harness: s.harness,
+                        name: s.name,
+                        live: s.live,
+                      })),
+                      warning:
+                        `${evidence.sessionsInRepo.length} harness session(s) report a working directory inside this repository. ` +
+                        'A lock reaped here may belong to one of them. ' +
+                        evidence.caveat,
+                    },
+                  }
+                : {}),
+            },
+            null,
+            2,
+          ),
+        );
       } catch (error) {
         return errorResult(error);
       }
