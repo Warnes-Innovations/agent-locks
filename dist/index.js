@@ -527,6 +527,14 @@ var LockNotActiveError = class extends Error {
     this.name = "LockNotActiveError";
   }
 };
+var DuplicateLockIdError = class extends Error {
+  constructor(lockId, destination, what) {
+    super(
+      `Refusing to ${what} lock "${lockId}": ${destination} already exists. Moving onto it would destroy that lock \u2014 its scope, checklist, owner and progress \u2014 with no way to recover it. Two lock files share this id, which should be impossible; inspect the store by hand rather than letting a move pick a winner.`
+    );
+    this.name = "DuplicateLockIdError";
+  }
+};
 function activeDir(locksRoot) {
   return locksRoot;
 }
@@ -591,7 +599,7 @@ async function mutateRecord(locksRoot, lockId, mutate) {
     if (!release) continue;
     try {
       const { record, raw } = await readRecordWithRaw(found);
-      const result = mutate(record);
+      const result = await mutate(record);
       const current = await fs2.readFile(found, "utf8").catch(() => null);
       if (current !== raw) continue;
       await writeRecord(record);
@@ -680,18 +688,46 @@ async function findLockById(locksRoot, lockId) {
   }
   return null;
 }
-async function uniqueFilePath(dir, timestamp, slug) {
+async function writeNewLock(activeDirPath, doneDirPath, timestamp, slug, build) {
   let suffix = 0;
   for (; ; ) {
     const candidateId = suffix === 0 ? `${timestamp}-${slug}` : `${timestamp}-${slug}-${suffix + 1}`;
-    const filePath = path2.join(dir, `${candidateId}.md`);
+    let archived = false;
     try {
-      await fs2.access(filePath);
-      suffix += 1;
+      await fs2.access(path2.join(doneDirPath, `${candidateId}.md`));
+      archived = true;
     } catch {
-      return { filePath, id: candidateId };
+      archived = false;
+    }
+    if (archived) {
+      suffix += 1;
+      continue;
+    }
+    const filePath = path2.join(activeDirPath, `${candidateId}.md`);
+    const record = build(candidateId);
+    record.filePath = filePath;
+    const contents = serializeLockFile(record);
+    try {
+      const handle = await fs2.open(filePath, "wx");
+      try {
+        await handle.writeFile(contents, "utf8");
+      } finally {
+        await handle.close();
+      }
+      return { record, id: candidateId };
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      suffix += 1;
     }
   }
+}
+async function assertDestinationFree(destination, lockId, what) {
+  try {
+    await fs2.access(destination);
+  } catch {
+    return;
+  }
+  throw new DuplicateLockIdError(lockId, destination, what);
 }
 function normalizeTasks(tasks) {
   const seen = /* @__PURE__ */ new Set();
@@ -714,33 +750,34 @@ async function createLock(locksRoot, params) {
   await ensureDirs(locksRoot);
   const now = formatTimestamp();
   const slug = slugify(params.title);
-  const { filePath, id } = await uniqueFilePath(activeDir(locksRoot), now, slug);
   const scope = normalizeScope(params.scope);
   if (scope.length === 0) {
     throw new EmptyScopeError(
       "lock_create requires at least one non-empty glob pattern in scope (whitespace-only patterns are dropped, because a glob carrying stray whitespace matches nothing and would produce a lock that claims a file it can never be matched against)."
     );
   }
-  const frontmatter = {
-    id,
-    agent_id: params.agent_id ?? null,
-    parent_agent_id: params.parent_agent_id ?? null,
-    status: "active",
-    created: now,
-    updated: now,
-    scope,
-    repository: params.repository ?? "",
-    ...params.head ? { head: params.head } : {}
-  };
-  const record = {
-    filePath,
-    frontmatter,
-    title: params.title,
-    tasks: normalizeTasks(params.tasks),
-    notes: []
-  };
-  await writeRecord(record);
-  return { id, filePath, scope, scopeCheck: formatScopeCheck(scope, params.dialect ?? "mcp", id) };
+  const { record, id } = await writeNewLock(activeDir(locksRoot), doneDir(locksRoot), now, slug, (candidateId) => {
+    const frontmatter = {
+      id: candidateId,
+      agent_id: params.agent_id ?? null,
+      parent_agent_id: params.parent_agent_id ?? null,
+      status: "active",
+      created: now,
+      updated: now,
+      scope,
+      repository: params.repository ?? "",
+      ...params.head ? { head: params.head } : {}
+    };
+    return {
+      filePath: "",
+      // set by writeNewLock once the name is actually claimed
+      frontmatter,
+      title: params.title,
+      tasks: normalizeTasks(params.tasks),
+      notes: []
+    };
+  });
+  return { id, filePath: record.filePath, scope, scopeCheck: formatScopeCheck(scope, params.dialect ?? "mcp", id) };
 }
 async function queryLocks(locksRoot, params) {
   const status = params.status ?? "active";
@@ -870,7 +907,7 @@ async function updateLock(locksRoot, params) {
 }
 async function finishLock(locksRoot, params) {
   await ensureDirs(locksRoot);
-  const { record } = await mutateRecord(locksRoot, params.lock_id, (record2) => {
+  const { record } = await mutateRecord(locksRoot, params.lock_id, async (record2) => {
     if (record2.frontmatter.status !== "active") throw new LockNotActiveError(params.lock_id);
     if (params.summary) record2.notes.push(params.summary);
     const holder = record2.frontmatter.agent_id;
@@ -885,7 +922,9 @@ async function finishLock(locksRoot, params) {
     }
     record2.frontmatter.status = "done";
     record2.frontmatter.updated = formatTimestamp();
-    record2.filePath = path2.join(doneDir(locksRoot), path2.basename(record2.filePath));
+    const newFilePath = path2.join(doneDir(locksRoot), path2.basename(record2.filePath));
+    await assertDestinationFree(newFilePath, params.lock_id, "archive");
+    record2.filePath = newFilePath;
   });
   return { id: record.frontmatter.id, filePath: record.filePath };
 }
@@ -934,14 +973,16 @@ async function reapStaleLocks(locksRoot, params = {}) {
     reaped.push({ id: record.frontmatter.id, title: record.title, staleForSeconds: summary.staleForSeconds });
     if (params.dry_run) continue;
     await ensureDirs(locksRoot);
-    await mutateRecord(locksRoot, record.frontmatter.id, (fresh) => {
+    await mutateRecord(locksRoot, record.frontmatter.id, async (fresh) => {
       if (fresh.frontmatter.status !== "active") throw new LockNotActiveError(fresh.frontmatter.id);
       fresh.notes.push(
         `Auto-reaped: last touched ${fresh.frontmatter.updated} (UTC), no activity for ${Math.round(summary.staleForSeconds / 60)} minute(s), threshold ${staleMinutes} minute(s).`
       );
       fresh.frontmatter.status = "done";
       fresh.frontmatter.updated = formatTimestamp();
-      fresh.filePath = path2.join(doneDir(locksRoot), path2.basename(fresh.filePath));
+      const newFilePath = path2.join(doneDir(locksRoot), path2.basename(fresh.filePath));
+      await assertDestinationFree(newFilePath, fresh.frontmatter.id, "reap");
+      fresh.filePath = newFilePath;
     });
   }
   return reaped;
