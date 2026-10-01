@@ -1,0 +1,20 @@
+# Build scripts this project allows its dependencies to run.
+#
+# KEEP THIS FILE TO DELIBERATE ENTRIES ONLY. `pnpm approve-builds` writes into
+# this same file, so it will happily accumulate whatever a given machine
+# happened to approve. Those are local trust decisions and do not belong in
+# git; the entry below is a project-level one and does.
+#
+# Why esbuild is here at all: its postinstall is a no-op for us — the binary
+# arrives as the `@esbuild/<platform>` optional dependency — but pnpm fails
+# `install --frozen-lockfile` with ERR_PNPM_IGNORED_BUILDS until the script is
+# allow-listed. Until this file was tracked, every fresh clone and every CI run
+# hit that exit 1 on a tree whose build and full test suite both pass.
+#
+# Do not "fix" a future ignored-build failure by disabling the check globally
+# (PNPM_CONFIG_STRICT_DEP_BUILDS=false, or --ignore-scripts). That silences the
+# warning for every dependency at once, including the next one that genuinely
+# needs its build script. Add the specific package here instead, having looked
+# at what its script does.
+allowBuilds:
+  esbuild: true

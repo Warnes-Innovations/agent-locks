@@ -1,0 +1,127 @@
+# agent-locks had no CI at all until this file (issue #12) — the only sibling
+# project without one. Three pull requests merged on 2026-09-10 whose entire
+# value was regression tests, and nothing automated ever ran them.
+#
+# Triggers cover BOTH branches deliberately. `main` is what the MCP servers are
+# launched from, and a workflow that only watches `devel` cannot tell you
+# whether the thing agents are about to run passes.
+
+name: ci
+
+on:
+  push:
+    branches: [main, devel]
+  pull_request:
+    branches: [main, devel]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor package.json's `engines` actually claims, and a current LTS.
+        # Testing only the ceiling lets the floor rot while the metadata keeps
+        # promising it — if 18 goes red, `engines` is the thing that is wrong,
+        # not this matrix.
+        node: ['18', '22']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          # Matches the pnpm this project is developed against. package.json
+          # carries no `packageManager` field on purpose: adding one forces a
+          # lockfile update and makes corepack enforce this exact version on
+          # every contributor's machine.
+          version: 12.3.4
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        # The whole suite. Note `pretest` rebuilds dist/ first, so this also
+        # proves the build works on this node version.
+        #
+        # These tests shell out to `git commit` inside throwaway repositories.
+        # That is hermetic on a runner but NOT on a developer machine: a global
+        # `core.hooksPath` applies to the fixtures too, and a blocking pre-commit
+        # hook fails 88 of them for reasons that have nothing to do with the
+        # code. If you are reproducing a CI result locally and see mass
+        # failures, try:
+        #   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
+        #   GIT_CONFIG_VALUE_0=/dev/null pnpm test
+        run: pnpm test
+
+  dist:
+    name: committed dist/ matches src/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12.3.4
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Rebuild
+        run: pnpm run build
+
+      - name: dist/ must match a clean rebuild of src/
+        # This is the only mechanical check that the artifact agents actually
+        # execute corresponds to the source that was reviewed. dist/index.js is
+        # committed, every MCP server launches it directly, and nothing else
+        # notices when a merge, a rebase or a forgotten `pnpm run build` leaves
+        # the two out of step.
+        #
+        # It is not hypothetical. The 2026-09-10 merges of three branches
+        # produced a dist/index.js that git assembled textually and that matched
+        # none of the three branches' own bundles. It happened to equal a clean
+        # rebuild. Nothing checked that; it was luck.
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- dist/; then
+            git diff --stat -- dist/
+            echo
+            echo "==============================================================="
+            echo "dist/ does not match a clean build of src/."
+            echo
+            echo "The committed artifact is what every MCP server runs, so this"
+            echo "means agents are executing something other than the source"
+            echo "that was reviewed. Fix it by rebuilding and committing:"
+            echo
+            echo "    pnpm install --frozen-lockfile"
+            echo "    pnpm run build"
+            echo "    git add dist/ && git commit"
+            echo
+            echo "Only --stat is shown on purpose. dist/index.js is a ~95 KB"
+            echo "single-file bundle, and its real diff is thousands of columns"
+            echo "of unreadable output that buries this message."
+            echo "==============================================================="
+            exit 1
+          fi
+          echo "dist/ is in sync with src/"
